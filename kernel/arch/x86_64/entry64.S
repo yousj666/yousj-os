@@ -31,3 +31,5 @@ hang:
     cli
     hlt
     jmp hang
+
+.section .note.GNU-stack, "", @progbits

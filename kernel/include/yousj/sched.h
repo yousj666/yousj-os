@@ -1,0 +1,113 @@
+/* Yousj OS - scheduler and task structure (stage 1).
+ *
+ * Written from scratch by Muse (kernel core), implementing
+ * docs/SCHED_DESIGN.md milestones M0/M1: kernel threads first,
+ * cooperative round-robin, no timer yet (M2 adds IDT/PIC/PIT
+ * preemption). Interface adopted by the coordinator with two
+ * simplifications against the design draft, both deliberate:
+ *   - ctx is the FIRST field of struct task, so ctx.rsp sits at
+ *     offset 0 and context_switch.S needs no magic offsets (the
+ *     design's offsetof static assert pins this in sched.c);
+ *   - task storage is a static pool (no kernel heap exists yet),
+ *     and thread stacks are handed to kthread_create() by the
+ *     caller (kthread_create_auto() allocates 16 KiB from the PMM).
+ *
+ * A task is one execution flow. mm == NULL means a kernel thread,
+ * borrowing whatever address space is current; user processes
+ * (with their own vmm_space and a Ring 3 landing) arrive at M3+.
+ */
+#ifndef YOUSJ_SCHED_H
+#define YOUSJ_SCHED_H
+
+#include <yousj/types.h>
+
+struct vmm_space; /* from <yousj/vmm.h>; tasks only hold the pointer */
+
+enum task_state {
+    TASK_READY = 0,
+    TASK_RUNNING,
+    TASK_BLOCKED,
+    TASK_ZOMBIE,
+    TASK_DEAD
+};
+
+/* Callee-saved context: the assembly switch saves rbx/rbp/r12-r15
+ * on the task's own stack and only rsp lives here (design sec. 5.1).
+ * MUST stay the first member of struct task, with rsp first inside. */
+struct task_context {
+    uint64_t rsp;
+};
+
+struct task {
+    struct task_context ctx;      /* offset 0 -- see header note */
+    uint64_t        tid;          /* idle = 0, then 1, 2, ... */
+    uint64_t        parent_tid;
+    enum task_state state;
+    char            name[16];
+    uint64_t        timeslice_left; /* ticks; unused until M2 preemption */
+    uint64_t        total_ticks;
+    struct task    *rq_next;
+    struct task    *all_next;
+    struct vmm_space *mm;         /* NULL = kernel thread */
+    uint64_t        kernel_stack_top;
+    void          (*entry)(void *arg); /* kernel threads only */
+    void           *arg;
+    int             exit_status;
+    bool            in_use;
+};
+
+#define YOUSJ_SCHED_MAX_TASKS   32
+#define YOUSJ_SCHED_STACK_SIZE  (16ULL * 1024ULL)
+#define YOUSJ_SCHED_SLICE_TICKS 5 /* design sec. 4.2; applies from M2 */
+
+/* Implemented in assembly (kernel/arch/x86_64/context_switch.S):
+ * saves callee-saved registers on prev's stack, stores rsp into
+ * prev->ctx (offset 0), loads next->ctx, restores, and returns into
+ * next's saved (or fabricated first-run) context. */
+void context_switch(struct task *prev, struct task *next);
+
+/* First-run landing pad for kernel threads (see sched.c): runs the
+ * task's entry function, then exits it. Exposed so host tests can
+ * verify fabricated stack frames point here. */
+void sched_kthread_trampoline(void);
+
+/* Initialise the scheduler and create the idle task (tid 0) around
+ * the calling execution flow. Call once, before kthread_create(). */
+void sched_init(void);
+
+struct task *sched_current(void);
+struct task *sched_idle(void);
+
+/* Create a kernel thread over caller-provided stack memory
+ * (stack_mem .. stack_mem+stack_size). Returns NULL when the pool
+ * is full or arguments are bad. The thread starts READY, queued. */
+struct task *kthread_create(const char *name, void (*entry)(void *arg),
+                            void *arg, void *stack_mem, uint64_t stack_size);
+/* Same, with a fresh 16 KiB stack allocated from the PMM. */
+struct task *kthread_create_auto(const char *name, void (*entry)(void *arg),
+                                 void *arg);
+
+/* Core scheduling point (cooperative in M1): move current to the
+ * back of the run queue when it stays runnable, pick the head,
+ * context-switch. All run-queue manipulation in sched.c assumes
+ * single-CPU with interrupts off -- true throughout M1, where
+ * interrupts are never enabled; M2 must keep the same discipline
+ * around these calls (design sec. 4.2). */
+void sched_schedule(void);
+void sched_yield(void);
+
+/* Block the current task and schedule another; returns when the
+ * task has been woken and rescheduled. */
+void sched_block_current(void);
+/* Move a BLOCKED task back to READY at the queue tail. No-op for
+ * tasks in other states. */
+void sched_wake(struct task *task);
+
+/* Exit the current task (state ZOMBIE, exit_status recorded) and
+ * schedule another. Never returns; the idle task may not exit. */
+void sched_exit_current(int status);
+
+/* Count tasks currently in the given state (pool scan; M0/M1 scale). */
+uint64_t sched_count_state(enum task_state state);
+
+#endif /* YOUSJ_SCHED_H */

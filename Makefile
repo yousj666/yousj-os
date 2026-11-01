@@ -4,19 +4,21 @@
 # hosted, so allocator logic is verified without needing to boot.
 CC      ?= gcc
 CFLAGS  := -ffreestanding -fno-stack-protector -fno-pic -m64 -mno-red-zone \
+           -mno-sse -mno-mmx \
            -Wall -Wextra -I kernel/include -I kernel
 HOSTCFLAGS := -Wall -Wextra -I kernel/include
 BUILD   := build
 
-KERNEL_OBJS := $(BUILD)/kmain.o $(BUILD)/pmm.o $(BUILD)/vmm.o $(BUILD)/vmm_arch.o $(BUILD)/serial.o
+KERNEL_OBJS := $(BUILD)/kmain.o $(BUILD)/pmm.o $(BUILD)/vmm.o $(BUILD)/vmm_arch.o $(BUILD)/serial.o $(BUILD)/sched.o $(BUILD)/context_switch.o
 
 .PHONY: check test clean
 check: $(KERNEL_OBJS)
 	@echo "check OK: kernel core compiles freestanding"
 
-test: $(BUILD)/test_pmm $(BUILD)/test_vmm
+test: $(BUILD)/test_pmm $(BUILD)/test_vmm $(BUILD)/test_sched
 	./$(BUILD)/test_pmm
 	./$(BUILD)/test_vmm
+	./$(BUILD)/test_sched
 
 $(BUILD)/kmain.o: kernel/arch/x86_64/kmain.c kernel/include/yousj/*.h
 	mkdir -p $(BUILD)
@@ -46,6 +48,18 @@ $(BUILD)/test_vmm: tests/test_vmm.c kernel/mm/vmm.c kernel/mm/pmm.c kernel/inclu
 	mkdir -p $(BUILD)
 	$(CC) $(HOSTCFLAGS) tests/test_vmm.c kernel/mm/vmm.c kernel/mm/pmm.c -o $@
 
+$(BUILD)/sched.o: kernel/sched/sched.c kernel/include/yousj/*.h
+	mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD)/context_switch.o: kernel/arch/x86_64/context_switch.S
+	mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD)/test_sched: tests/test_sched.c kernel/sched/sched.c kernel/mm/pmm.c kernel/include/yousj/*.h
+	mkdir -p $(BUILD)
+	$(CC) $(HOSTCFLAGS) tests/test_sched.c kernel/sched/sched.c kernel/mm/pmm.c -o $@
+
 clean:
 	rm -rf $(BUILD)
 
@@ -59,7 +73,8 @@ STUB := $(BUILD)/yousj-stub.elf
 CFLAGS32 := -m32 -ffreestanding -fno-stack-protector -fno-pic -mno-red-zone \
             -Wall -Wextra -I kernel/include -I kernel
 KERNEL_LINK_OBJS := $(BUILD)/entry64.o $(BUILD)/kmain.o \
-                    $(BUILD)/serial.o $(BUILD)/pmm.o $(BUILD)/vmm.o $(BUILD)/vmm_arch.o
+                    $(BUILD)/serial.o $(BUILD)/pmm.o $(BUILD)/vmm.o $(BUILD)/vmm_arch.o \
+                    $(BUILD)/sched.o $(BUILD)/context_switch.o
 STUB_LINK_OBJS := $(BUILD)/stub.o $(BUILD)/stub_main.o $(BUILD)/stub_bootinfo.o
 
 .PHONY: kernel run
