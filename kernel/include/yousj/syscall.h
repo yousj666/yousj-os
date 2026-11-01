@@ -29,6 +29,12 @@
 #define YOUSJ_SYS_clone        56   /* fork/exec come in stage 2 */
 #define YOUSJ_SYS_execve       59
 #define YOUSJ_SYS_exit         60
+#define YOUSJ_SYS_exit_group   231 /* approved 2026-11-01 (coordinator):
+                                    proposed by both SCHED_DESIGN sec. 6.1
+                                    and SYSCALL_DESIGN batch 0 -- glibc's
+                                    exit() really issues exit_group, so the
+                                    number is required for real programs;
+                                    same handler as exit */
 #define YOUSJ_SYS_wait4        61
 #define YOUSJ_SYS_kill         62
 #define YOUSJ_SYS_uname        63
