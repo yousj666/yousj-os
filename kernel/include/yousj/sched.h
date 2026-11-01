@@ -53,6 +53,8 @@ struct task {
     void          (*entry)(void *arg); /* kernel threads only */
     void           *arg;
     int             exit_status;
+    uint64_t        user_ip;      /* user tasks: first ring-3 RIP */
+    uint64_t        user_sp;      /* user tasks: initial ring-3 RSP */
     uint64_t        wake_tick;    /* nonzero while sleeping: tick at
                                      which sched_tick() wakes the
                                      task (M2). Cleared on wake. */

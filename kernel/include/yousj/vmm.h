@@ -104,6 +104,12 @@ void vmm_destroy_space(struct vmm_space *space);
 
 void               vmm_set_kernel_master(struct vmm_space *space);
 struct vmm_space  *vmm_kernel_master(void);
+/* Transition helper (identity-kernel period): share the master's
+ * PML4 entry 0 -- the kernel identity subtree -- into a user
+ * space, so the space can execute kernel code after a CR3 switch.
+ * The shared subtree is recognised by vmm_destroy_space() and is
+ * never freed through a user space. */
+void               vmm_share_kernel_identity(struct vmm_space *space);
 
 int  vmm_map(struct vmm_space *space, uint64_t virt, uint64_t phys,
              uint64_t length, uint32_t flags);

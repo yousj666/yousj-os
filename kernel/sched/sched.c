@@ -11,7 +11,22 @@
  */
 #include <yousj/sched.h>
 #include <yousj/pmm.h>
+#include <yousj/vmm.h> /* vmm_space layout + CR3 hooks (weak, below) */
 #include <stddef.h> /* offsetof */
+
+/* Address-space and stack-pointer plumbing lives in the kernel's
+ * arch/syscall layers. These references are WEAK so the host unit
+ * test -- which links sched.c without vmm.c/gdt code -- sees them
+ * as absent and skips both actions; in the kernel they resolve to
+ * the real implementations. The update discipline itself (what is
+ * written, when, from which single source value) is defined here
+ * and in docs/SYSCALL_DESIGN.md sec. 3.3. */
+#pragma weak vmm_kernel_master
+#pragma weak vmm_load_cr3
+void arch_on_task_switch(struct task *next);
+#pragma weak arch_on_task_switch
+
+static struct vmm_space *g_current_space;
 
 /* The contract context_switch.S relies on: ctx.rsp is at offset 0. */
 _Static_assert(offsetof(struct task, ctx) == 0,
@@ -82,6 +97,7 @@ void sched_init(void)
     g_all_head = NULL;
     g_rq_head = g_rq_tail = NULL;
     g_next_tid = 0;
+    g_current_space = NULL;
 
     idle = &g_tasks[0];
     mem_zero(idle, sizeof(*idle));
@@ -246,6 +262,27 @@ void sched_schedule(void)
     next->state = TASK_RUNNING;
     next->timeslice_left = YOUSJ_SCHED_SLICE_TICKS;
     g_current = next;
+
+    /* Address space switch (SCHED_DESIGN 5.3): kernel threads
+     * borrow the kernel master space, user tasks run in their own.
+     * CR3 is written only on an actual space change, and BEFORE
+     * the context switch, so the switch itself already executes
+     * under the incoming space -- safe because the kernel half
+     * (identity subtree) is present in every space. */
+    {
+        struct vmm_space *target = next->mm != NULL ? next->mm
+            : (vmm_kernel_master != NULL ? vmm_kernel_master() : NULL);
+        if (target != NULL && target != g_current_space &&
+            vmm_load_cr3 != NULL) {
+            vmm_load_cr3(target->pml4_phys);
+            g_current_space = target;
+        }
+    }
+    /* TSS.rsp0 + syscall kernel_rsp track the incoming task's
+     * kernel stack (single update point, SYSCALL_DESIGN 3.3). */
+    if (arch_on_task_switch != NULL)
+        arch_on_task_switch(next);
+
     context_switch(prev, next);
     /* When prev runs again, it resumes here. */
 

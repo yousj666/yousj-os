@@ -16,17 +16,25 @@
  *   0x00  null
  *   0x08  kernel code, 64-bit, ring 0   (IDT gates point here)
  *   0x10  kernel data, ring 0
- *
- * User segments (0x18/0x20 + TSS at 0x28) arrive with M3's Ring 3
- * work, per docs/SYSCALL_DESIGN.md sec. 3.2, extending this table
- * in the reserved slots without renumbering the kernel pair.
+ *   0x18  user data, ring 3             (M3, SYSCALL_DESIGN 3.2)
+ *   0x20  user code, 64-bit, ring 3
+ *   0x28  TSS (two slots)
  */
 #ifndef YOUSJ_GDT_H
 #define YOUSJ_GDT_H
 
 #define YOUSJ_GDT_KERNEL_CODE 0x08
 #define YOUSJ_GDT_KERNEL_DATA 0x10
+#define YOUSJ_GDT_USER_DATA   0x18
+#define YOUSJ_GDT_USER_CODE   0x20
+#define YOUSJ_GDT_TSS         0x28
 
 void gdt_init(void);
+
+/* Point the TSS's ring-0 stack at the given kernel stack top.
+ * Called on every task switch (via the syscall layer's
+ * arch_on_task_switch hook) so an interrupt out of ring 3 always
+ * lands on the CURRENT task's kernel stack. */
+void tss_set_rsp0(uint64_t rsp0);
 
 #endif /* YOUSJ_GDT_H */

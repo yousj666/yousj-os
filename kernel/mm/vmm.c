@@ -303,9 +303,16 @@ void vmm_destroy_space(struct vmm_space *space)
         return;
     pml4 = table_of(space->pml4_phys);
     /* User half only: the kernel half is shared with the master and
-     * its tables are never owned by this space. */
+     * its tables are never owned by this space. Entry 0 needs the
+     * same care in the transition period: when it is byte-identical
+     * to the master's entry 0, it is the SHARED kernel identity
+     * subtree (see vmm_share_kernel_identity) and must not be
+     * freed either. */
     for (i = 0; i < 256; i++) {
         if (pml4[i] & YOUSJ_PTE_PRESENT) {
+            if (i == 0 && g_kernel_master != NULL &&
+                pml4[0] == table_of(g_kernel_master->pml4_phys)[0])
+                continue;
             free_table_tree(pml4[i] & YOUSJ_PTE_ADDR_MASK, 0);
             pml4[i] = 0;
         }
@@ -317,6 +324,23 @@ void vmm_destroy_space(struct vmm_space *space)
 void vmm_set_kernel_master(struct vmm_space *space)
 {
     g_kernel_master = space;
+}
+
+void vmm_share_kernel_identity(struct vmm_space *space)
+{
+    if (!g_backend_ready || space == NULL || g_kernel_master == NULL ||
+        space == g_kernel_master)
+        return;
+    /* Transition arrangement (identity-kernel period): the kernel
+     * occupies the low half under PML4 entry 0, so every user
+     * space must see that exact subtree to be able to run kernel
+     * code at all after a CR3 switch. The entries carry no USER
+     * flag, so ring 3 cannot touch them; they point at the
+     * master's tables, which vmm_destroy_space() now recognises
+     * and refuses to free. When the kernel moves to the higher
+     * half (VMM_DESIGN sec. 6.2), create-space already shares the
+     * kernel half and this helper goes away. */
+    table_of(space->pml4_phys)[0] = table_of(g_kernel_master->pml4_phys)[0];
 }
 
 struct vmm_space *vmm_kernel_master(void)
