@@ -8,6 +8,7 @@
 #include <yousj/types.h>
 #include <yousj/boot.h>
 #include <yousj/pmm.h>
+#include <yousj/vmm.h>
 
 #define SERIAL_PORT 0x3f8 /* COM1 */
 
@@ -129,11 +130,48 @@ void kmain(struct yousj_boot_info *boot_info)
         serial_puts("Yousj OS: PMM self-test PASS\n");
     }
 
+    /* Stage 1, step 2 (logic done 2026-11-01): the VMM's page-table
+     * walking/mapping is exercised here as a pure software self-test
+     * on a throwaway address space. We deliberately do NOT load the
+     * new space into CR3 yet: switching page tables waits for the
+     * bootloader paging contract (docs/VMM_DESIGN.md sec. 2.3). */
+    {
+        struct vmm_space space;
+        uint64_t data_page, translated = 0;
+        int ok = 1;
+
+        vmm_use_kernel_backend();
+        if (vmm_create_space(&space) != 0)
+            ok = 0;
+        data_page = ok ? pmm_alloc_page() : 0;
+        if (data_page == 0)
+            ok = 0;
+        if (ok && vmm_map(&space, 0x400000, data_page, YOUSJ_PAGE_SIZE,
+                          YOUSJ_VMM_READ | YOUSJ_VMM_WRITE) != 0)
+            ok = 0;
+        if (ok && (vmm_translate(&space, 0x400000, &translated, NULL) != 0 ||
+                   translated != data_page))
+            ok = 0;
+        if (ok && vmm_unmap(&space, 0x400000, YOUSJ_PAGE_SIZE) != 0)
+            ok = 0;
+        if (data_page != 0)
+            (void)pmm_free_page(data_page);
+        if (ok) {
+            vmm_destroy_space(&space);
+            serial_puts("Yousj OS: VMM self-test PASS (no CR3 switch yet)\n");
+        } else {
+            serial_puts("Yousj OS: VMM self-test FAILED, halting\n");
+            halt_forever();
+        }
+    }
+
     /* Next steps, in order (owned by coordinator):
-     * 2. virtual memory (identity + kernel map)
-     * 3. scheduler + first kernel thread
-     * 4. console input, then jump to userland init/shell (server userland)
+     * 3. bootloader contract + CR3 switch to the kernel's own tables
+     *    (hardware start decided by the user 2026-11-01: virtual
+     *    machine / QEMU first, real hardware later)
+     * 4. scheduler + first kernel thread
+     * 5. console input, then jump to userland init/shell (server userland)
      */
-    serial_puts("Yousj OS: stage 1 PMM done, next is VMM, halting for now\n");
+    serial_puts("Yousj OS: stage 1 PMM+VMM logic done, halting for now\n");
     halt_forever();
 }

@@ -8,16 +8,21 @@ CFLAGS  := -ffreestanding -fno-stack-protector -fno-pic -m64 -mno-red-zone \
 HOSTCFLAGS := -Wall -Wextra -I kernel/include
 BUILD   := build
 
-KERNEL_OBJS := $(BUILD)/kmain.o $(BUILD)/pmm.o
+KERNEL_OBJS := $(BUILD)/kmain.o $(BUILD)/pmm.o $(BUILD)/vmm.o $(BUILD)/vmm_arch.o
 
 .PHONY: check test clean
 check: $(KERNEL_OBJS)
 	@echo "check OK: kernel core compiles freestanding"
 
-test: $(BUILD)/test_pmm
+test: $(BUILD)/test_pmm $(BUILD)/test_vmm
 	./$(BUILD)/test_pmm
+	./$(BUILD)/test_vmm
 
 $(BUILD)/kmain.o: kernel/arch/x86_64/kmain.c kernel/include/yousj/*.h
+	mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD)/vmm_arch.o: kernel/arch/x86_64/vmm_arch.c kernel/include/yousj/*.h
 	mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -25,9 +30,17 @@ $(BUILD)/pmm.o: kernel/mm/pmm.c kernel/include/yousj/*.h
 	mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
+$(BUILD)/vmm.o: kernel/mm/vmm.c kernel/include/yousj/*.h
+	mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+
 $(BUILD)/test_pmm: tests/test_pmm.c kernel/mm/pmm.c kernel/include/yousj/*.h
 	mkdir -p $(BUILD)
 	$(CC) $(HOSTCFLAGS) tests/test_pmm.c kernel/mm/pmm.c -o $@
+
+$(BUILD)/test_vmm: tests/test_vmm.c kernel/mm/vmm.c kernel/mm/pmm.c kernel/include/yousj/*.h
+	mkdir -p $(BUILD)
+	$(CC) $(HOSTCFLAGS) tests/test_vmm.c kernel/mm/vmm.c kernel/mm/pmm.c -o $@
 
 clean:
 	rm -rf $(BUILD)
