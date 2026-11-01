@@ -23,8 +23,10 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   `make run` 经 32 位 Multiboot 桩 + ELF64 内核模块链路启动，串口实测
   输出 kmain 到达、PMM 自检 PASS、VMM 自检 PASS。Multiboot 桩只是
   冒烟工具，正式 Bootloader 为自写 UEFI 应用（见 bootloader/DESIGN.md）。
-- ⏳ 下一步：调度器（内核线程先行，设计见 docs/SCHED_DESIGN.md）、
-  UEFI Bootloader 主线、init/Shell 上机。
+- ✅ 调度器 M0+M1（2026-11-01）：协作式轮转内核线程；逻辑层宿主机
+  单测全过，QEMU 实测两线程严格交替 10 轮并干净退出（串口自检 PASS）。
+- ⏳ 下一步：M2 抢占（IDT+PIC+PIT 100Hz）、UEFI Bootloader 主线、
+  init/Shell 上机。
 
 ## 开发分工（三方并行 + Muse 本人下场）
 
