@@ -1,18 +1,14 @@
 /* Yousj OS - bootloader-side boot_info construction.
  *
- * Written from scratch. Two halves live in this file:
+ * Written from scratch. Everything in this file is pure conversion:
+ * no firmware calls, no globals, no allocation. Data in, struct out.
+ * It turns an abstract firmware memory map into the
+ * struct yousj_boot_info the kernel expects (see <yousj/boot.h>),
+ * and can be read and host-tested on its own.
  *
- *   1. Pure conversion (everything down to yousj_boot_info_set_cmdline):
- *      no firmware calls, no globals, no allocation. Data in, struct
- *      out. This half is complete and can be read and tested on its
- *      own; it turns an abstract firmware memory map into the
- *      struct yousj_boot_info the kernel expects (see <yousj/boot.h>).
- *
- *   2. Firmware entry (yousj_bootloader_entry at the bottom): a TODO
- *      skeleton only. The UEFI calls it needs do not exist yet, so
- *      it returns -1 and must not be mistaken for a working
- *      bootloader. See bootloader/DESIGN.md section 3 for the full
- *      step list and section 7 for the TODO list.
+ * The firmware side that feeds it (UEFI calls, file loading,
+ * ExitBootServices, the jump to kmain) lives in efi_main.c; the
+ * minimal UEFI types live in uefi.h. See bootloader/DESIGN.md.
  */
 #include "boot_info.h"
 
@@ -232,52 +228,3 @@ void yousj_boot_info_set_cmdline(struct yousj_boot_info *info,
     info->cmdline[i] = '\0';
 }
 
-/* ------------------------------------------------------------------ */
-/* Firmware side: TODO skeleton. Nothing below this line can boot.    */
-/* ------------------------------------------------------------------ */
-
-int yousj_bootloader_entry(void *image_handle, void *system_table)
-{
-    (void)image_handle;
-    (void)system_table;
-
-    /* TODO (DESIGN.md sections 3 and 7, TODO-1..TODO-5): implement
-     * the UEFI application flow, in this exact order:
-     *
-     *   1. Save ImageHandle / SystemTable; log one line via ConOut
-     *      (console output dies at ExitBootServices).
-     *   2. Open the ESP via LoadedImage + SimpleFileSystem, read the
-     *      kernel image file fully into a pool buffer.
-     *   3. AllocatePages for the kernel image; place it per its
-     *      ELF64 PT_LOAD program headers (p_paddr, zero the
-     *      p_memsz tail) -- minimal ELF loader, TODO-3. Remember
-     *      [kernel_base, kernel_end).
-     *   4. AllocatePages for the boot_info struct itself and for a
-     *      kernel stack; remember both ranges.
-     *   5. Walk the UEFI configuration table for the ACPI 2.0/1.0
-     *      GUIDs -> boot_info.rsdp_addr (0 when absent).
-     *   6. Convert LoadOptions (UTF-16) to ASCII and call
-     *      yousj_boot_info_set_cmdline().
-     *   7. GetMemoryMap, two-call sizing dance, striding by the
-     *      firmware's DescriptorSize (never sizeof), requiring
-     *      DescriptorVersion == 1. Translate descriptors into
-     *      struct yousj_fw_mem_entry[] (page count -> bytes).
-     *      TODO-5: sort by base if a firmware ever returns them
-     *      out of order.
-     *   8. yousj_boot_info_build(&info, fw, n, kernel_base,
-     *      kernel_end - kernel_base), then
-     *      yousj_boot_info_mark_range(..., YOUSJ_MEM_BOOTLOADER)
-     *      for the boot_info and stack ranges from step 4.
-     *      Any failure here: print via ConOut and halt -- do not
-     *      jump with a map that might free the kernel's own pages.
-     *   9. ExitBootServices with the step-7 MapKey. On
-     *      INVALID_PARAMETER, redo steps 7-8 and retry exactly
-     *      once (TODO-4). After a successful exit: no firmware
-     *      calls, no allocation, no ConOut, ever again.
-     *  10. cli; load RSP with the step-4 stack top (16-byte
-     *      aligned); load RDI with the boot_info address; jmp to
-     *      the kernel entry (kmain, per <yousj/boot.h>).
-     *
-     * Until those steps exist, report "not implemented" honestly. */
-    return -1;
-}

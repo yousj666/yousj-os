@@ -13,9 +13,10 @@
  *     yousj_boot_info_mark_range()
  *     yousj_boot_info_set_cmdline()
  *
- *   Firmware entry (declared here, body still a TODO skeleton in
- *   boot_info.c -- it must NOT be treated as a working bootloader):
- *     yousj_bootloader_entry()
+ * The firmware entry point itself (efi_main) lives in efi_main.c
+ * and is not declared here; this header covers only the pure
+ * conversion half and the abstract firmware-map entry type it
+ * consumes.
  */
 #ifndef YOUSJ_BOOTLOADER_BOOT_INFO_H
 #define YOUSJ_BOOTLOADER_BOOT_INFO_H
@@ -34,8 +35,8 @@
  * one place: yousj_boot_map_uefi_type().
  *
  * Precondition for the conversion: entries are sorted by ascending
- * `base` (UEFI memory maps are in practice; see the TODO about
- * sorting in boot_info.c). Overlapping entries are not expected;
+ * `base` (efi_main.c sorts the descriptors it fetched before
+ * calling the build). Overlapping entries are not expected;
  * adjacent entries are merged when they share a type. */
 struct yousj_fw_mem_entry {
     uint64_t base;
@@ -103,14 +104,5 @@ int yousj_boot_info_mark_range(struct yousj_boot_info *info,
  * the firmware side before calling this.) */
 void yousj_boot_info_set_cmdline(struct yousj_boot_info *info,
                                  const char *cmdline);
-
-/* Bootloader firmware entry point -- TODO, NOT YET IMPLEMENTED.
- *
- * The real signature will take the UEFI ImageHandle and
- * EFI_SYSTEM_TABLE pointer once the bootloader adopts UEFI types
- * (DESIGN.md TODO-1); void* keeps this skeleton free of any UEFI
- * header dependency. The current body in boot_info.c only lists the
- * required steps and returns -1. It cannot boot anything. */
-int yousj_bootloader_entry(void *image_handle, void *system_table);
 
 #endif /* YOUSJ_BOOTLOADER_BOOT_INFO_H */

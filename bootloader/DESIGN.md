@@ -216,24 +216,30 @@ kmain 只校验 magic，图错了 PMM 会把错图当真理。
 
 ## 7. 本目录交付与待落地清单
 
-已交付（本次）：
+已交付：
 
 - `DESIGN.md`：本文。
-- `boot_info.h` / `boot_info.c`：boot_info 填充骨架。纯函数部分
-  （类型映射、图转换、区间改型、命令行拷贝）完整可读、可单独编译自检；
-  固件相关部分（efi_main 全流程）只写步骤骨架与 `TODO` 标记，返回未实现，
-  **不假装能启动**。
+- `boot_info.h` / `boot_info.c`：boot_info 纯转换（类型映射、图转换、
+  区间改型、命令行拷贝），完整可读、可单独编译自检。
+- `uefi.h`：自写最小 UEFI 类型子集（ms_abi 已标注），零外部依赖。
+- `efi_main.c`：efi_main 全流程真实现（读 ESP 内核文件 → ELF64
+  PT_LOAD 加载并按址申页 → boot_info/栈申页 → RSDP/命令行 →
+  取图+转换（转换数组在取图前预分配，取图后零分配，保 MapKey
+  有效）→ ExitBootServices 一次重试 → 关中断、串口面包屑、
+  RDI=boot_info 直跳 kmain 符号）。总协调验收时修了两处：
+  kmain 符号名比较越界（精确名永远匹配不上）、转换数组分配
+  顺序（原顺序可能使 MapKey 失效且重试无法自愈）；符号查找已
+  用真实内核 ELF 对照 nm 验证（0x100245 一致）。
 
 待落地（实现期，按序）：
 
-- TODO-1：引入 UEFI 头文件与类型（自写最小子集或 gnu-efi，二选一提请
-  协调者定；倾向自写最小子集，保持零外部依赖与从零原则）。
-- TODO-2：efi_main 全流程（§3 第 1–10 步），含文件读取与 AllocatePages。
-- TODO-3：ELF64 最小加载器（§4.2 方案 A），或按协调者结论改平面映像。
-- TODO-4：ExitBootServices 重试路径 + 无固件状态下的串口兜底日志。
-- TODO-5：固件图乱序时的排序（或断言停住）。
+- TODO-1～TODO-5：**已完成**（见上 efi_main.c；TODO-1 按倾向
+  采用自写最小子集）。
 - TODO-6：与内核侧联调——OVMF/真机二选一由用户拍板后（§2.2），按选定
   环境做第一次「固件 → 引导器 → kmain 串口出字」端到端验证。
+  前置缺口：需 PE/COFF 目标工具链把 efi_main 链成 BOOTX64.EFI
+  （沙箱暂无 mingw/clang，待协调者解决）；内核侧入口为 kmain
+  直跳，GDT/TSS 自建在 SYSCALL_DESIGN 地盘排期中。
 
 ## 8. 给协调者的接口提案（如需批复）
 
