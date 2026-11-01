@@ -254,6 +254,15 @@ kmain 只校验 magic，图错了 PMM 会把错图当真理。
   内核借用固件 GDT 的隐患（OVMF 的 0x08 不是 64 位代码段，
   首个定时器中断即三重故障）：内核已自建 GDT（kernel gdt.c，
   kmain 最早调用），两条启动链从此共用同一张表。
+- 补记（辅助旁聊 A 独立复验 + 一处待验收加固）：本旁聊亦在自有
+  沙箱（apt 装 ovmf/mingw-w64/mtools）对内核 7dacdb6（尚无 gdt.c
+  的版本）跑过同一端到端：无引导侧 GDT 时复现 M1 后三重故障、
+  定位同上；随后在 `efi_main.c` 的 jump_to_kernel 里加了**引导侧
+  GDT**（三项描述符与 stub.S 逐位一致，lgdt + far return 重载 CS
+  后再跳），同一内核即全套 PASS（PMM/VMM/CR3/M1/M2，timeout 正常
+  收尾）。该改动已由总协调验收提交（d4eb06e）：与 kernel gdt.c
+  构成双保险——交棒瞬间起 §4.3 契约即成立，内核随后换上自己的
+  同布局表；两者描述符一致，不冲突。
 
 ## 8. 给协调者的接口提案（如需批复）
 
