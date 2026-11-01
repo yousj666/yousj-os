@@ -11,6 +11,7 @@
 #include <yousj/vmm.h>
 #include <yousj/sched.h>
 #include <yousj/interrupts.h>
+#include <yousj/gdt.h>
 #include <drivers/serial.h> /* kernel/drivers/serial.h; -I kernel in Makefile */
 
 /* M1 demo threads (SCHED_DESIGN.md milestone M1): two cooperative
@@ -119,11 +120,15 @@ void kmain(struct yousj_boot_info *boot_info)
     serial_init();
     serial_puts("\nYousj OS: kmain reached (server-first build)\n");
 
-    /* IDT + PIC go in as early as possible (all IRQs masked,
-     * interrupts still off): from here on, a fault anywhere below
-     * produces a serial exception dump instead of a silent triple
-     * fault, and thread trampolines may safely sti (M1 threads run
-     * before timer_start(), when no source can fire yet). */
+    /* Own GDT first (the boot environment's table is not ours to
+     * trust -- under UEFI its selector 0x08 is not even a 64-bit
+     * code segment), then IDT + PIC as early as possible (all IRQs
+     * masked, interrupts still off): from here on, a fault anywhere
+     * below produces a serial exception dump instead of a silent
+     * triple fault, and thread trampolines may safely sti (M1
+     * threads run before timer_start(), when no source can fire
+     * yet). */
+    gdt_init();
     interrupts_init();
 
     if (boot_info == NULL) {

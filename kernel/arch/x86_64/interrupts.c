@@ -35,10 +35,10 @@ static void idt_set_gate(int vec, uint64_t handler)
 {
     struct idt_entry *e = &g_idt[vec];
     e->offset_low = (uint16_t)(handler & 0xFFFF);
-    e->selector = 0x08; /* code64 descriptor in the active (stub) GDT;
-                           a kernel GDT replaces it together with the
-                           UEFI bootloader chain, and this constant
-                           moves with it */
+    e->selector = 0x08; /* kernel code64 in OUR GDT (gdt.c installs
+                           it before interrupts_init runs, on every
+                           boot path -- the boot environment's own
+                           table is never trusted with our gates) */
     e->ist = 0;
     e->type_attr = 0x8E; /* present, DPL 0, 64-bit interrupt gate */
     e->offset_mid = (uint16_t)((handler >> 16) & 0xFFFF);
