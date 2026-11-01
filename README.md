@@ -25,8 +25,12 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   冒烟工具，正式 Bootloader 为自写 UEFI 应用（见 bootloader/DESIGN.md）。
 - ✅ 调度器 M0+M1（2026-11-01）：协作式轮转内核线程；逻辑层宿主机
   单测全过，QEMU 实测两线程严格交替 10 轮并干净退出（串口自检 PASS）。
-- ⏳ 下一步：M2 抢占（IDT+PIC+PIT 100Hz）、UEFI Bootloader 主线、
-  init/Shell 上机。
+- ✅ 调度器 M2（2026-11-01）：IDT+PIC+PIT 100Hz 抢占跑通——从不让出
+  的两个忙等线程被时钟轮转（1 秒内各推进约 6000 万/5200 万次计数），
+  睡眠线程 3 次准时醒来；异常有串口转储不再静默三重故障。一键冒烟：
+  tools/qemu-smoke.sh。
+- ⏳ 下一步：VMM 硬件步（切 CR3 到内核自己的页表）、M3 Ring 3 冒烟、
+  UEFI Bootloader 主线、init/Shell 上机。
 
 ## 开发分工（三方并行 + Muse 本人下场）
 
