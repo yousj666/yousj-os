@@ -9,7 +9,7 @@ CFLAGS  := -DYOUSJ_KERNEL -ffreestanding -fno-stack-protector -fno-pic -m64 -mno
 HOSTCFLAGS := -Wall -Wextra -I kernel/include
 BUILD   := build
 
-KERNEL_OBJS := $(BUILD)/kmain.o $(BUILD)/pmm.o $(BUILD)/vmm.o $(BUILD)/vmm_arch.o $(BUILD)/serial.o $(BUILD)/sched.o $(BUILD)/context_switch.o $(BUILD)/interrupts.o $(BUILD)/isr.o $(BUILD)/gdt.o
+KERNEL_OBJS := $(BUILD)/kmain.o $(BUILD)/pmm.o $(BUILD)/vmm.o $(BUILD)/vmm_arch.o $(BUILD)/syscall.o $(BUILD)/syscall_entry.o $(BUILD)/m3_user_bin.o $(BUILD)/serial.o $(BUILD)/sched.o $(BUILD)/context_switch.o $(BUILD)/interrupts.o $(BUILD)/isr.o $(BUILD)/gdt.o
 
 .PHONY: check test clean
 check: $(KERNEL_OBJS)
@@ -64,6 +64,24 @@ $(BUILD)/gdt.o: kernel/arch/x86_64/gdt.c kernel/include/yousj/*.h
 	mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
+$(BUILD)/syscall.o: kernel/syscall/syscall.c kernel/include/yousj/*.h kernel/drivers/serial.h
+	mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD)/syscall_entry.o: kernel/arch/x86_64/syscall_entry.S
+	mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# First ring-3 program: flat binary at YOUSJ_USER_CODE_VA, embedded
+# into the kernel image for the M3 smoke.
+$(BUILD)/m3_user.bin: userland/m3_user.S
+	mkdir -p $(BUILD)
+	as --64 -o $(BUILD)/m3_user_asm.o $<
+	ld -Ttext=0x8000000000 --oformat=binary -o $@ $(BUILD)/m3_user_asm.o
+
+$(BUILD)/m3_user_bin.o: $(BUILD)/m3_user.bin
+	cd $(BUILD) && objcopy -I binary -O elf64-x86-64 m3_user.bin m3_user_bin.o
+
 $(BUILD)/isr.o: kernel/arch/x86_64/isr.S
 	mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -85,7 +103,7 @@ STUB := $(BUILD)/yousj-stub.elf
 CFLAGS32 := -m32 -ffreestanding -fno-stack-protector -fno-pic -mno-red-zone \
             -Wall -Wextra -I kernel/include -I kernel
 KERNEL_LINK_OBJS := $(BUILD)/entry64.o $(BUILD)/kmain.o \
-                    $(BUILD)/serial.o $(BUILD)/pmm.o $(BUILD)/vmm.o $(BUILD)/vmm_arch.o \
+                    $(BUILD)/serial.o $(BUILD)/pmm.o $(BUILD)/vmm.o $(BUILD)/vmm_arch.o $(BUILD)/syscall.o $(BUILD)/syscall_entry.o $(BUILD)/m3_user_bin.o \
                     $(BUILD)/sched.o $(BUILD)/context_switch.o $(BUILD)/interrupts.o $(BUILD)/isr.o $(BUILD)/gdt.o
 STUB_LINK_OBJS := $(BUILD)/stub.o $(BUILD)/stub_main.o $(BUILD)/stub_bootinfo.o
 

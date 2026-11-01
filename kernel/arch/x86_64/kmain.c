@@ -12,6 +12,7 @@
 #include <yousj/sched.h>
 #include <yousj/interrupts.h>
 #include <yousj/gdt.h>
+#include <yousj/user.h>
 #include <drivers/serial.h> /* kernel/drivers/serial.h; -I kernel in Makefile */
 
 /* M1 demo threads (SCHED_DESIGN.md milestone M1): two cooperative
@@ -101,9 +102,14 @@ static void monitor_thread(void *arg)
     } else {
         serial_puts("Yousj OS: sched M2 self-test FAILED\n");
     }
-    /* Test over: stop the world (the spinners would run forever). */
-    for (;;)
-        __asm__ volatile("cli; hlt");
+    /* Test over: just exit. The spinners would run forever, but
+     * they only burn their own timeslices; the M3 launcher thread
+     * (created alongside) notices this thread's zombie and carries
+     * the boot sequence on. Orchestration must live in a queued
+     * thread like this one: once immortal threads exist, the idle
+     * task (kmain) is only a fallback and would never run again to
+     * notice anything -- the exact trap the M2 design warned about
+     * when it made the observer a monitor thread, not idle. */
 }
 
 static void halt_forever(void)
@@ -111,6 +117,119 @@ static void halt_forever(void)
     for (;;) {
         __asm__ volatile("cli; hlt");
     }
+}
+
+
+struct m3_launcher_arg {
+    struct task *m2_monitor;
+};
+
+/* Stage 1, step 5 (SCHED_DESIGN milestone M3): the first ring-3
+ * program, orchestrated from a queued kernel thread (see the
+ * monitor's comment for why idle cannot do this job). Waits for
+ * the M2 monitor to finish, then gives one user task its own
+ * address space (kernel identity subtree shared, image + stack at
+ * YOUSJ_USER_BASE), lands it in ring 3 via iretq, and requires it
+ * to print its pid through the write syscall and exit with status
+ * 42. The two M2 spinners keep looping in the background --
+ * background noise the scheduler just has to live with now. On the
+ * verdict it stops the machine: this is the last boot milestone
+ * for now. */
+static void m3_launcher_thread(void *arg)
+{
+    struct m3_launcher_arg *larg = (struct m3_launcher_arg *)arg;
+    extern const uint8_t _binary_m3_user_bin_start[];
+    extern const uint8_t _binary_m3_user_bin_end[];
+    static struct vmm_space uspace;
+    static struct user_start ustart;
+    struct task *ut;
+    uint64_t code_size = (uint64_t)(_binary_m3_user_bin_end -
+                                    _binary_m3_user_bin_start);
+    uint64_t code_pages = (code_size + YOUSJ_PAGE_SIZE - 1) /
+                          YOUSJ_PAGE_SIZE;
+    uint64_t i;
+    int ok = 1;
+
+    while (task_state_of(larg->m2_monitor) != TASK_ZOMBIE)
+        sched_sleep_ticks(10);
+
+    if (vmm_create_space(&uspace) != 0)
+        ok = 0;
+    if (ok)
+        vmm_share_kernel_identity(&uspace);
+    /* Image pages: RWX for now (the flat binary keeps its strings
+     * in the same page); W^X separation arrives when the ELF
+     * loader distinguishes segments (M4). */
+    for (i = 0; ok && i < code_pages; i++) {
+        uint64_t frame = pmm_alloc_page();
+        const uint8_t *src = _binary_m3_user_bin_start +
+                             i * YOUSJ_PAGE_SIZE;
+        uint64_t chunk = code_size - i * YOUSJ_PAGE_SIZE;
+        uint64_t j;
+        if (frame == 0) { ok = 0; break; }
+        if (chunk > YOUSJ_PAGE_SIZE)
+            chunk = YOUSJ_PAGE_SIZE;
+        for (j = 0; j < chunk; j++)
+            ((uint8_t *)(uintptr_t)frame)[j] = src[j];
+        if (vmm_map(&uspace, YOUSJ_USER_CODE_VA + i * YOUSJ_PAGE_SIZE,
+                    frame, YOUSJ_PAGE_SIZE,
+                    YOUSJ_VMM_READ | YOUSJ_VMM_WRITE |
+                    YOUSJ_VMM_EXEC | YOUSJ_VMM_USER) != 0)
+            ok = 0;
+    }
+    /* Stack: 4 pages below YOUSJ_USER_STACK_TOP, RW, no exec. */
+    for (i = 0; ok && i < 4; i++) {
+        uint64_t frame = pmm_alloc_page();
+        if (frame == 0) { ok = 0; break; }
+        if (vmm_map(&uspace,
+                    YOUSJ_USER_STACK_TOP - (i + 1) * YOUSJ_PAGE_SIZE,
+                    frame, YOUSJ_PAGE_SIZE,
+                    YOUSJ_VMM_READ | YOUSJ_VMM_WRITE |
+                    YOUSJ_VMM_USER) != 0)
+            ok = 0;
+    }
+    if (!ok) {
+        serial_puts("Yousj OS: sched M3 FAILED (user space setup)\n");
+        halt_forever();
+    }
+
+    syscall_init();
+    ustart.ip = YOUSJ_USER_CODE_VA;
+    ustart.sp = YOUSJ_USER_STACK_TOP;
+
+    /* Create + bind the address space atomically w.r.t. the
+     * timer: the new task must never be scheduled before its
+     * mm is attached. */
+    __asm__ volatile("cli");
+    ut = kthread_create_auto("user-smoke", user_task_start, &ustart);
+    if (ut != NULL)
+        ut->mm = &uspace;
+    __asm__ volatile("sti");
+    if (ut == NULL) {
+        serial_puts("Yousj OS: sched M3 FAILED (task create)\n");
+        halt_forever();
+    }
+    while (task_state_of(ut) != TASK_ZOMBIE)
+        sched_sleep_ticks(5);
+    if (ut->exit_status == 42) {
+        serial_puts("Yousj OS: sched M3 self-test PASS "
+                    "(ring3 program ran, syscalls served, exit 42)\n");
+    } else {
+        serial_puts("Yousj OS: sched M3 self-test FAILED (exit status ");
+        serial_put_u64((uint64_t)(uint32_t)ut->exit_status);
+        serial_puts(")\n");
+        halt_forever();
+    }
+    /* The user space is deliberately NOT destroyed: its entry 0
+     * is shared with the master (destroy handles that), but the
+     * image/stack frames have no owner-tracking yet. Stage-1
+     * smoke leak; reaper arrives with real process teardown. */
+
+    /* All boot self-tests passed. What remains of stage 1, in
+     * order (owned by coordinator): M4 (ELF init as PID 1), M5
+     * (clone/exec split + standalone shell), console input. */
+    serial_puts("Yousj OS: all stage-1 boot self-tests done, halting for now\n");
+    halt_forever();
 }
 
 /* Kernel entry. boot_info may be NULL in the earliest bring-up builds,
@@ -291,12 +410,15 @@ void kmain(struct yousj_boot_info *boot_info)
      * preemption. Two busy threads never yield; both counters must
      * still advance, and the sleeper must complete 3 sleep/wake
      * cycles. The monitor thread (not idle -- see its comment)
-     * verifies and prints the verdict, then stops the world. */
+     * verifies and prints the verdict, then exits; the M3 launcher
+     * thread created alongside it picks the sequence up from
+     * there, and kmain settles into pure idle. */
     {
         static volatile uint64_t spin_c, spin_d;
         static struct spin_arg carg, darg;
         static struct monitor_arg marg;
-        struct task *tc, *td, *ts, *tm;
+        static struct m3_launcher_arg larg;
+        struct task *tc, *td, *ts, *tm, *t3;
 
         carg.count = &spin_c;
         darg.count = &spin_d;
@@ -307,24 +429,20 @@ void kmain(struct yousj_boot_info *boot_info)
         marg.spin_c = &spin_c;
         marg.spin_d = &spin_d;
         tm = kthread_create_auto("monitor-M", monitor_thread, &marg);
-        if (tc == NULL || td == NULL || ts == NULL || tm == NULL) {
+        larg.m2_monitor = tm;
+        t3 = kthread_create_auto("m3-launcher", m3_launcher_thread, &larg);
+        if (tc == NULL || td == NULL || ts == NULL || tm == NULL ||
+            t3 == NULL) {
             serial_puts("Yousj OS: sched M2 FAILED (thread create)\n");
             halt_forever();
         }
 
         timer_start(); /* PIT 100 Hz live: preemption from here */
 
-        /* Idle from here on: the monitor drives the test. */
+        /* Idle from here on: the monitor drives the M2 test, the
+         * launcher drives everything after it. */
         for (;;)
             __asm__ volatile("hlt" : : : "memory");
     }
 
-    /* Unreachable while the M2 demo above idles forever; kept as
-     * the halt target for the milestone that replaces the demo.
-     * Next steps, in order (owned by coordinator):
-     * 5. CR3 switch to the kernel's own tables (VMM hardware step)
-     * 6. M3: Ring 3 smoke (flat user binary, iretq, getpid/write/exit)
-     * 7. console input, then userland init/shell (server userland)
-     */
-    halt_forever();
 }
