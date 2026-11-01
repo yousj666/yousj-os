@@ -32,8 +32,12 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
 - ✅ VMM 硬件步 1（2026-11-01）：CR3 已从引导桩页表切换到内核自有
   主空间（全 RAM 恒等映射＋映像区可执行，NXE/WP 已开）；切换后在
   2GiB 处映射/写入/翻译/撤销冒烟通过，M1/M2 自检在新页表上照常 PASS。
-- ⏳ 下一步：M3 Ring 3 冒烟（用户态落点＋syscall 入口）、高半区＋HHDM
-  布局（随 UEFI 链）、UEFI Bootloader 主线、init/Shell 上机。
+- ✅ UEFI 启动链端到端打通（2026-11-01）：自写 BOOTX64.EFI 在
+  QEMU/OVMF 下把内核送入 kmain，全部自检（PMM/VMM/CR3 切换/调度
+  M1+M2）在 UEFI 链上与 Multiboot 冒烟链上双双 PASS。内核已自建
+  GDT，不再借用启动环境的表（bootloader/Makefile 一键出 ESP 镜像）。
+- ⏳ 下一步：M3 Ring 3 冒烟（用户段＋TSS＋syscall 入口）、高半区＋
+  HHDM 布局、init/Shell 上机。
 
 ## 开发分工（三方并行 + Muse 本人下场）
 

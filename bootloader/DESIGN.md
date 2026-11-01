@@ -59,7 +59,7 @@ x86_64 长模式，不用再写模式切换；内存图、ACPI 表、文件访�
 固件 (UEFI)
   │ 加载 \EFI\YOUSJ\BOOTX64.EFI，传入 ImageHandle + SystemTable
   ▼
-efi_main（Bootloader 入口，骨架见 boot_info.c 末尾 TODO 区）
+efi_main（Bootloader 入口，实现见 efi_main.c；UEFI 类型见 uefi.h）
   1. 存 ImageHandle/SystemTable；用固件 ConOut 打最早一行日志（退出服务后不可用）
   2. 经 LoadedImage + SimpleFileSystem 打开 ESP，读内核映像文件到临时缓冲
   3. 给内核映像分配物理页（AllocatePages），按 §4 布局放好，记下
@@ -125,11 +125,22 @@ boot.h 是唯一合同，交棒必须逐字满足它：
   `void kmain(struct yousj_boot_info *boot_info)`；
 - 用 `jmp` 不用 `call`：kmain 不返回（最终 `cli; hlt`），不需要返回地址；
 - 交棒时中断关闭（`cli`），分页沿用 UEFI 的恒等映射现状——阶段 1 内核
-  靠物理地址直接读 boot_info 与内存图，VMM 阶段再换自有页表（内核事项）；
-- **入口衔接提案（给协调者）**：kmain 是 C 函数，默认预期由一个汇编入口
-  桩先清 BSS、设栈再调它。若链接布局保证 BSS 已由本加载器按 §4.2 清零、
-  栈由本加载器备好，则 Bootloader 可直跳 kmain 本体，入口桩可以省；
-  二选一请协调者在链接脚本落地时定，Bootloader 两边都配合。
+  靠物理地址直接读 boot_info 与内存图，其 VMM 硬件步再切自有页表
+  （内核事项，UEFI 链实测已通过该步）；
+- **GDT 契约（2026-11-01 OVMF 实测踩出，重要）**：内核在开中断前不加载
+  自己的 GDT——其 IDT 表项写死选择子 `0x08` 为「当前 GDT 中的 code64
+  描述符」（kernel/arch/x86_64/interrupts.c），数据段按 `0x10`。EDK2
+  固件 GDT 的 0x08 不是 code64，沿用固件 GDT 时第一个时钟中断即三级
+  fault。Multiboot 桩的 GDT 恰好是这个布局。故交棒前 Bootloader 必须
+  自带并 `lgdt` 一份三项 GDT（null / 0x08 code64 / 0x10 data，描述符
+  与 stub.S 逐位一致），far return 重载 CS、0x10 重载数据段，然后才
+  跳。**启动契约由此明确：谁引导谁提供这份 GDT 布局。**
+- **入口衔接（已落地）**：Bootloader 按 §4.2 方案 A 加载（BSS 清零、
+  栈另行备好），并解析 ELF 符号表直跳 `kmain` 符号本体（boot.h 字面
+  合同）。现行 `_kentry64` 是 Multiboot 桩专属入口（从物理 0x9008 读
+  boot_info、假设桩 GDT），UEFI 链不用它。若日后链接剥离符号表，
+  本加载器会 fail closed 停住——届时请内核侧立一个正式 UEFI 入口
+  符号（见 §8 提案 1）。
 
 ## 5. 内存图：获取与转换
 
@@ -235,11 +246,14 @@ kmain 只校验 magic，图错了 PMM 会把错图当真理。
 
 - TODO-1～TODO-5：**已完成**（见上 efi_main.c；TODO-1 按倾向
   采用自写最小子集）。
-- TODO-6：与内核侧联调——OVMF/真机二选一由用户拍板后（§2.2），按选定
-  环境做第一次「固件 → 引导器 → kmain 串口出字」端到端验证。
-  前置缺口：需 PE/COFF 目标工具链把 efi_main 链成 BOOTX64.EFI
-  （沙箱暂无 mingw/clang，待协调者解决）；内核侧入口为 kmain
-  直跳，GDT/TSS 自建在 SYSCALL_DESIGN 地盘排期中。
+- TODO-6：**已完成（2026-11-01，总协调联调）**。环境按 §2.2 拍板
+  走虚拟机：沙箱实有 mingw-w64 + OVMF + mtools，本目录 Makefile
+  产出 BOOTX64.EFI 与 ESP 镜像，QEMU/OVMF 端到端实测：固件 →
+  本引导器（串口面包屑 YOUSJ-UEFI）→ kmain → PMM/VMM 自检 →
+  VMM 硬件步切 CR3 → 调度 M1/M2 全 PASS。联调中定位并修复了
+  内核借用固件 GDT 的隐患（OVMF 的 0x08 不是 64 位代码段，
+  首个定时器中断即三重故障）：内核已自建 GDT（kernel gdt.c，
+  kmain 最早调用），两条启动链从此共用同一张表。
 
 ## 8. 给协调者的接口提案（如需批复）
 
