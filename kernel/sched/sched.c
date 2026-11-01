@@ -174,8 +174,15 @@ void sched_kthread_trampoline(void)
 {
     /* Runs as the "return address" of a fabricated frame, with
      * current already set to this task by sched_schedule().
-     * Interrupts stay OFF here: there is no IDT yet (M2 installs
-     * one, and its design updates this line). */
+     * Interrupts are enabled here (design sec. 5.4): kmain installs
+     * the IDT with every IRQ masked before any thread runs, so sti
+     * is safe from the very first thread; before timer_start() no
+     * source can actually fire. Cooperative M1 threads therefore
+     * also run with IF=1 but unperturbed, and from M2 on the timer
+     * can preempt any thread from its first instruction. */
+#ifdef YOUSJ_KERNEL
+    __asm__ volatile("sti");
+#endif
     struct task *me = g_current;
     if (me != NULL && me->entry != NULL)
         me->entry(me->arg);
@@ -195,6 +202,19 @@ void sched_schedule(void)
     if (prev == NULL)
         return;
 
+    /* Queue manipulation must be atomic against the timer IRQ
+     * (M2): from here to the matching restore, interrupts are off.
+     * The saved flags live on this call's own stack frame, so a
+     * task switched out mid-schedule restores ITS OWN flags when it
+     * resumes here -- the discipline is per-call, not global. On
+     * the host this guard is compiled out (YOUSJ_KERNEL undefined);
+     * cli would fault in user mode, and the host test is
+     * single-threaded anyway. */
+#ifdef YOUSJ_KERNEL
+    uint64_t flags;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(flags));
+#endif
+
     /* A still-runnable non-idle current goes to the queue tail
      * (round-robin). Blocked/zombie currents simply fall off. The
      * idle task is never queued; it is the fallback, per design. */
@@ -211,16 +231,16 @@ void sched_schedule(void)
          * or exited (fall back to idle). */
         if (prev == g_idle) {
             prev->state = TASK_RUNNING;
-            return;
+            goto out;
         }
         if (prev->state == TASK_RUNNING)
-            return; /* safety net; not expected to be reachable */
+            goto out; /* safety net; not expected to be reachable */
         next = g_idle;
     }
 
     if (next == prev) {
         prev->state = TASK_RUNNING;
-        return;
+        goto out;
     }
 
     next->state = TASK_RUNNING;
@@ -228,6 +248,12 @@ void sched_schedule(void)
     g_current = next;
     context_switch(prev, next);
     /* When prev runs again, it resumes here. */
+
+out:
+#ifdef YOUSJ_KERNEL
+    __asm__ volatile("push %0; popfq" : : "r"(flags) : "memory");
+#endif
+    ;
 }
 
 void sched_yield(void)
@@ -275,4 +301,60 @@ uint64_t sched_count_state(enum task_state state)
             n++;
     }
     return n;
+}
+
+/* --- M2: tick, preemption, sleeping -------------------------------------- */
+
+static uint64_t g_ticks;
+
+uint64_t sched_uptime_ticks(void)
+{
+    return g_ticks;
+}
+
+void sched_tick(void)
+{
+    uint64_t i;
+
+    g_ticks++;
+
+    /* Wake due sleepers first, so a reschedule below can pick them. */
+    for (i = 0; i < YOUSJ_SCHED_MAX_TASKS; i++) {
+        struct task *t = &g_tasks[i];
+        if (t->in_use && t->state == TASK_BLOCKED && t->wake_tick != 0 &&
+            g_ticks >= t->wake_tick) {
+            t->wake_tick = 0;
+            sched_wake(t);
+        }
+    }
+
+    if (g_current == NULL)
+        return;
+    g_current->total_ticks++;
+
+    if (g_current == g_idle) {
+        /* Idle never burns a slice; just give queued work a chance. */
+        sched_schedule();
+        return;
+    }
+    if (g_current->timeslice_left > 0)
+        g_current->timeslice_left--;
+    if (g_current->timeslice_left == 0)
+        sched_schedule();
+}
+
+void sched_sleep_ticks(uint64_t ticks)
+{
+    if (g_current == NULL || g_current == g_idle || ticks == 0) {
+        sched_yield();
+        return;
+    }
+    /* wake_tick is written before the state store; a tick landing
+     * between the two sees a RUNNING task with a future wake_tick
+     * and ignores it (wake scan only touches BLOCKED tasks). */
+    g_current->wake_tick = g_ticks + ticks;
+    g_current->state = TASK_BLOCKED;
+    sched_schedule();
+    /* Resumed after sched_tick() woke us and the scheduler picked
+     * us again; wake_tick was cleared by the wake scan. */
 }

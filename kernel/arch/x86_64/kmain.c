@@ -10,6 +10,7 @@
 #include <yousj/pmm.h>
 #include <yousj/vmm.h>
 #include <yousj/sched.h>
+#include <yousj/interrupts.h>
 #include <drivers/serial.h> /* kernel/drivers/serial.h; -I kernel in Makefile */
 
 /* M1 demo threads (SCHED_DESIGN.md milestone M1): two cooperative
@@ -34,6 +35,76 @@ static void demo_thread(void *arg)
     }
 }
 
+/* M2 demo threads (SCHED_DESIGN.md milestone M2): two busy spinners
+ * that never yield -- only the timer can move them -- and a sleeper
+ * that must wake three times, once per second. */
+struct spin_arg {
+    volatile uint64_t *count;
+};
+
+static void spin_thread(void *arg)
+{
+    struct spin_arg *s = (struct spin_arg *)arg;
+    for (;;)
+        (*s->count)++;
+}
+
+static void sleeper_thread(void *arg)
+{
+    int i;
+    (void)arg;
+    for (i = 0; i < 3; i++) {
+        serial_puts("Yousj OS: thread S sleeping 1s\n");
+        sched_sleep_ticks(100);
+        serial_puts("Yousj OS: thread S woke\n");
+    }
+}
+
+/* M2 monitor: a normal thread doing the observing. It cannot be
+ * kmain/idle doing this -- with two always-runnable spinners the
+ * run queue never empties, so the idle fallback would starve and
+ * never print anything (observed on the first M2 attempt, where
+ * the sleeper finished but no PASS line ever appeared). */
+struct monitor_arg {
+    struct task *sleeper;
+    volatile uint64_t *spin_c;
+    volatile uint64_t *spin_d;
+};
+
+static enum task_state task_state_of(struct task *t)
+{
+    return ((volatile struct task *)t)->state;
+}
+
+static void monitor_thread(void *arg)
+{
+    struct monitor_arg *m = (struct monitor_arg *)arg;
+    uint64_t c1, d1, c2, d2, waited = 0;
+
+    while (task_state_of(m->sleeper) != TASK_ZOMBIE && waited < 3000) {
+        sched_sleep_ticks(10);
+        waited += 10;
+    }
+    c1 = *m->spin_c;
+    d1 = *m->spin_d;
+    sched_sleep_ticks(100); /* sample over 1 s */
+    c2 = *m->spin_c;
+    d2 = *m->spin_d;
+
+    if (task_state_of(m->sleeper) == TASK_ZOMBIE && c2 > c1 && d2 > d1) {
+        serial_puts("Yousj OS: sched M2 self-test PASS (preemption: spin-C +");
+        serial_put_u64(c2 - c1);
+        serial_puts(", spin-D +");
+        serial_put_u64(d2 - d1);
+        serial_puts(" in 1s; sleeper woke 3x and exited)\n");
+    } else {
+        serial_puts("Yousj OS: sched M2 self-test FAILED\n");
+    }
+    /* Test over: stop the world (the spinners would run forever). */
+    for (;;)
+        __asm__ volatile("cli; hlt");
+}
+
 static void halt_forever(void)
 {
     for (;;) {
@@ -47,6 +118,13 @@ void kmain(struct yousj_boot_info *boot_info)
 {
     serial_init();
     serial_puts("\nYousj OS: kmain reached (server-first build)\n");
+
+    /* IDT + PIC go in as early as possible (all IRQs masked,
+     * interrupts still off): from here on, a fault anywhere below
+     * produces a serial exception dump instead of a silent triple
+     * fault, and thread trampolines may safely sti (M1 threads run
+     * before timer_start(), when no source can fire yet). */
+    interrupts_init();
 
     if (boot_info == NULL) {
         serial_puts("Yousj OS: no boot_info, halting\n");
@@ -154,11 +232,44 @@ void kmain(struct yousj_boot_info *boot_info)
         }
     }
 
-    /* Next steps, in order (owned by coordinator):
-     * 4. M2: IDT + PIC + PIT preemption (SCHED_DESIGN sec. 4.2),
-     *    then CR3 switch to the kernel's own tables
-     * 5. console input, then jump to userland init/shell (server userland)
+    /* Stage 1, step 4 (SCHED_DESIGN milestone M2): timer
+     * preemption. Two busy threads never yield; both counters must
+     * still advance, and the sleeper must complete 3 sleep/wake
+     * cycles. The monitor thread (not idle -- see its comment)
+     * verifies and prints the verdict, then stops the world. */
+    {
+        static volatile uint64_t spin_c, spin_d;
+        static struct spin_arg carg, darg;
+        static struct monitor_arg marg;
+        struct task *tc, *td, *ts, *tm;
+
+        carg.count = &spin_c;
+        darg.count = &spin_d;
+        tc = kthread_create_auto("spin-C", spin_thread, &carg);
+        td = kthread_create_auto("spin-D", spin_thread, &darg);
+        ts = kthread_create_auto("sleeper-S", sleeper_thread, NULL);
+        marg.sleeper = ts;
+        marg.spin_c = &spin_c;
+        marg.spin_d = &spin_d;
+        tm = kthread_create_auto("monitor-M", monitor_thread, &marg);
+        if (tc == NULL || td == NULL || ts == NULL || tm == NULL) {
+            serial_puts("Yousj OS: sched M2 FAILED (thread create)\n");
+            halt_forever();
+        }
+
+        timer_start(); /* PIT 100 Hz live: preemption from here */
+
+        /* Idle from here on: the monitor drives the test. */
+        for (;;)
+            __asm__ volatile("hlt" : : : "memory");
+    }
+
+    /* Unreachable while the M2 demo above idles forever; kept as
+     * the halt target for the milestone that replaces the demo.
+     * Next steps, in order (owned by coordinator):
+     * 5. CR3 switch to the kernel's own tables (VMM hardware step)
+     * 6. M3: Ring 3 smoke (flat user binary, iretq, getpid/write/exit)
+     * 7. console input, then userland init/shell (server userland)
      */
-    serial_puts("Yousj OS: stage 1 PMM+VMM+sched(M1) done, halting for now\n");
     halt_forever();
 }

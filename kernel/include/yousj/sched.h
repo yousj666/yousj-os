@@ -53,6 +53,9 @@ struct task {
     void          (*entry)(void *arg); /* kernel threads only */
     void           *arg;
     int             exit_status;
+    uint64_t        wake_tick;    /* nonzero while sleeping: tick at
+                                     which sched_tick() wakes the
+                                     task (M2). Cleared on wake. */
     bool            in_use;
 };
 
@@ -109,5 +112,20 @@ void sched_exit_current(int status);
 
 /* Count tasks currently in the given state (pool scan; M0/M1 scale). */
 uint64_t sched_count_state(enum task_state state);
+
+/* --- M2: tick-driven preemption and sleeping -------------------------
+ * sched_tick() is called from the timer IRQ handler (100 Hz) with
+ * interrupts off. It advances the uptime counter, wakes sleepers
+ * whose wake_tick has arrived, charges the current task's slice and
+ * triggers a reschedule when the slice expires (or whenever the
+ * idle task is on CPU and work is queued). */
+void     sched_tick(void);
+uint64_t sched_uptime_ticks(void);
+
+/* Sleep for at least the given number of ticks (10 ms each at
+ * 100 Hz), via the BLOCKED state plus wake_tick; nanosleep's kernel
+ * side will build on this. Sleeping in the idle task is a no-op
+ * yield -- idle must always stay able to run the fallback loop. */
+void sched_sleep_ticks(uint64_t ticks);
 
 #endif /* YOUSJ_SCHED_H */

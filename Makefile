@@ -3,13 +3,13 @@
 # host-side unit tests (tests/) which compile the same kernel sources
 # hosted, so allocator logic is verified without needing to boot.
 CC      ?= gcc
-CFLAGS  := -ffreestanding -fno-stack-protector -fno-pic -m64 -mno-red-zone \
+CFLAGS  := -DYOUSJ_KERNEL -ffreestanding -fno-stack-protector -fno-pic -m64 -mno-red-zone \
            -mno-sse -mno-mmx \
            -Wall -Wextra -I kernel/include -I kernel
 HOSTCFLAGS := -Wall -Wextra -I kernel/include
 BUILD   := build
 
-KERNEL_OBJS := $(BUILD)/kmain.o $(BUILD)/pmm.o $(BUILD)/vmm.o $(BUILD)/vmm_arch.o $(BUILD)/serial.o $(BUILD)/sched.o $(BUILD)/context_switch.o
+KERNEL_OBJS := $(BUILD)/kmain.o $(BUILD)/pmm.o $(BUILD)/vmm.o $(BUILD)/vmm_arch.o $(BUILD)/serial.o $(BUILD)/sched.o $(BUILD)/context_switch.o $(BUILD)/interrupts.o $(BUILD)/isr.o
 
 .PHONY: check test clean
 check: $(KERNEL_OBJS)
@@ -56,6 +56,14 @@ $(BUILD)/context_switch.o: kernel/arch/x86_64/context_switch.S
 	mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
+$(BUILD)/interrupts.o: kernel/arch/x86_64/interrupts.c kernel/include/yousj/*.h
+	mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD)/isr.o: kernel/arch/x86_64/isr.S
+	mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+
 $(BUILD)/test_sched: tests/test_sched.c kernel/sched/sched.c kernel/mm/pmm.c kernel/include/yousj/*.h
 	mkdir -p $(BUILD)
 	$(CC) $(HOSTCFLAGS) tests/test_sched.c kernel/sched/sched.c kernel/mm/pmm.c -o $@
@@ -74,7 +82,7 @@ CFLAGS32 := -m32 -ffreestanding -fno-stack-protector -fno-pic -mno-red-zone \
             -Wall -Wextra -I kernel/include -I kernel
 KERNEL_LINK_OBJS := $(BUILD)/entry64.o $(BUILD)/kmain.o \
                     $(BUILD)/serial.o $(BUILD)/pmm.o $(BUILD)/vmm.o $(BUILD)/vmm_arch.o \
-                    $(BUILD)/sched.o $(BUILD)/context_switch.o
+                    $(BUILD)/sched.o $(BUILD)/context_switch.o $(BUILD)/interrupts.o $(BUILD)/isr.o
 STUB_LINK_OBJS := $(BUILD)/stub.o $(BUILD)/stub_main.o $(BUILD)/stub_bootinfo.o
 
 .PHONY: kernel run
