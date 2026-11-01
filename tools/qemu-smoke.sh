@@ -97,6 +97,7 @@ for pat in \
     "Yousj OS: kmain reached" \
     "Yousj OS: PMM self-test PASS" \
     "Yousj OS: VMM self-test PASS" \
+    "Yousj OS: VMM hw-init PASS" \
     "Yousj OS: thread A iter 0" \
     "Yousj OS: thread B iter 9" \
     "Yousj OS: sched M1 self-test PASS" \

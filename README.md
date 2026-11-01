@@ -29,8 +29,11 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   的两个忙等线程被时钟轮转（1 秒内各推进约 6000 万/5200 万次计数），
   睡眠线程 3 次准时醒来；异常有串口转储不再静默三重故障。一键冒烟：
   tools/qemu-smoke.sh。
-- ⏳ 下一步：VMM 硬件步（切 CR3 到内核自己的页表）、M3 Ring 3 冒烟、
-  UEFI Bootloader 主线、init/Shell 上机。
+- ✅ VMM 硬件步 1（2026-11-01）：CR3 已从引导桩页表切换到内核自有
+  主空间（全 RAM 恒等映射＋映像区可执行，NXE/WP 已开）；切换后在
+  2GiB 处映射/写入/翻译/撤销冒烟通过，M1/M2 自检在新页表上照常 PASS。
+- ⏳ 下一步：M3 Ring 3 冒烟（用户态落点＋syscall 入口）、高半区＋HHDM
+  布局（随 UEFI 链）、UEFI Bootloader 主线、init/Shell 上机。
 
 ## 开发分工（三方并行 + Muse 本人下场）
 
