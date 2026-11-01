@@ -45,8 +45,13 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   QEMU/OVMF 下把内核送入 kmain，全部自检（PMM/VMM/CR3 切换/调度
   M1+M2）在 UEFI 链上与 Multiboot 冒烟链上双双 PASS。内核已自建
   GDT，不再借用启动环境的表（bootloader/Makefile 一键出 ESP 镜像）。
-- ⏳ 下一步：M3 Ring 3 冒烟（用户段＋TSS＋syscall 入口）、高半区＋
-  HHDM 布局、init/Shell 上机。
+- ✅ 调度 M3（2026-11-01）：第一个 Ring 3 程序跑通——GDT 用户段＋
+  TSS 落地，`syscall`/`sysret` 入口＋分发器（write/getpid/exit）
+  上线，调度器按任务切换 CR3；扁平二进制用户程序在自有地址空间
+  里打印出自己的 pid 并以状态 42 退出，Multiboot 与 UEFI 两条
+  启动链均实测 PASS。
+- ⏳ 下一步：M4 ELF 加载（init 正式成为 PID 1）、高半区＋HHDM
+  布局、Shell 上机。
 
 ## 从零构建
 
