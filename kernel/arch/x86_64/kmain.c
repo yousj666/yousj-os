@@ -200,6 +200,56 @@ void kmain(struct yousj_boot_info *boot_info)
         }
     }
 
+    /* Stage 1, step 2b (VMM hardware step 1): switch CR3 from the
+     * boot stub's tables to a kernel-owned master space (identity
+     * map of all RAM, built by vmm_hw_init). Everything after this
+     * block -- scheduler, threads, interrupts -- runs on OUR page
+     * tables; the M1/M2 self-tests below double as the regression
+     * proof. The post-switch check maps a scratch page at 2 GiB
+     * (above RAM, previously unmapped in both table sets), writes
+     * through the NEW tables, and translates it back. */
+    {
+        uint64_t old_cr3 = vmm_read_cr3();
+        uint64_t ram_top = pmm_total_page_count() * YOUSJ_PAGE_SIZE;
+        uint64_t frame, translated = 0;
+        volatile uint64_t *scratch = (volatile uint64_t *)(uintptr_t)0x80000000ULL;
+        int ok = 1;
+
+        if (vmm_hw_init(ram_top) != 0)
+            ok = 0;
+        frame = ok ? pmm_alloc_page() : 0;
+        if (frame == 0)
+            ok = 0;
+        if (ok && vmm_map(vmm_kernel_master(), 0x80000000ULL, frame,
+                          YOUSJ_PAGE_SIZE,
+                          YOUSJ_VMM_READ | YOUSJ_VMM_WRITE) != 0)
+            ok = 0;
+        if (ok) {
+            *scratch = 0xA5A5DEADBEEF5A5AULL;
+            if (*scratch != 0xA5A5DEADBEEF5A5AULL)
+                ok = 0;
+        }
+        if (ok && (vmm_translate(vmm_kernel_master(), 0x80000000ULL,
+                                 &translated, NULL) != 0 ||
+                   translated != frame))
+            ok = 0;
+        if (ok && vmm_unmap(vmm_kernel_master(), 0x80000000ULL,
+                            YOUSJ_PAGE_SIZE) != 0)
+            ok = 0;
+        if (frame != 0)
+            (void)pmm_free_page(frame);
+        if (ok) {
+            serial_puts("Yousj OS: VMM hw-init PASS (CR3 ");
+            serial_put_hex64(old_cr3);
+            serial_puts(" -> ");
+            serial_put_hex64(vmm_read_cr3());
+            serial_puts(", kernel master identity map live)\n");
+        } else {
+            serial_puts("Yousj OS: VMM hw-init FAILED, halting\n");
+            halt_forever();
+        }
+    }
+
     /* Stage 1, step 3 (SCHED_DESIGN milestone M1): cooperative
      * kernel threads. kmain itself becomes the idle task; the two
      * demo threads must strictly alternate A/B for 10 rounds and

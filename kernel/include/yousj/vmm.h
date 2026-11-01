@@ -122,4 +122,14 @@ int  vmm_protect(struct vmm_space *space, uint64_t virt, uint64_t length,
 void vmm_load_cr3(uint64_t pml4_phys);
 uint64_t vmm_read_cr3(void);
 
+/* Hardware bring-up step 1 (arch glue, vmm_arch.c): enable
+ * EFER.NXE + CR0.WP, build the kernel master space as an identity
+ * map of [0, ram_top_phys), mark the kernel image range executable,
+ * register it via vmm_set_kernel_master() and load it into CR3.
+ * Execution continues at identity addresses, so no trampoline is
+ * needed; the higher-half/HHDM layout of VMM_DESIGN.md sec. 6.2 is
+ * a later step tied to the UEFI bootloader chain. Returns 0 or a
+ * negative errno from the mapping layer. */
+int vmm_hw_init(uint64_t ram_top_phys);
+
 #endif /* YOUSJ_VMM_H */
