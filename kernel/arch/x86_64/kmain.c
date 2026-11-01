@@ -9,7 +9,30 @@
 #include <yousj/boot.h>
 #include <yousj/pmm.h>
 #include <yousj/vmm.h>
+#include <yousj/sched.h>
 #include <drivers/serial.h> /* kernel/drivers/serial.h; -I kernel in Makefile */
+
+/* M1 demo threads (SCHED_DESIGN.md milestone M1): two cooperative
+ * kernel threads printing in alternation via sched_yield(). */
+struct demo_arg {
+    char letter;
+    volatile int *count;
+};
+
+static void demo_thread(void *arg)
+{
+    struct demo_arg *d = (struct demo_arg *)arg;
+    int i;
+    for (i = 0; i < 10; i++) {
+        serial_puts("Yousj OS: thread ");
+        serial_putc(d->letter);
+        serial_puts(" iter ");
+        serial_put_u64((uint64_t)i);
+        serial_putc('\n');
+        (*d->count)++;
+        sched_yield();
+    }
+}
 
 static void halt_forever(void)
 {
@@ -99,13 +122,43 @@ void kmain(struct yousj_boot_info *boot_info)
         }
     }
 
+    /* Stage 1, step 3 (SCHED_DESIGN milestone M1): cooperative
+     * kernel threads. kmain itself becomes the idle task; the two
+     * demo threads must strictly alternate A/B for 10 rounds and
+     * exit as zombies, which the idle loop below waits for. */
+    {
+        static volatile int count_a, count_b;
+        static struct demo_arg arg_a, arg_b;
+        struct task *ta, *tb;
+
+        arg_a.letter = 'A';
+        arg_a.count = &count_a;
+        arg_b.letter = 'B';
+        arg_b.count = &count_b;
+
+        sched_init();
+        ta = kthread_create_auto("thread-A", demo_thread, &arg_a);
+        tb = kthread_create_auto("thread-B", demo_thread, &arg_b);
+        if (ta == NULL || tb == NULL) {
+            serial_puts("Yousj OS: sched M1 FAILED (thread create)\n");
+            halt_forever();
+        }
+        while (sched_count_state(TASK_ZOMBIE) < 2)
+            sched_schedule();
+        if (count_a == 10 && count_b == 10) {
+            serial_puts("Yousj OS: sched M1 self-test PASS "
+                        "(threads A/B alternated 10 rounds, both exited)\n");
+        } else {
+            serial_puts("Yousj OS: sched M1 self-test FAILED (counts)\n");
+            halt_forever();
+        }
+    }
+
     /* Next steps, in order (owned by coordinator):
-     * 3. bootloader contract + CR3 switch to the kernel's own tables
-     *    (hardware start decided by the user 2026-11-01: virtual
-     *    machine / QEMU first, real hardware later)
-     * 4. scheduler + first kernel thread
+     * 4. M2: IDT + PIC + PIT preemption (SCHED_DESIGN sec. 4.2),
+     *    then CR3 switch to the kernel's own tables
      * 5. console input, then jump to userland init/shell (server userland)
      */
-    serial_puts("Yousj OS: stage 1 PMM+VMM logic done, halting for now\n");
+    serial_puts("Yousj OS: stage 1 PMM+VMM+sched(M1) done, halting for now\n");
     halt_forever();
 }
