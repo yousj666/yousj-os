@@ -7,6 +7,7 @@
  */
 #include <yousj/types.h>
 #include <yousj/boot.h>
+#include <yousj/pmm.h>
 
 #define SERIAL_PORT 0x3f8 /* COM1 */
 
@@ -50,6 +51,31 @@ static void serial_puts(const char *s)
     }
 }
 
+static void serial_put_u64(uint64_t v)
+{
+    char buf[20];
+    int i = 0;
+    if (v == 0) {
+        serial_putc('0');
+        return;
+    }
+    while (v > 0) {
+        buf[i++] = (char)('0' + (v % 10));
+        v /= 10;
+    }
+    while (i > 0)
+        serial_putc(buf[--i]);
+}
+
+static void serial_put_hex64(uint64_t v)
+{
+    static const char digits[] = "0123456789abcdef";
+    int shift;
+    serial_puts("0x");
+    for (shift = 60; shift >= 0; shift -= 4)
+        serial_putc(digits[(v >> shift) & 0xF]);
+}
+
 static void halt_forever(void)
 {
     for (;;) {
@@ -74,12 +100,40 @@ void kmain(struct yousj_boot_info *boot_info)
     }
 
     serial_puts("Yousj OS: boot_info OK, memory map received\n");
+
+    /* Stage 1, step 1 (done 2026-11-01): physical page allocator. */
+    pmm_init(boot_info);
+    serial_puts("Yousj OS: PMM total pages=");
+    serial_put_u64(pmm_total_page_count());
+    serial_puts(" free pages=");
+    serial_put_u64(pmm_free_page_count());
+    if (pmm_truncated())
+        serial_puts(" (map truncated to bitmap capacity)");
+    serial_putc('\n');
+
+    /* PMM self-test on real hardware state: allocate one page, show
+     * it, give it back. A failure here means the boot map lied. */
+    {
+        uint64_t page = pmm_alloc_page();
+        if (page == 0) {
+            serial_puts("Yousj OS: PMM self-test FAILED (no free page)\n");
+            halt_forever();
+        }
+        serial_puts("Yousj OS: PMM self-test alloc ");
+        serial_put_hex64(page);
+        serial_putc('\n');
+        if (pmm_free_page(page) != 0) {
+            serial_puts("Yousj OS: PMM self-test FAILED (free)\n");
+            halt_forever();
+        }
+        serial_puts("Yousj OS: PMM self-test PASS\n");
+    }
+
     /* Next steps, in order (owned by coordinator):
-     * 1. physical page allocator over boot_info->mem
      * 2. virtual memory (identity + kernel map)
      * 3. scheduler + first kernel thread
      * 4. console input, then jump to userland init/shell (server userland)
      */
-    serial_puts("Yousj OS: stage 1 work starts here, halting for now\n");
+    serial_puts("Yousj OS: stage 1 PMM done, next is VMM, halting for now\n");
     halt_forever();
 }

@@ -12,17 +12,23 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
 
 ## 当前阶段
 
-阶段 0（进行中）：仓库骨架、构建系统、核心接口锁定、三方分工。
-阶段 1：Bootloader + 最小内核（串口输出、内存管理、进程/调度、Shell 能跑）。
+阶段 0（已完成）：仓库骨架、构建系统、核心接口锁定、三方分工。
+阶段 1（进行中）：Bootloader + 最小内核（串口输出、内存管理、进程/调度、Shell 能跑）。
+- ✅ 物理页分配器 PMM（2026-11-01）：`kernel/mm/pmm.c`，双位图
+  （可用/已用分开，保留洞不会被误释放），`make test` 宿主机单元测试全过；
+  kmain 启动后初始化 PMM 并自检一块页的分配/释放。
+- ⏳ 下一步：虚拟内存 VMM（设计评审中）、Bootloader 与串口驱动、
+  userland init/Shell 原型（辅助旁聊并行开发中）。
 
 ## 开发分工（三方并行 + Muse 本人下场）
 
 - **Muse（本人，总协调 + 内核核心）**：架构、核心接口定义
-  （`kernel/include/`）、内核入口与集成、进度汇报。不只协调，也写核心代码。
-- **Claude Code（子代理）**：Bootloader 与驱动方向，只动 `bootloader/`
-  和 `kernel/drivers/`。
-- **Codex（子代理）**：构建工具与用户态方向，只动 `tools/`、
-  `userland/` 和 `docs/` 里归它的文档。
+  （`kernel/include/`）、内核入口、内存管理与集成、进度汇报。
+  不只协调，也写核心代码。
+- **辅助旁聊（2026-11-01 用户授权）**：A 管 Bootloader 与驱动
+  （只动 `bootloader/`、`kernel/drivers/`）；B 管构建工具与用户态
+  （只动 `tools/`、`userland/`）；C 只做 VMM/调度设计文档。
+  详见 `docs/DIVISION.md`。
 
 接口以 `kernel/include/yousj/` 下的头文件为准，三方不得自行改接口，
 要改先报 Muse 协调。

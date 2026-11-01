@@ -14,21 +14,29 @@ init 起来 → Shell 能敲命令。图形栈、帧缓冲驱动、桌面一律�
 ## 分工（目录互斥，谁也不许动别人的地盘）
 
 ### Muse 本人（Wonder，总协调 + 内核核心）
-- 地盘：`kernel/include/`、`kernel/arch/`、`Makefile`、本文件、README
+- 地盘：`kernel/include/`、`kernel/arch/`、`kernel/mm/`、`tests/`、
+  `Makefile`、本文件、README
 - 已交付：boot 信息接口（boot.h）、第一批兼容 syscall 号（syscall.h）、
-  串口输出的 kmain 入口（只走串口，正合服务器无头）
-- 接下来：物理页分配器、虚拟内存、调度器骨架、集成与验收
+  串口输出的 kmain 入口（只走串口，正合服务器无头）、
+  物理页分配器 PMM（`kernel/mm/pmm.c` + `pmm.h`，双位图设计，
+  2026-11-01；宿主机单元测试 `tests/test_pmm.c` 全过，kmain 已接入
+  PMM 并带真机自检打印）
+- 接下来：虚拟内存 VMM、调度器骨架、集成与验收
 
-### Claude Code（子代理 1）
-- 地盘：`bootloader/`、`kernel/drivers/`
-- 第一批任务：按 boot.h 接口写 Bootloader 设计 + 最小实现骨架；
-  串口驱动从 kmain 里抽成正式驱动放 `kernel/drivers/serial.c`（接口先报
-  Muse 批，不许改 boot.h / syscall.h）
+### 辅助旁聊（2026-11-01 用户授权新增）
+用户授权总协调创建多个旁聊辅助开发，替代/补足原 Claude Code 与
+Codex 通道（前者重活通道不稳、后者缺 key）。地盘沿用原分工、互斥：
 
-### Codex（子代理 2）
-- 地盘：`tools/`、`userland/`、`docs/` 里归它的文档
-- 第一批任务：构建/运行脚本骨架（tools/）、服务器 userland 的
-  init + Shell 设计与最小骨架（userland/，只用 syscall.h 里已定的号）
+- 旁聊 A（原 Claude Code 地盘）：`bootloader/`、`kernel/drivers/`
+  第一批任务：按 boot.h 接口写 Bootloader 设计 + 最小实现骨架；
+  串口驱动从 kmain 里抽成正式驱动放 `kernel/drivers/serial.c`
+  （接口提案先报 Muse 批，不许改 boot.h / syscall.h）
+- 旁聊 B（原 Codex 地盘）：`tools/`、`userland/`
+  第一批任务：构建/检查脚本（tools/）、服务器 userland 的
+  init + Shell 设计与宿主机原型（userland/，只用 syscall.h 里已定的号）
+- 旁聊 C（设计）：只写 `docs/VMM_DESIGN.md`、`docs/SCHED_DESIGN.md`
+  为 VMM 与调度器做可落地设计（只提案、不写代码、不定接口）
+- 辅助旁聊一律不 git commit，成果由总协调验收后统一提交。
 
 ## 铁律
 
