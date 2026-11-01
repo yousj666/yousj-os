@@ -587,22 +587,67 @@ static uint64_t fetch_map_and_build(struct yousj_boot_info *info,
 /* and jump. RSP is set to stack_top - 8 so kmain's entry sees the  */
 /* stack alignment a normal `call` would have produced (RSP % 16    */
 /* == 8); kmain never returns.                                      */
+/*                                                                  */
+/* GDT contract (found the hard way in OVMF testing, on BOTH      */
+/* sides in parallel): the kernel's IDT entries hardcode selector  */
+/* 0x08 as its code64 descriptor, and EDK2's GDT does not have a   */
+/* 64-bit code descriptor at 0x08, so under the raw firmware GDT   */
+/* the first timer interrupt triple-faulted. The kernel has since  */
+/* grown its own GDT (kernel/arch/x86_64/gdt.c, installed at the   */
+/* very start of kmain), so it no longer depends on this. This     */
+/* loader still installs the same three descriptors before         */
+/* jumping -- the boot contract "flat GDT, code64 at 0x08, data    */
+/* at 0x10" then holds from the kernel's first instruction rather  */
+/* than from gdt_init(), whoever boots. Descriptor values are      */
+/* bit-identical to the stub's (stub.S) and the kernel's.          */
 /* ---------------------------------------------------------------- */
+
+static const uint64_t g_kernel_gdt[3] = {
+    0x0000000000000000ULL, /* 0x00: null */
+    0x00AF9A000000FFFFULL, /* 0x08: code64, ring 0 */
+    0x00CF92000000FFFFULL, /* 0x10: data, ring 0, flat */
+};
+
+struct gdt_ptr {
+    uint16_t limit;
+    uint64_t base;
+} __attribute__((packed));
 
 static void jump_to_kernel(const struct yousj_boot_info *info,
                            uint64_t stack_top, uint64_t entry)
 {
+    /* Filled at runtime, not by a link-time initializer: the GDTR
+     * base is an absolute address and must not depend on the
+     * firmware applying PE base relocations for us. */
+    static struct gdt_ptr gdtr;
+
+    gdtr.limit = sizeof(g_kernel_gdt) - 1;
+    gdtr.base = (uint64_t)(uintptr_t)g_kernel_gdt;
+
     __asm__ volatile("cli");
     raw_serial_marker();
     __asm__ volatile(
+        "lgdt (%0)\n\t"
+        "mov $0x10, %%ax\n\t"
+        "mov %%ax, %%ds\n\t"
+        "mov %%ax, %%es\n\t"
+        "mov %%ax, %%fs\n\t"
+        "mov %%ax, %%gs\n\t"
+        "mov %%ax, %%ss\n\t"
+        /* reload CS to 0x08 via a far return */
+        "pushq $0x08\n\t"
+        "lea 1f(%%rip), %%rax\n\t"
+        "pushq %%rax\n\t"
+        "lretq\n\t"
+        "1:\n\t"
         "cld\n\t"
-        "mov %0, %%rsp\n\t"
-        "mov %1, %%rdi\n\t"
-        "jmp *%2\n\t"
+        "mov %1, %%rsp\n\t"
+        "mov %2, %%rdi\n\t"
+        "jmp *%3\n\t"
         :
-        : "r"(stack_top - 8), "r"((uint64_t)(uintptr_t)info),
-          "r"(entry)
-        : "memory");
+        : "r"(&gdtr), "r"(stack_top - 8),
+          "r"((uint64_t)(uintptr_t)info), "r"(entry)
+        : "rax", "memory");
     for (;;)
         __asm__ volatile("hlt");
 }
