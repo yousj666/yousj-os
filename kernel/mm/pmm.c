@@ -130,8 +130,19 @@ void pmm_init(const struct yousj_boot_info *boot_info)
     if (boot_info == NULL || boot_info->mem_entry_count == 0)
         return;
 
+    /* The managed range ends at the top of the highest USABLE entry.
+     * Reserved/MMIO entries far above RAM (QEMU reports firmware
+     * regions near 4 GiB) must not inflate the total or trip the
+     * truncation warning on an ordinary small machine -- that was
+     * observed on the first QEMU smoke boot (128 MiB VM claiming a
+     * truncated 8 GiB map). Entries that would wrap are ignored. */
     for (i = 0; i < boot_info->mem_entry_count && i < YOUSJ_MAX_MEM_ENTRIES; i++) {
-        uint64_t end = boot_info->mem[i].base + boot_info->mem[i].length;
+        uint64_t end;
+        if (boot_info->mem[i].type != YOUSJ_MEM_USABLE)
+            continue;
+        end = boot_info->mem[i].base + boot_info->mem[i].length;
+        if (end < boot_info->mem[i].base)
+            continue;
         if (end > max_phys)
             max_phys = end;
     }

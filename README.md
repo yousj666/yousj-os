@@ -17,8 +17,14 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
 - ✅ 物理页分配器 PMM（2026-11-01）：`kernel/mm/pmm.c`，双位图
   （可用/已用分开，保留洞不会被误释放），`make test` 宿主机单元测试全过；
   kmain 启动后初始化 PMM 并自检一块页的分配/释放。
-- ⏳ 下一步：虚拟内存 VMM（设计评审中）、Bootloader 与串口驱动、
-  userland init/Shell 原型（辅助旁聊并行开发中）。
+- ✅ 虚拟内存 VMM 逻辑（2026-11-01）：四级页表 map/unmap/translate/
+  protect，宿主机单测全过；CR3 切换待 Bootloader 分页契约。
+- ✅ **首次在 QEMU 虚拟机中真启动（2026-11-01，用户拍板虚拟机先行）**：
+  `make run` 经 32 位 Multiboot 桩 + ELF64 内核模块链路启动，串口实测
+  输出 kmain 到达、PMM 自检 PASS、VMM 自检 PASS。Multiboot 桩只是
+  冒烟工具，正式 Bootloader 为自写 UEFI 应用（见 bootloader/DESIGN.md）。
+- ⏳ 下一步：调度器（内核线程先行，设计见 docs/SCHED_DESIGN.md）、
+  UEFI Bootloader 主线、init/Shell 上机。
 
 ## 开发分工（三方并行 + Muse 本人下场）
 

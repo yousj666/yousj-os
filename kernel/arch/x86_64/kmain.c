@@ -9,73 +9,7 @@
 #include <yousj/boot.h>
 #include <yousj/pmm.h>
 #include <yousj/vmm.h>
-
-#define SERIAL_PORT 0x3f8 /* COM1 */
-
-static inline void outb(uint16_t port, uint8_t value)
-{
-    __asm__ volatile("outb %0, %1" : : "a"(value), "Nd"(port));
-}
-
-static inline uint8_t inb(uint16_t port)
-{
-    uint8_t value;
-    __asm__ volatile("inb %1, %0" : "=a"(value) : "Nd"(port));
-    return value;
-}
-
-static void serial_init(void)
-{
-    outb(SERIAL_PORT + 1, 0x00); /* disable interrupts */
-    outb(SERIAL_PORT + 3, 0x80); /* DLAB on */
-    outb(SERIAL_PORT + 0, 0x01); /* divisor 1 = 115200 baud */
-    outb(SERIAL_PORT + 1, 0x00);
-    outb(SERIAL_PORT + 3, 0x03); /* 8 bits, no parity, 1 stop bit */
-    outb(SERIAL_PORT + 2, 0xc7); /* FIFO on, clear, 14-byte threshold */
-    outb(SERIAL_PORT + 4, 0x0b); /* DTR + RTS + OUT2 */
-}
-
-static void serial_putc(char c)
-{
-    while ((inb(SERIAL_PORT + 5) & 0x20) == 0) {
-        /* wait for transmitter holding register empty */
-    }
-    outb(SERIAL_PORT, (uint8_t)c);
-}
-
-static void serial_puts(const char *s)
-{
-    while (*s) {
-        if (*s == '\n')
-            serial_putc('\r');
-        serial_putc(*s++);
-    }
-}
-
-static void serial_put_u64(uint64_t v)
-{
-    char buf[20];
-    int i = 0;
-    if (v == 0) {
-        serial_putc('0');
-        return;
-    }
-    while (v > 0) {
-        buf[i++] = (char)('0' + (v % 10));
-        v /= 10;
-    }
-    while (i > 0)
-        serial_putc(buf[--i]);
-}
-
-static void serial_put_hex64(uint64_t v)
-{
-    static const char digits[] = "0123456789abcdef";
-    int shift;
-    serial_puts("0x");
-    for (shift = 60; shift >= 0; shift -= 4)
-        serial_putc(digits[(v >> shift) & 0xF]);
-}
+#include <drivers/serial.h> /* kernel/drivers/serial.h; -I kernel in Makefile */
 
 static void halt_forever(void)
 {
