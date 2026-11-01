@@ -10,6 +10,15 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
 - 两个版本共用同一个内核
 - 到时候开源（协议发布时定，发布需用户单次确认）
 
+## 方针（2026-11-01 用户定版）
+
+- **内核优先**：先把内核做好，完整系统（GUI、userland 大铺开）
+  放后面；开源也先开源内核。
+- **北极星**：内核设计求**快**与**干净**——精简、低开销、不堆
+  臃肿抽象。长期目标是承载 Linux 程序生态（包括 AI/视频工具链
+  这类负载），并且比 Ubuntu 更快、更干净。这是设计原则，
+  不是当前阶段的功能清单。
+
 ## 当前阶段
 
 阶段 0（已完成）：仓库骨架、构建系统、核心接口锁定、三方分工。
@@ -38,6 +47,21 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   GDT，不再借用启动环境的表（bootloader/Makefile 一键出 ESP 镜像）。
 - ⏳ 下一步：M3 Ring 3 冒烟（用户段＋TSS＋syscall 入口）、高半区＋
   HHDM 布局、init/Shell 上机。
+
+## 从零构建
+
+依赖只有三样：`gcc`、`make`、`qemu-system-x86_64`（UEFI 链另需
+`x86_64-w64-mingw32-gcc`、`mtools` 与 OVMF 固件）。
+
+```sh
+make check            # 内核核心 freestanding 编译检查
+make test             # 宿主机单元测试（PMM / VMM / 调度逻辑）
+make kernel           # 构建 ELF64 内核 + Multiboot 冒烟桩
+tools/qemu-smoke.sh   # 一键冒烟：构建 + QEMU 启动 + 串口断言
+make -C bootloader esp  # 构建 UEFI 链：BOOTX64.EFI + ESP 镜像
+```
+
+许可证：待定（开源发布前由用户确认；确认前本仓库不对外发布）。
 
 ## 开发分工（三方并行 + Muse 本人下场）
 
