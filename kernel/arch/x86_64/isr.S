@@ -44,6 +44,80 @@ exc_hang:
     hlt
     jmp exc_hang
 
+    /* Page-fault stub (M17): unlike the other exceptions,
+     * #PF must be able to RETURN -- demand paging resolves
+     * the fault and retries the access. Saves the caller-
+     * saved set (the C handler follows SysV for the rest),
+     * builds a yousj_pf_info on the stack, and calls
+     * yousj_page_fault(), which returns only for resolved
+     * faults. GS discipline mirrors irq0_stub: swap when the
+     * interrupted frame is ring 3, swap back before iretq.
+     * Hardware frame on entry: [rsp]=err, +8 RIP, +16 CS,
+     * +24 RFLAGS, +32 RSP, +40 SS. */
+    .globl pf_stub
+pf_stub:
+    testb $3, 16(%rsp)
+    jz 9f
+    swapgs
+9:
+    push %rax
+    push %rcx
+    push %rdx
+    push %rsi
+    push %rdi
+    push %r8
+    push %r9
+    push %r10
+    push %r11
+    /* 9 pushes put the hardware frame at 72(%rsp): err 72,
+     * rip 80, cs 88, rsp 104. pf_info takes 40 more bytes,
+     * shifting those offsets by 40 for the reads below. */
+    sub $40, %rsp
+    mov %cr2, %rax
+    mov %rax, 0(%rsp)
+    mov 112(%rsp), %rax
+    mov %rax, 8(%rsp)
+    mov 120(%rsp), %rax
+    mov %rax, 16(%rsp)
+    mov 128(%rsp), %rax
+    mov %rax, 24(%rsp)
+    mov 144(%rsp), %rax
+    mov %rax, 32(%rsp)
+    mov %rsp, %rdi
+    call yousj_page_fault
+    add $40, %rsp
+    /* Canonicalize a ring-3 frame's selectors, exactly as
+     * irq0_stub does: a task resumed by sysret runs with
+     * QEMU's fabricated CS=0x1B / SS=0x13, and iretq rejects
+     * that pair with #GP. The hardware frame is at 72(%rsp)
+     * here (err 72, rip 80, cs 88, ss 112); the user-window
+     * test keeps kernel frames out of the rewrite. %rax is
+     * still scratch -- the saved user %rax pops later. */
+    movq $0x8000000000, %rax     /* YOUSJ_USER_BASE */
+    cmpq %rax, 80(%rsp)
+    jb 7f
+    movq $0x8003000000, %rax     /* YOUSJ_USER_LIMIT */
+    cmpq %rax, 80(%rsp)
+    jae 7f
+    movq $0x23, 88(%rsp)
+    movq $0x1B, 112(%rsp)
+7:
+    pop %r11
+    pop %r10
+    pop %r9
+    pop %r8
+    pop %rdi
+    pop %rsi
+    pop %rdx
+    pop %rcx
+    pop %rax
+    testb $3, 16(%rsp)
+    jz 8f
+    swapgs
+8:
+    add $8, %rsp
+    iretq
+
     .globl irq0_stub
 irq0_stub:
     /* GS discipline (M7): the syscall path's swapgs pairing only

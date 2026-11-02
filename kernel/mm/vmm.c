@@ -592,6 +592,22 @@ int vmm_translate(struct vmm_space *space, uint64_t virt,
     return 0;
 }
 
+int vmm_query_raw(struct vmm_space *space, uint64_t virt,
+                  uint64_t *phys_out, uint64_t *raw_out)
+{
+    uint64_t leaf;
+    if (!g_backend_ready || space == NULL || space->pml4_phys == 0)
+        return -YOUSJ_EINVAL;
+    leaf = walk_leaf(space, virt);
+    if (!(leaf & YOUSJ_PTE_PRESENT))
+        return -YOUSJ_ENOENT;
+    if (phys_out != NULL)
+        *phys_out = leaf & YOUSJ_PTE_ADDR_MASK;
+    if (raw_out != NULL)
+        *raw_out = leaf;
+    return 0;
+}
+
 int vmm_protect(struct vmm_space *space, uint64_t virt, uint64_t length,
                 uint32_t flags)
 {

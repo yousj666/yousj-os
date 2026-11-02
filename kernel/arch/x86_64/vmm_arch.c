@@ -14,6 +14,11 @@
 #include <yousj/vmm.h>
 #include <yousj/pmm.h>
 
+void vmm_flush_tlb_va(uint64_t va)
+{
+    __asm__ volatile("invlpg (%0)" : : "r"(va) : "memory");
+}
+
 void vmm_load_cr3(uint64_t pml4_phys)
 {
     __asm__ volatile("mov %0, %%cr3" : : "r"(pml4_phys) : "memory");

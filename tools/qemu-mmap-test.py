@@ -19,7 +19,8 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DISK = os.path.join(REPO, 'build', 'mmap-test.img')
 SOCK = '/tmp/serM14'
 SCENARIOS = ['anon', 'priv-read', 'priv-write', 'shared-ramfs',
-             'shared-yfs', 'offset']
+             'shared-yfs', 'offset',
+             'lazy', 'cow-flip', 'segv-wild', 'segv-ro']
 fails = []
 
 

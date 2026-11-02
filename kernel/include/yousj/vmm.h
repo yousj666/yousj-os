@@ -59,6 +59,7 @@
 #define YOUSJ_PTE_PRESENT     (1ULL << 0)
 #define YOUSJ_PTE_WRITABLE    (1ULL << 1)
 #define YOUSJ_PTE_USER        (1ULL << 2)
+#define YOUSJ_PTE_DIRTY       (1ULL << 6)
 #define YOUSJ_PTE_HUGE        (1ULL << 7)
 #define YOUSJ_PTE_NX          (1ULL << 63)
 #define YOUSJ_PTE_ADDR_MASK   0x000FFFFFFFFFF000ULL
@@ -160,6 +161,13 @@ int  vmm_translate(struct vmm_space *space, uint64_t virt,
                    uint64_t *phys_out, uint32_t *flags_out);
 int  vmm_protect(struct vmm_space *space, uint64_t virt, uint64_t length,
                  uint32_t flags);
+/* M17: like vmm_translate but also yields the RAW leaf PTE,
+ * so callers can see hardware bits (DIRTY) the abstract
+ * flags hide. */
+int  vmm_query_raw(struct vmm_space *space, uint64_t virt,
+                   uint64_t *phys_out, uint64_t *raw_out);
+/* M17: invalidate one TLB entry on this CPU (arch glue). */
+void vmm_flush_tlb_va(uint64_t va);
 
 /* Load a space's PML4 into CR3 (arch code,
  * kernel/arch/x86_64/vmm_arch.c). Called by vmm_hw_init() for the

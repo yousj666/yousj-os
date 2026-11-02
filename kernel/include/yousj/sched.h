@@ -78,6 +78,7 @@ struct task {
         uint64_t len;      /* page-rounded length */
         uint64_t file_off; /* page-aligned file offset */
         struct yousj_file *file; /* NULL = anonymous */
+        uint32_t prot;           /* M17: raw prot bits */
         bool     shared;
         bool     used;
     } vmas[YOUSJ_MAX_VMA];
@@ -218,6 +219,13 @@ void sched_wake(struct task *task);
 /* Exit the current task (state ZOMBIE, exit_status recorded) and
  * schedule another. Never returns; the idle task may not exit. */
 void sched_exit_current(int status);
+
+/* M17: page-fault handoff from pf_stub (isr.S) to the VMA
+ * layer. yousj_page_fault returns only for resolved faults. */
+struct yousj_pf_info {
+    uint64_t cr2, err, rip, cs, rsp;
+};
+void yousj_page_fault(struct yousj_pf_info *info);
 
 /* Count tasks currently in the given state (pool scan; M0/M1 scale). */
 uint64_t sched_count_state(enum task_state state);

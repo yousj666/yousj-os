@@ -1614,10 +1614,25 @@ static long sys_brk(uint64_t addr)
 #define MAP_ANON_K    0x20
 #define EACCES_K 13
 
+static uint32_t vma_abstract_flags(struct yousj_vma *v,
+                                   bool writable)
+{
+    uint32_t f = YOUSJ_VMM_USER;
+    if (v->prot & PROT_READ_K)
+        f |= YOUSJ_VMM_READ;
+    if (v->prot & 0x4)
+        f |= YOUSJ_VMM_EXEC;
+    if (writable)
+        f |= YOUSJ_VMM_WRITE;
+    return f;
+}
+
 /* Write back the intersection of [start, start+len) with the
- * VMA's pages into the backing file. The pages are reached
- * through the VMM (translate + HHDM), never by assuming the
- * caller's CR3. */
+ * VMA's pages into the backing file -- M17: only pages that
+ * are present AND hardware-dirty; a written-back page's
+ * dirty bit is cleared so the next msync only does new work.
+ * Pages are reached through the VMM (translate + HHDM),
+ * never by assuming the caller's CR3. */
 static void vma_writeback_range(struct vmm_space *sp,
                                 struct yousj_vma *v,
                                 uint64_t start, uint64_t len)
@@ -1634,13 +1649,18 @@ static void vma_writeback_range(struct vmm_space *sp,
     if (end > v->base + v->len)
         end = v->base + v->len;
     for (va = start; va < end; va += YOUSJ_PAGE_SIZE) {
-        uint64_t phys, chunk = end - va;
+        uint64_t phys, raw, chunk = end - va;
         if (chunk > YOUSJ_PAGE_SIZE)
             chunk = YOUSJ_PAGE_SIZE;
-        if (vmm_translate(sp, va, &phys, NULL) != 0)
+        if (vmm_query_raw(sp, va, &phys, &raw) != 0)
+            continue; /* never touched: nothing to write */
+        if (!(raw & YOUSJ_PTE_DIRTY))
             continue;
         fs_pwrite_file(v->file, v->file_off + (va - v->base),
                        yousj_phys_to_virt(phys), chunk);
+        vmm_protect(sp, va, YOUSJ_PAGE_SIZE,
+                    vma_abstract_flags(v, true));
+        vmm_flush_tlb_va(va);
     }
 }
 
@@ -1677,7 +1697,6 @@ static long sys_mmap(uint64_t addr, uint64_t len, uint64_t prot,
     struct yousj_file *file = NULL;
     struct yousj_vma *vma = NULL;
     uint64_t base, pg, npages;
-    uint32_t vflags = YOUSJ_VMM_USER;
     bool anon = (flags & MAP_ANON_K) != 0;
     bool shared = (flags & MAP_SHARED_K) != 0;
     int i;
@@ -1719,49 +1738,23 @@ static long sys_mmap(uint64_t addr, uint64_t len, uint64_t prot,
     }
     if (vma == NULL)
         return -YOUSJ_ENOMEM;
-    if (prot & 0x1)
-        vflags |= YOUSJ_VMM_READ;
-    if (prot & 0x2)
-        vflags |= YOUSJ_VMM_WRITE;
-    if (prot & 0x4)
-        vflags |= YOUSJ_VMM_EXEC;
     if (me->mmap_next == 0)
         me->mmap_next = YOUSJ_MMAP_BASE;
     base = me->mmap_next;
     npages = (len + YOUSJ_PAGE_SIZE - 1) / YOUSJ_PAGE_SIZE;
     if (base + npages * YOUSJ_PAGE_SIZE > YOUSJ_USER_LIMIT)
         return -YOUSJ_ENOMEM;
-    for (pg = 0; pg < npages; pg++) {
-        if (map_zero_page(me->mm, base + pg * YOUSJ_PAGE_SIZE,
-                          vflags) != 0) {
-            while (pg > 0) {
-                pg--;
-                unmap_free_page(me->mm,
-                                base + pg * YOUSJ_PAGE_SIZE);
-            }
-            return -YOUSJ_ENOMEM;
-        }
-    }
-    if (file != NULL) {
-        /* Eager population (stage-1 model: no demand paging):
-         * copy the file's bytes into the fresh pages; anything
-         * past EOF stays zero. The mapping is a snapshot --
-         * later write()s to the file are not visible in it. */
+    /* M17: registration only. No page is allocated or filled
+     * here; the page-fault path (yousj_page_fault) material-
+     * izes pages on first touch, reading the CURRENT file
+     * content at that moment. */
+    if (file != NULL)
         file_get(file);
-        for (pg = 0; pg < npages; pg++) {
-            uint64_t phys;
-            if (vmm_translate(me->mm,
-                              base + pg * YOUSJ_PAGE_SIZE,
-                              &phys, NULL) == 0)
-                fs_pread_file(file, offset + pg * YOUSJ_PAGE_SIZE,
-                              yousj_phys_to_virt(phys),
-                              YOUSJ_PAGE_SIZE);
-        }
-    }
     vma->base = base;
     vma->len = npages * YOUSJ_PAGE_SIZE;
     vma->file_off = offset;
     vma->file = file;
+    vma->prot = (uint32_t)prot;
     vma->shared = shared;
     vma->used = true;
     me->mmap_next = base + npages * YOUSJ_PAGE_SIZE + YOUSJ_PAGE_SIZE;
@@ -1820,6 +1813,118 @@ static long sys_msync(uint64_t addr, uint64_t len, uint64_t flags)
         }
     }
     return -YOUSJ_ENOMEM; /* never mapped */
+}
+
+/* --- M17: demand paging ----------------------------------
+ * yousj_page_fault is called from pf_stub (isr.S) with the
+ * fault description; it returns ONLY when the fault was
+ * resolved and the access may be retried. Unresolvable
+ * faults from user mode kill the task with SIGSEGV through
+ * the one exit path; kernel faults keep the legacy
+ * dump-and-halt. */
+
+static struct yousj_vma *vma_find(struct task *me, uint64_t va)
+{
+    int i;
+    for (i = 0; i < YOUSJ_MAX_VMA; i++) {
+        struct yousj_vma *v = &me->vmas[i];
+        if (v->used && va >= v->base && va < v->base + v->len)
+            return v;
+    }
+    return NULL;
+}
+
+static bool fault_in_vma(struct task *me, struct yousj_vma *v,
+                         uint64_t va, uint64_t err)
+{
+    uint64_t page = va & ~(YOUSJ_PAGE_SIZE - 1);
+    bool write = (err & 0x2) != 0;
+    bool prot_write = (v->prot & PROT_WRITE_K) != 0;
+    uint64_t phys, raw;
+
+    if (vmm_query_raw(me->mm, page, &phys, &raw) == 0) {
+        /* Present page: only a write to a read-only PRIVATE
+         * file page under PROT_WRITE resolves here. Frames
+         * are never aliased (fork deep-copies; there is no
+         * page cache), so copy-on-write is a permission
+         * flip, never a copy. */
+        if (write && !(raw & YOUSJ_PTE_WRITABLE) &&
+            v->file != NULL && !v->shared && prot_write) {
+            if (vmm_protect(me->mm, page, YOUSJ_PAGE_SIZE,
+                            vma_abstract_flags(v, true)) != 0)
+                return false;
+            vmm_flush_tlb_va(page);
+            return true;
+        }
+        return false;
+    }
+    /* Not present. Linux ordering: the access must be one
+     * the mapping's protection allows at all. */
+    if ((v->prot & (PROT_READ_K | PROT_WRITE_K)) == 0)
+        return false;
+    if (write && !prot_write)
+        return false;
+    {
+        /* Anonymous and shared pages go in with their final
+         * permissions; private file pages go in read-only
+         * and upgrade through the COW branch above. */
+        bool writable = prot_write &&
+                        (v->file == NULL || v->shared);
+        if (map_zero_page(me->mm, page,
+                          vma_abstract_flags(v, writable)) != 0)
+            return false;
+        if (v->file != NULL) {
+            if (vmm_translate(me->mm, page, &phys, NULL) != 0)
+                return false;
+            /* A short read at EOF leaves the rest zero --
+             * exactly the bytes Linux exposes there. */
+            fs_pread_file(v->file,
+                          v->file_off + (page - v->base),
+                          yousj_phys_to_virt(phys),
+                          YOUSJ_PAGE_SIZE);
+            if (write && !v->shared && prot_write) {
+                /* First touch is a write on a private file
+                 * page: the frame was just created for this
+                 * task alone, so flipping it writable IS
+                 * the copy-on-write. */
+                if (vmm_protect(me->mm, page, YOUSJ_PAGE_SIZE,
+                                vma_abstract_flags(v,
+                                                   true)) != 0)
+                    return false;
+                vmm_flush_tlb_va(page);
+            }
+        }
+        return true;
+    }
+}
+
+void yousj_page_fault(struct yousj_pf_info *info)
+{
+    struct task *me = sched_current();
+
+    if (me != NULL && me->mm != NULL) {
+        struct yousj_vma *v = vma_find(me, info->cr2);
+        if (v != NULL &&
+            fault_in_vma(me, v, info->cr2, info->err))
+            return; /* resolved: the stub retries the access */
+    }
+    if ((info->cs & 3) == 3 && me != NULL && me->mm != NULL) {
+        serial_puts("\nYousj OS: task ");
+        serial_puts(me->name);
+        serial_puts(" killed by SIGSEGV at ");
+        serial_put_hex64(info->cr2);
+        serial_puts("\n");
+        process_exit(0, YOUSJ_SIGSEGV); /* never returns */
+    }
+    serial_puts("\nYousj OS: EXCEPTION vector 14 error=");
+    serial_put_hex64(info->err);
+    serial_puts(" at RIP=");
+    serial_put_hex64(info->rip);
+    serial_puts(" cr2=");
+    serial_put_hex64(info->cr2);
+    serial_puts(" -- halting\n");
+    for (;;)
+        __asm__ volatile("cli; hlt");
 }
 
 #define ARCH_SET_FS 0x1002

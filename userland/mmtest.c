@@ -19,6 +19,9 @@
 #define SYS_msync  26
 #define SYS_unlink 87
 #define SYS_exit_group 231
+#define SYS_clone  56
+#define SYS_wait4  61
+#define SYS_PMM_FREE 0x1001
 
 #define O_RDONLY 0
 #define O_RDWR   2
@@ -153,6 +156,122 @@ static void shared_flow(const char *path, const char *name)
     report(name, n >= 2 && buf[0] == 'S' && buf[1] == 'T');
 }
 
+
+/* --- M17: demand paging --------------------------------- */
+
+static long free_pages(void)
+{
+    return sys_call3(SYS_PMM_FREE, 0, 0, 0);
+}
+
+static void t_lazy(void)
+{
+    static char big[65536];
+    long i, fd, f0, f1, f2, f4;
+    char *m;
+    int ok;
+    for (i = 0; i < 65536; i++)
+        big[i] = (char)('A' + (i / 4096) % 26);
+    write_file("/mm-lazy.bin", big, 65536);
+    fd = sys_call3(SYS_open, (long)(uintptr_t)"/mm-lazy.bin",
+                   O_RDONLY, 0);
+    f0 = free_pages();
+    m = (char *)(uintptr_t)sys_mmap(NULL, 65536,
+                                    PROT_READ | PROT_WRITE,
+                                    MAP_PRIVATE, fd, 0);
+    if ((long)(uintptr_t)m < 0) {
+        report("lazy", 0);
+        return;
+    }
+    f1 = free_pages();
+    /* registration only: no frame may be spent yet */
+    ok = (f1 == f0);
+    /* first touch materializes a page (plus maybe tables);
+     * the load must be volatile or the compiler elides it
+     * and nothing ever faults */
+    {
+        volatile char t = *(volatile char *)m;
+        (void)t;
+    }
+    f2 = free_pages();
+    ok = ok && f2 < f1 && f2 >= f1 - 6;
+    /* every page faults in with the right content */
+    for (i = 0; i < 16 && ok; i++)
+        ok = m[i * 4096] == (char)('A' + i % 26);
+    sys_call3(SYS_munmap, (long)(uintptr_t)m, 65536, 0);
+    f4 = free_pages();
+report("lazy", ok && f4 == f0);
+    sys_call3(SYS_close, fd, 0, 0);
+    sys_call3(SYS_unlink, (long)(uintptr_t)"/mm-lazy.bin", 0, 0);
+}
+
+static void t_cow(void)
+{
+    static char two[8192];
+    char buf[16];
+    long i, fd;
+    char *m;
+    int ok;
+    for (i = 0; i < 4096; i++)
+        two[i] = 'a';
+    for (; i < 8192; i++)
+        two[i] = 'b';
+    write_file("/mm-cow.bin", two, 8192);
+    fd = sys_call3(SYS_open, (long)(uintptr_t)"/mm-cow.bin",
+                   O_RDWR, 0);
+    m = (char *)(uintptr_t)sys_mmap(NULL, 8192,
+                                    PROT_READ | PROT_WRITE,
+                                    MAP_PRIVATE, fd, 0);
+    if ((long)(uintptr_t)m < 0) {
+        report("cow-flip", 0);
+        return;
+    }
+    m[0] = 'X';            /* write fault: fill + COW flip */
+    ok = m[0] == 'X' && m[4096] == 'b';
+    sys_call3(SYS_munmap, (long)(uintptr_t)m, 8192, 0);
+    sys_call3(SYS_close, fd, 0, 0);
+    read_file("/mm-cow.bin", buf, sizeof buf);
+    report("cow-flip", ok && buf[0] == 'a');
+    sys_call3(SYS_unlink, (long)(uintptr_t)"/mm-cow.bin", 0, 0);
+}
+
+static void t_segv_wild(void)
+{
+    long pid = sys_call3(SYS_clone, 17 /* SIGCHLD */, 0, 0);
+    int status = 0;
+    if (pid == 0) {
+        volatile char *p = (volatile char *)0x8004000000ULL;
+        *p = 1; /* no VMA covers this: SIGSEGV */
+        sys_call3(SYS_exit_group, 99, 0, 0);
+    }
+    sys_call3(SYS_wait4, pid, (long)(uintptr_t)&status, 0);
+    report("segv-wild", (status & 0x7F) == 11);
+}
+
+static void t_segv_ro(void)
+{
+    long fd;
+    write_file("/mm-ro.bin", "readonly!", 9);
+    fd = sys_call3(SYS_open, (long)(uintptr_t)"/mm-ro.bin",
+                   O_RDONLY, 0);
+    {
+        long pid = sys_call3(SYS_clone, 17, 0, 0);
+        int status = 0;
+        if (pid == 0) {
+            char *m = (char *)(uintptr_t)sys_mmap(
+                NULL, 4096, PROT_READ, MAP_SHARED, fd, 0);
+            if ((long)(uintptr_t)m < 0)
+                sys_call3(SYS_exit_group, 98, 0, 0);
+            m[0] = 'Z'; /* write to a read-only shared page */
+            sys_call3(SYS_exit_group, 99, 0, 0);
+        }
+        sys_call3(SYS_wait4, pid, (long)(uintptr_t)&status, 0);
+        report("segv-ro", (status & 0x7F) == 11);
+    }
+    sys_call3(SYS_close, fd, 0, 0);
+    sys_call3(SYS_unlink, (long)(uintptr_t)"/mm-ro.bin", 0, 0);
+}
+
 int main(void)
 {
     static const char content[] = "MMAP-CONTENT-0123456789";
@@ -245,6 +364,10 @@ int main(void)
         sys_call3(SYS_close, fd, 0, 0);
         sys_call3(SYS_unlink, (long)(uintptr_t)"/mm4.txt", 0, 0);
     }
+    t_lazy();
+    t_cow();
+    t_segv_wild();
+    t_segv_ro();
     sys_call3(SYS_unlink, (long)(uintptr_t)"/mm1.txt", 0, 0);
 
     out("MMTEST DONE\n");

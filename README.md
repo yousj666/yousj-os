@@ -247,8 +247,25 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   readlink 本身与非链接 EINVAL、中间分量是链接、删链
   留真身）两轮全过；磁盘套件在 /data 建相对链接、两次
   硬杀断电后仍可读穿；其余十一链不回归。
-- ⏳ 下一步候选：mmap 缺页填充（真按需分页）、yfs 一
-  致性日志、epoll、lstat。
+- ✅ 调度 M17（2026-11-02）：mmap 真按需分页——mmap 只
+  登记 VMA 不再分配/填充任何页；#PF 换上专属可返回桩
+  （pf_stub：存寄存器＋pf_info＋GS 纪律与 irq0 同款，进
+  出时按 irq0 同规则把 sysret 伪造的 CS/SS 修正为规范对，
+  否则 iretq #GP），缺页时按页物化：文件页读当时的文件
+  内容（超 EOF 部分为零）、匿名页为零页；PRIVATE 文件
+  页只读进入、写时"写时复制"（帧从不共享/别名，COW 退
+  化为权限翻转）；SHARED 回写只写硬件脏位为 1 的页并清
+  脏（新增 vmm_query_raw 读原始 PTE、vmm_flush_tlb_va）。
+  无 VMA 覆盖或权限不许的用户缺页走唯一退出路径以
+  SIGSEGV 终结任务；内核缺页保持旧 dump 挂起。fork 只
+  拷已物化页（窗口克隆天然如此）。验收：mmtest 新增
+  lazy（mmap 后空闲页不变、首触才掉页、munmap 后全
+  归还）、cow-flip、segv-wild（野指针）、segv-ro（写只
+  读共享页）四场景与原六场景两轮全过；其余十一链不回
+  归。边界：已物化页与 write() 的一致性仍不保证（无页
+  缓存）；整页越过 EOF 只给零页、不发 SIGBUS。
+- ⏳ 下一步候选：epoll、yfs 一致性日志、lstat、
+  mprotect。
 
 ## 从零构建
 

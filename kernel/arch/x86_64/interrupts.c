@@ -11,6 +11,7 @@
 
 extern const uint64_t exc_table[32];
 extern void irq0_stub(void);
+extern void pf_stub(void);
 
 /* --- IDT -------------------------------------------------------------- */
 
@@ -98,6 +99,9 @@ void interrupts_init(void)
     for (i = 0; i < 32; i++)
         idt_set_gate(i, exc_table[i]);
     idt_set_gate(0x20, (uint64_t)(uintptr_t)&irq0_stub);
+    /* M17: #PF gets its own resumable stub (demand paging);
+     * it replaces exc_stub_14 from the table above. */
+    idt_set_gate(14, (uint64_t)(uintptr_t)&pf_stub);
 
     ptr.limit = (uint16_t)(sizeof(g_idt) - 1);
     ptr.base = (uint64_t)(uintptr_t)&g_idt;
