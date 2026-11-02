@@ -34,6 +34,7 @@
 #define SYS_nanosleep 35
 #define SYS_getpid 39
 #define SYS_clone 56
+#define SYS_pipe 22
 #define SYS_mmap 9
 #define SYS_munmap 11
 #define SYS_execve 59
@@ -588,6 +589,88 @@ int main(int argc, char **argv)
                contains(mb, tot, "rw-p"));
         if (maddr > 0)
             sys_call3(SYS_munmap, maddr, 8192, 0);
+    }
+
+    /* M41: the fd directory and its links. */
+    {
+        char lb[300];
+        struct st sb;
+        long ln, xfd, pfd[2];
+        int ok;
+        xfd = sys_call3(SYS_open,
+                        (long)(uintptr_t)"/bin/pidtest", 0, 0);
+        sys_call3(SYS_pipe, (long)(uintptr_t)pfd, 0, 0);
+        ln = sys_call3(SYS_readlink,
+                       (long)(uintptr_t)"/proc/self/fd/0",
+                       (long)(uintptr_t)lb, sizeof(lb));
+        ok = ln == 12 && lb[0] == '/' && lb[1] == 'd' &&
+             lb[5] == 'c';
+        {
+            char xp[64];
+            const char *pre = "/proc/self/fd/";
+            uint64_t j = 0;
+            while (pre[j] != '\0') {
+                xp[j] = pre[j];
+                j++;
+            }
+            if (xfd >= 10)
+                xp[j++] = (char)('0' + xfd / 10);
+            xp[j++] = (char)('0' + xfd % 10);
+            xp[j] = '\0';
+            ln = sys_call3(SYS_readlink,
+                           (long)(uintptr_t)xp,
+                           (long)(uintptr_t)lb, sizeof(lb));
+            ok = ok && ln == 12 && lb[0] == '/' &&
+                 lb[5] == 'p';
+            ok = ok &&
+                 sys_call3(SYS_lstat, (long)(uintptr_t)xp,
+                           (long)(uintptr_t)&sb, 0) == 0 &&
+                 (sb.mode & 0170000) == 0120000;
+            ok = ok &&
+                 sys_call3(SYS_stat, (long)(uintptr_t)xp,
+                           (long)(uintptr_t)&sb, 0) == 0 &&
+                 (sb.mode & 0170000) == 0100000;
+        }
+        {
+            char pp[64];
+            const char *pre = "/proc/self/fd/";
+            uint64_t j = 0;
+            while (pre[j] != '\0') {
+                pp[j] = pre[j];
+                j++;
+            }
+            pp[j++] = (char)('0' + pfd[0] % 10);
+            pp[j] = '\0';
+            ln = sys_call3(SYS_readlink,
+                           (long)(uintptr_t)pp,
+                           (long)(uintptr_t)lb, sizeof(lb));
+            ok = ok && ln > 6 && lb[0] == 'p' &&
+                 lb[1] == 'i' && lb[2] == 'p' &&
+                 lb[3] == 'e' && lb[4] == ':' &&
+                 lb[5] == '[';
+        }
+        /* the listing itself: fd entry is a directory,
+         * the open file appears as a link entry */
+        {
+            char db[1024];
+            long got = read_dents("/proc/self", db,
+                                  sizeof(db));
+            ok = ok && got > 0 &&
+                 dent_type(db, got, "fd") == 4;
+            got = read_dents("/proc/self/fd", db,
+                             sizeof(db));
+            ok = ok && got > 0 &&
+                 dent_type(db, got, "0") == 10 &&
+                 dent_type(db, got, "1") == 10;
+        }
+        ok = ok && sys_call3(SYS_open,
+                             (long)(uintptr_t)"/proc/self/fd/99",
+                             0, 0) == -2;
+        if (xfd >= 0)
+            sys_call1(SYS_close, xfd);
+        sys_call1(SYS_close, pfd[0]);
+        sys_call1(SYS_close, pfd[1]);
+        report("fd-dir", ok);
     }
 
     out("PIDTEST DONE\n");

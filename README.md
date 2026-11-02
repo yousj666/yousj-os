@@ -605,8 +605,20 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   sendfile（偏移/流式/EOF 三段＋内容比对，
   ramfs/yfs 各一遍）、pipetest 加
   sendfile-pipe。
+- ✅ /proc/<pid>/fd M41（2026-11-03）：fd 子
+  目录列出目标任务当前打开的 fd（链接项）；
+  readlink 目标按对象类型给出——普通文件
+  为其打开路径、管道 pipe:[序号]、epoll
+  anon_inode:[eventpoll]、proc 文件重建其
+  /proc 路径、控制台 /dev/console；lstat 报
+  链接自身、stat 跟随（非路径目标按 FIFO/
+  CHR/REG 报告类别）；open 链接对路径目标
+  按路径重开（新偏移），非路径目标 EINVAL。
+  fd 不存在即整项不存在。验收：pidtest 加
+  fd-dir（控制台/文件/管道三种目标、lstat
+  与 stat 分工、目录列表类型、坏 fd ENOENT）。
 - ⏳ 下一步候选：硬链接（目录项重构）、
-  /proc/<pid>/fd 目录、splice。
+  splice、/proc/<pid>/fdinfo。
 
 ## 从零构建
 

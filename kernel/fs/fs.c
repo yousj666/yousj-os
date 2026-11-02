@@ -910,6 +910,8 @@ static long yfs_open_path_fs(const char *rel, long flags,
 #define PROC_ID_PCWD     9 /* M35 */
 #define PROC_ID_PEXE     10 /* M35 */
 #define PROC_ID_PMAPS    11 /* M39 */
+#define PROC_ID_PFDDIR   12 /* M41 */
+#define PROC_ID_PFD      13 /* M41 */
 static const char *const g_proc_names[3] = {
     "uptime", "meminfo", "version"
 };
@@ -923,7 +925,8 @@ static bool is_proc_path(const char *path)
 
 static bool proc_is_dir_id(int id)
 {
-    return id == 0 || id == PROC_ID_PIDDIR;
+    return id == 0 || id == PROC_ID_PIDDIR ||
+           id == PROC_ID_PFDDIR;
 }
 
 /* Inode numbers: the flat files keep 9000+id; a pid entry
@@ -948,6 +951,8 @@ static uint64_t proc_ino_for(int id, uint32_t pid)
         return 10000 + (uint64_t)pid * 8 + 6;
     if (id == PROC_ID_PMAPS)
         return 10000 + (uint64_t)pid * 8 + 7;
+    if (id == PROC_ID_PFDDIR)
+        return 30000 + (uint64_t)pid;
     return 9000 + (uint64_t)id;
 }
 
@@ -955,10 +960,21 @@ static uint64_t proc_ino_for(int id, uint32_t pid)
  * "<pid>" / "<pid>/status" / "<pid>/stat" -> the M28 ids
  * (with *pid_out set), else -1. A numeric head that names
  * no live task is -1: from the outside it does not exist. */
+static int proc_find2(const char *rel, uint32_t *pid_out,
+                      int *fd_out);
+
 static int proc_find(const char *rel, uint32_t *pid_out)
+{
+    return proc_find2(rel, pid_out, NULL);
+}
+
+static int proc_find2(const char *rel, uint32_t *pid_out,
+                      int *fd_out)
 {
     int i;
     *pid_out = 0;
+    if (fd_out != NULL)
+        *fd_out = -1;
     if (rel[0] == '\0')
         return 0;
     for (i = 0; i < 3; i++) {
@@ -1018,6 +1034,33 @@ static int proc_find(const char *rel, uint32_t *pid_out)
                 leaf[2] == 'p' && leaf[3] == 's' &&
                 leaf[4] == '\0')
                 return PROC_ID_PMAPS;
+            if (leaf[0] == 'f' && leaf[1] == 'd' &&
+                leaf[2] == '\0')
+                return PROC_ID_PFDDIR;
+            if (leaf[0] == 'f' && leaf[1] == 'd' &&
+                leaf[2] == '/') {
+                /* M41: fd/<n> -- only while that fd is
+                 * open in the target task. */
+                const char *d = leaf + 3;
+                uint64_t v = 0, j = 0;
+                struct task *t;
+                if (d[0] == '\0')
+                    return -1;
+                while (d[j] >= '0' && d[j] <= '9') {
+                    v = v * 10 + (uint64_t)(d[j] - '0');
+                    if (v >= YOUSJ_NR_OPEN)
+                        return -1;
+                    j++;
+                }
+                if (d[j] != '\0')
+                    return -1;
+                t = sched_find_task((int)*pid_out);
+                if (t == NULL || t->fd_file[v] == NULL)
+                    return -1;
+                if (fd_out != NULL)
+                    *fd_out = (int)v;
+                return PROC_ID_PFD;
+            }
         }
         return -1;
     }
@@ -1048,6 +1091,101 @@ static long proc_link_target(int id, uint32_t pid,
         i++;
     }
     buf[i] = '\0';
+    return (long)i;
+}
+
+/* M41: the target text of a /proc/<pid>/fd/<n> link.
+ * -1 when the task or the fd is gone. */
+static void str_cat(char *dst, const char *src)
+{
+    uint64_t i = 0, j = 0;
+    while (dst[i] != '\0')
+        i++;
+    while (src[j] != '\0')
+        dst[i++] = src[j++];
+    dst[i] = '\0';
+}
+
+static void u32_dec(char *dst, uint32_t v)
+{
+    char tmp[12];
+    int n = 0;
+    if (v == 0) {
+        dst[0] = '0';
+        dst[1] = '\0';
+        return;
+    }
+    while (v > 0) {
+        tmp[n++] = (char)('0' + (v % 10));
+        v /= 10;
+    }
+    {
+        int i;
+        for (i = 0; i < n; i++)
+            dst[i] = tmp[n - 1 - i];
+        dst[n] = '\0';
+    }
+}
+
+static long proc_fd_target(uint32_t pid, int fd, char *buf,
+                           uint64_t cap)
+{
+    struct task *t = sched_find_task((int)pid);
+    struct yousj_file *f;
+    char num[12];
+    uint64_t i;
+    if (t == NULL || fd < 0 || fd >= YOUSJ_NR_OPEN)
+        return -1;
+    f = t->fd_file[fd];
+    if (f == NULL)
+        return -1;
+    buf[0] = '\0';
+    if (f->pipe != NULL) {
+        str_cat(buf, "pipe:[");
+        u32_dec(num, (uint32_t)(f->pipe - g_pipes));
+        str_cat(buf, num);
+        str_cat(buf, "]");
+    } else if (f->epoll != NULL) {
+        str_cat(buf, "anon_inode:[eventpoll]");
+    } else if (f->backend == 2) {
+        str_cat(buf, "/proc");
+        if (f->proc_id == PROC_ID_PIDDIR ||
+            (f->proc_id >= PROC_ID_PSTATUS &&
+             f->proc_id <= PROC_ID_PFDDIR)) {
+            str_cat(buf, "/");
+            u32_dec(num, f->proc_pid);
+            str_cat(buf, num);
+            if (f->proc_id == PROC_ID_PSTATUS)
+                str_cat(buf, "/status");
+            else if (f->proc_id == PROC_ID_PSTAT)
+                str_cat(buf, "/stat");
+            else if (f->proc_id == PROC_ID_PCMDLINE)
+                str_cat(buf, "/cmdline");
+            else if (f->proc_id == PROC_ID_PENVIRON)
+                str_cat(buf, "/environ");
+            else if (f->proc_id == PROC_ID_PCWD)
+                str_cat(buf, "/cwd");
+            else if (f->proc_id == PROC_ID_PEXE)
+                str_cat(buf, "/exe");
+            else if (f->proc_id == PROC_ID_PMAPS)
+                str_cat(buf, "/maps");
+            else if (f->proc_id == PROC_ID_PFDDIR)
+                str_cat(buf, "/fd");
+        } else if (f->proc_id >= 1 && f->proc_id <= 3) {
+            str_cat(buf, "/");
+            str_cat(buf, g_proc_names[f->proc_id - 1]);
+        }
+    } else if (f->backend == 0 && f->node == NULL) {
+        str_cat(buf, "/dev/console");
+    } else {
+        str_cat(buf, f->open_path);
+    }
+    if (buf[0] == '\0')
+        return -1;
+    (void)cap; /* targets are bounded by open_path's 256 */
+    i = 0;
+    while (buf[i] != '\0')
+        i++;
     return (long)i;
 }
 
@@ -1186,7 +1324,7 @@ static uint32_t proc_generate(int id, uint32_t pid, char *buf,
         pb_puts(&b, " kB\n");
         break;
     case PROC_ID_VERSION:
-        pb_puts(&b, "Yousj OS version 0.9 (M39) x86_64 #1\n");
+        pb_puts(&b, "Yousj OS version 0.9 (M41) x86_64 #1\n");
         break;
     case PROC_ID_PCMDLINE: {
         /* Raw bytes, not text: the argv is NUL-joined, so
@@ -1357,14 +1495,32 @@ long fs_open_path(const char *path, long flags,
         int id;
         if (rel[0] == '/')
             rel++;
-        id = proc_find(rel, &pid);
-        if (id == PROC_ID_PCWD || id == PROC_ID_PEXE) {
-            char target[PATH_MAX_LEN + 1];
-            if (proc_link_target(id, pid, target,
-                                  sizeof(target)) < 0)
-                return -YOUSJ_ENOENT_L;
-            return fs_open_path(target, flags, mode_bits,
-                                out);
+        {
+            int fdn = -1;
+            id = proc_find2(rel, &pid, &fdn);
+            if (id == PROC_ID_PCWD || id == PROC_ID_PEXE) {
+                char target[PATH_MAX_LEN + 1];
+                if (proc_link_target(id, pid, target,
+                                      sizeof(target)) < 0)
+                    return -YOUSJ_ENOENT_L;
+                return fs_open_path(target, flags, mode_bits,
+                                    out);
+            }
+            if (id == PROC_ID_PFD) {
+                /* M41: opening an fd link re-opens its
+                 * target path (fresh offset, like Linux
+                 * for regular files). Non-path targets
+                 * (pipes, the console, epoll) cannot be
+                 * re-opened -- EINVAL. */
+                char target[PATH_MAX_LEN + 1];
+                if (proc_fd_target(pid, fdn, target,
+                                    sizeof(target)) < 0)
+                    return -YOUSJ_ENOENT_L;
+                if (target[0] != '/')
+                    return -YOUSJ_EINVAL;
+                return fs_open_path(target, flags, mode_bits,
+                                    out);
+            }
         }
     }
     rc = fs_resolve_links(path, resolved, true);
@@ -1597,7 +1753,22 @@ long fs_readlink_path(const char *path, char *buf, uint64_t cap)
         int id;
         if (rel[0] == '/')
             rel++;
-        id = proc_find(rel, &pid);
+        {
+            int fdn = -1;
+            id = proc_find2(rel, &pid, &fdn);
+            if (id == PROC_ID_PFD) {
+                char target[PATH_MAX_LEN + 1];
+                long tl = proc_fd_target(pid, fdn, target,
+                                          sizeof(target));
+                uint64_t i, n;
+                if (tl < 0)
+                    return -YOUSJ_ENOENT_L;
+                n = (uint64_t)tl < cap ? (uint64_t)tl : cap;
+                for (i = 0; i < n; i++)
+                    buf[i] = target[i];
+                return (long)n;
+            }
+        }
         if (id < 0)
             return -YOUSJ_ENOENT_L;
         if (id == PROC_ID_PCWD || id == PROC_ID_PEXE) {
@@ -1750,19 +1921,54 @@ bool fs_path_stat2(const char *path, bool follow,
         if (id < 0)
             return false;
         /* M35: the magic links either report themselves
-         * (lstat) or the target's stat (follow). */
-        if (id == PROC_ID_PCWD || id == PROC_ID_PEXE) {
+         * (lstat) or the target's stat (follow). M41:
+         * fd links join them, with non-path targets
+         * reported by kind when followed. */
+        if (id == PROC_ID_PCWD || id == PROC_ID_PEXE ||
+            id == PROC_ID_PFD) {
             char target[PATH_MAX_LEN + 1];
-            long tl = proc_link_target(id, pid, target,
-                                        sizeof(target));
+            long tl;
+            int fdn = -1;
+            if (id == PROC_ID_PFD) {
+                proc_find2(rel, &pid, &fdn);
+                tl = proc_fd_target(pid, fdn, target,
+                                     sizeof(target));
+            } else {
+                tl = proc_link_target(id, pid, target,
+                                      sizeof(target));
+            }
             if (tl < 0)
                 return false;
-            if (follow)
-                return fs_path_stat2(target, true, info);
+            if (follow) {
+                if (target[0] == '/' &&
+                    fs_path_stat2(target, true, info))
+                    return true;
+                if (target[0] == '/' &&
+                    !(target[1] == 'd' && target[2] == 'e' &&
+                      target[3] == 'v'))
+                    return false; /* a real path that is
+                                     gone: no stat to give */
+                /* pipes, the console, anon inodes */
+                info->mtime = (uint32_t)yousj_now_unix();
+                info->atime = info->mtime;
+                info->ctime = info->mtime;
+                info->ino = 20000 + (uint64_t)pid * 16 +
+                            (uint64_t)(fdn < 0 ? 0 : fdn);
+                info->mode = target[0] == 'p'
+                                 ? (S_IFIFO_K | 0644u)
+                                 : target[1] == 'd'
+                                       ? (S_IFCHR_K | 0666u)
+                                       : (S_IFREG_K | 0644u);
+                info->size = 0;
+                return true;
+            }
             info->mtime = (uint32_t)yousj_now_unix();
             info->atime = info->mtime;
             info->ctime = info->mtime;
-            info->ino = proc_ino_for(id, pid);
+            info->ino = id == PROC_ID_PFD
+                            ? 20000 + (uint64_t)pid * 16 +
+                                  (uint64_t)(fdn < 0 ? 0 : fdn)
+                            : proc_ino_for(id, pid);
             info->mode = S_IFLNK_K | 0777u;
             info->size = (uint32_t)tl;
             return true;
@@ -2224,11 +2430,12 @@ long file_getdents(struct yousj_file *f, uint8_t *buf, uint64_t count)
         static const char *const root_names[5] = {
             ".", "..", "uptime", "meminfo", "version"
         };
-        static const char *const pid_names[9] = {
+        static const char *const pid_names[10] = {
             ".", "..", "status", "stat", "cmdline",
-            "environ", "cwd", "exe", "maps"
+            "environ", "cwd", "exe", "maps", "fd"
         };
         uint64_t tids[YOUSJ_SCHED_MAX_TASKS];
+        int fds[YOUSJ_NR_OPEN]; /* M41: PFDDIR listing */
         uint32_t ntids = 0;
         uint64_t total, i;
         long blocked = 0; /* M38: an entry existed but
@@ -2239,8 +2446,18 @@ long file_getdents(struct yousj_file *f, uint8_t *buf, uint64_t count)
             ntids = sched_live_tids(tids,
                                     YOUSJ_SCHED_MAX_TASKS);
             total = 5 + ntids;
+        } else if (f->proc_id == PROC_ID_PFDDIR) {
+            struct task *t = sched_find_task(
+                (int)f->proc_pid);
+            int k;
+            total = 2;
+            if (t != NULL) {
+                for (k = 0; k < YOUSJ_NR_OPEN; k++)
+                    if (t->fd_file[k] != NULL)
+                        fds[total++ - 2] = k;
+            }
         } else {
-            total = 9;
+            total = 10;
         }
         for (i = f->offset; i < total; i++) {
             const char *nm;
@@ -2278,9 +2495,32 @@ long file_getdents(struct yousj_file *f, uint8_t *buf, uint64_t count)
                 else if (i == 7)
                     ino = proc_ino_for(PROC_ID_PEXE,
                                        f->proc_pid);
-                else
+                else if (i == 8)
                     ino = proc_ino_for(PROC_ID_PMAPS,
                                        f->proc_pid);
+                else {
+                    ino = 30000 + f->proc_pid; /* PFDDIR */
+                    dtype = YOUSJ_DT_DIR;
+                }
+            } else if (f->proc_id == PROC_ID_PFDDIR) {
+                if (i == 0) {
+                    nm = ".";
+                    ino = 30000 + f->proc_pid;
+                    dtype = YOUSJ_DT_DIR;
+                } else if (i == 1) {
+                    nm = "..";
+                    ino = proc_ino_for(PROC_ID_PIDDIR,
+                                       f->proc_pid);
+                    dtype = YOUSJ_DT_DIR;
+                } else {
+                    int fdn = fds[i - 2];
+                    u32_dec(numbuf, (uint32_t)fdn);
+                    nm = numbuf;
+                    ino = 20000 +
+                          (uint64_t)f->proc_pid * 16 +
+                          (uint64_t)fdn;
+                    dtype = 10; /* DT_LNK */
+                }
             } else if (i < 5) {
                 nm = root_names[i];
                 ino = i <= 1 ? 9000 : 9000 + (i - 1);
