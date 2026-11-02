@@ -956,6 +956,306 @@ static long sys_getcwd_sys(uint64_t buf, uint64_t size)
     return (long)len;
 }
 
+/* --- M15: poll / select ------------------------------------------
+ * One readiness probe serves the whole family. Regular files
+ * are always ready; a pipe read end is readable with data or
+ * at HUP, a pipe write end is writable with space and errors
+ * when readerless; the console reports input via the UART
+ * status register without consuming the byte. Waiting uses
+ * the same 2-tick poll + -ERESTARTSYS protocol as pipe I/O,
+ * so the signal gate produces Linux's EINTR/restart split. */
+
+#define POLLIN_K  0x0001
+#define POLLPRI_K 0x0002
+#define POLLOUT_K 0x0004
+#define POLLERR_K 0x0008
+#define POLLHUP_K 0x0010
+#define POLLNVAL_K 0x0020
+
+static short fd_ready(struct task *me, long fd, short events)
+{
+    struct yousj_file *f = fd_file_of(me, fd);
+    short rev = 0;
+
+    if (f == NULL)
+        return POLLNVAL_K;
+    if (f->pipe == NULL && f->backend == 0 && f->node == NULL) {
+        /* the console: fd 0 is the readable side */
+        if (fd == 0) {
+            if ((events & POLLIN_K) && serial_rx_ready())
+                rev |= POLLIN_K;
+        } else {
+            if (events & POLLOUT_K)
+                rev |= POLLOUT_K;
+        }
+        return rev;
+    }
+    if (f->pipe != NULL) {
+        struct yousj_pipe *p = f->pipe;
+        long acc = f->flags & YOUSJ_O_ACCMODE;
+        if (acc == YOUSJ_O_RDONLY) {
+            if (p->count > 0)
+                rev |= POLLIN_K;
+            if (p->writers == 0)
+                rev |= POLLHUP_K;
+        } else if (acc == YOUSJ_O_WRONLY) {
+            if (p->readers == 0)
+                rev |= POLLERR_K | POLLHUP_K;
+            else if (p->count < YOUSJ_PIPE_CAP)
+                rev |= POLLOUT_K;
+        }
+        /* ERR/HUP/NVAL are reported regardless of the mask */
+        return (short)((rev & (POLLERR_K | POLLHUP_K)) |
+                       (rev & events));
+    }
+    /* regular file on either backend */
+    return (short)(events & (POLLIN_K | POLLOUT_K));
+}
+
+struct pollfd_k {
+    int32_t fd;
+    int16_t events;
+    int16_t revents;
+};
+
+#define POLL_MAX_NFDS 64
+static struct pollfd_k g_pollfds[POLL_MAX_NFDS];
+
+static long poll_core(uint64_t fds_ptr, uint64_t nfds,
+                      int64_t timeout_ms)
+{
+    struct task *me = sched_current();
+    uint64_t deadline = 0;
+    uint64_t i;
+    bool infinite = timeout_ms < 0;
+
+    if (nfds > POLL_MAX_NFDS)
+        return -YOUSJ_EINVAL;
+    if (nfds > 0 && !user_range_ok(fds_ptr, nfds * 8))
+        return -YOUSJ_EFAULT;
+    for (i = 0; i < nfds; i++)
+        g_pollfds[i] = ((const struct pollfd_k *)(uintptr_t)fds_ptr)[i];
+    if (!infinite)
+        deadline = sched_uptime_ticks() +
+                   (uint64_t)((timeout_ms + 9) / 10);
+    for (;;) {
+        long ready = 0;
+        for (i = 0; i < nfds; i++) {
+            short rev = 0;
+            if (g_pollfds[i].fd >= 0)
+                rev = fd_ready(me, g_pollfds[i].fd,
+                               g_pollfds[i].events);
+            g_pollfds[i].revents = rev;
+            if (rev != 0)
+                ready++;
+        }
+        if (ready > 0 || (!infinite &&
+                          sched_uptime_ticks() >= deadline)) {
+            for (i = 0; i < nfds; i++)
+                ((struct pollfd_k *)(uintptr_t)fds_ptr)[i].revents =
+                    g_pollfds[i].revents;
+            return ready;
+        }
+        if (signal_deliverable_pending(me)) {
+            me->sig_wake = false;
+            return -YOUSJ_ERESTARTSYS;
+        }
+        sched_sleep_ticks(2);
+    }
+}
+
+static long sys_poll_sys(uint64_t fds_ptr, uint64_t nfds,
+                         long timeout_ms)
+{
+    return poll_core(fds_ptr, nfds, timeout_ms);
+}
+
+static int64_t timespec_ms(uint64_t ptr, bool *bad)
+{
+    const uint64_t *ts;
+    *bad = false;
+    if (!user_range_ok(ptr, 16)) {
+        *bad = true;
+        return 0;
+    }
+    ts = (const uint64_t *)(uintptr_t)ptr;
+    if ((int64_t)ts[0] < 0 || ts[1] >= 1000000000ULL) {
+        *bad = true;
+        return 0;
+    }
+    return (int64_t)ts[0] * 1000 +
+           (int64_t)((ts[1] + 999999ULL) / 1000000ULL);
+}
+
+static long sys_ppoll_sys(uint64_t fds_ptr, uint64_t nfds,
+                          uint64_t ts_ptr)
+{
+    bool bad;
+    int64_t ms;
+    if (ts_ptr == 0)
+        return poll_core(fds_ptr, nfds, -1);
+    ms = timespec_ms(ts_ptr, &bad);
+    if (bad)
+        return -YOUSJ_EINVAL;
+    return poll_core(fds_ptr, nfds, ms);
+}
+
+/* select: three 1024-bit sets in static storage */
+#define SEL_WORDS 16
+static uint64_t g_sel_in[3][SEL_WORDS];
+static uint64_t g_sel_out[3][SEL_WORDS];
+
+static int sel_get(const uint64_t *set, long fd)
+{
+    return (int)((set[fd / 64] >> (fd % 64)) & 1ULL);
+}
+
+static void sel_put(uint64_t *set, long fd)
+{
+    set[fd / 64] |= 1ULL << (fd % 64);
+}
+
+static long select_core(long nfds, uint64_t rptr, uint64_t wptr,
+                        uint64_t eptr, int64_t timeout_ms,
+                        uint64_t tv_out_ptr)
+{
+    struct task *me = sched_current();
+    uint64_t deadline = 0;
+    bool infinite = timeout_ms < 0;
+    long fd;
+    int s, w;
+
+    if (nfds < 0 || nfds > 1024)
+        return -YOUSJ_EINVAL;
+    for (s = 0; s < 3; s++)
+        for (w = 0; w < SEL_WORDS; w++)
+            g_sel_in[s][w] = 0;
+    {
+        const uint64_t *srcs[3];
+        srcs[0] = (const uint64_t *)(uintptr_t)rptr;
+        srcs[1] = (const uint64_t *)(uintptr_t)wptr;
+        srcs[2] = (const uint64_t *)(uintptr_t)eptr;
+        for (s = 0; s < 3; s++) {
+            if (srcs[s] == NULL)
+                continue;
+            if (!user_range_ok((uint64_t)(uintptr_t)srcs[s],
+                               ((nfds + 63) / 64) * 8))
+                return -YOUSJ_EFAULT;
+            for (w = 0; w < (nfds + 63) / 64; w++)
+                g_sel_in[s][w] = srcs[s][w];
+        }
+    }
+    if (!infinite)
+        deadline = sched_uptime_ticks() +
+                   (uint64_t)((timeout_ms + 9) / 10);
+    for (;;) {
+        long ready = 0;
+        for (s = 0; s < 3; s++)
+            for (w = 0; w < SEL_WORDS; w++)
+                g_sel_out[s][w] = 0;
+        for (fd = 0; fd < nfds; fd++) {
+            int want_r = rptr && sel_get(g_sel_in[0], fd);
+            int want_w = wptr && sel_get(g_sel_in[1], fd);
+            int want_e = eptr && sel_get(g_sel_in[2], fd);
+            short events = 0, rev;
+            if (!want_r && !want_w && !want_e)
+                continue;
+            if (want_r)
+                events |= POLLIN_K;
+            if (want_w)
+                events |= POLLOUT_K;
+            if (want_e)
+                events |= POLLPRI_K;
+            rev = fd_ready(me, fd, events);
+            if (rev & POLLNVAL_K)
+                return -YOUSJ_EBADF; /* Linux select rule */
+            if (rev & (POLLIN_K | POLLHUP_K)) {
+                if (want_r) {
+                    sel_put(g_sel_out[0], fd);
+                    ready++;
+                }
+            }
+            if (rev & POLLOUT_K) {
+                if (want_w) {
+                    sel_put(g_sel_out[1], fd);
+                    ready++;
+                }
+            }
+            if (rev & (POLLERR_K | POLLPRI_K)) {
+                if (want_e) {
+                    sel_put(g_sel_out[2], fd);
+                    ready++;
+                }
+                if ((rev & POLLERR_K) && want_w &&
+                    !(rev & POLLOUT_K)) {
+                    sel_put(g_sel_out[1], fd);
+                    ready++;
+                }
+            }
+        }
+        if (ready > 0 ||
+            (!infinite && sched_uptime_ticks() >= deadline)) {
+            uint64_t *dsts[3];
+            dsts[0] = (uint64_t *)(uintptr_t)rptr;
+            dsts[1] = (uint64_t *)(uintptr_t)wptr;
+            dsts[2] = (uint64_t *)(uintptr_t)eptr;
+            for (s = 0; s < 3; s++) {
+                if (dsts[s] == NULL)
+                    continue;
+                for (w = 0; w < SEL_WORDS; w++)
+                    dsts[s][w] = w < (nfds + 63) / 64
+                                     ? g_sel_out[s][w]
+                                     : 0;
+            }
+            if (ready == 0 && tv_out_ptr != 0) {
+                /* Linux writes the unslept remainder back */
+                uint64_t *tv = (uint64_t *)(uintptr_t)tv_out_ptr;
+                uint64_t rem = deadline > sched_uptime_ticks()
+                                   ? deadline - sched_uptime_ticks()
+                                   : 0;
+                tv[0] = rem / 100;
+                tv[1] = (rem % 100) * 10000;
+            }
+            return ready;
+        }
+        if (signal_deliverable_pending(me)) {
+            me->sig_wake = false;
+            return -YOUSJ_ERESTARTSYS;
+        }
+        sched_sleep_ticks(2);
+    }
+}
+
+static long sys_select_sys(long nfds, uint64_t r, uint64_t w,
+                           uint64_t e, uint64_t tv_ptr)
+{
+    int64_t ms = -1;
+    if (tv_ptr != 0) {
+        const uint64_t *tv;
+        if (!user_range_ok(tv_ptr, 16))
+            return -YOUSJ_EFAULT;
+        tv = (const uint64_t *)(uintptr_t)tv_ptr;
+        if ((int64_t)tv[0] < 0 || tv[1] >= 1000000ULL)
+            return -YOUSJ_EINVAL;
+        ms = (int64_t)tv[0] * 1000 +
+             (int64_t)((tv[1] + 999ULL) / 1000ULL);
+    }
+    return select_core(nfds, r, w, e, ms, tv_ptr);
+}
+
+static long sys_pselect_sys(long nfds, uint64_t r, uint64_t w,
+                            uint64_t e, uint64_t ts_ptr)
+{
+    bool bad;
+    int64_t ms = -1;
+    if (ts_ptr != 0) {
+        ms = timespec_ms(ts_ptr, &bad);
+        if (bad)
+            return -YOUSJ_EINVAL;
+    }
+    return select_core(nfds, r, w, e, ms, 0);
+}
+
 /* --- M13: unlink / rmdir / rename ------------------------------- */
 
 static long sys_unlink_sys(uint64_t path_ptr)
@@ -1557,6 +1857,14 @@ static long dispatch_inner(struct yousj_syscall_ctx *ctx)
         return sys_chdir_sys(a1);
     case YOUSJ_SYS_getcwd:
         return sys_getcwd_sys(a1, a2);
+    case YOUSJ_SYS_poll:
+        return sys_poll_sys(a1, a2, (long)a3);
+    case YOUSJ_SYS_ppoll:
+        return sys_ppoll_sys(a1, a2, a3);
+    case YOUSJ_SYS_select:
+        return sys_select_sys((long)a1, a2, a3, a4, a5);
+    case YOUSJ_SYS_pselect6:
+        return sys_pselect_sys((long)a1, a2, a3, a4, a5);
     case YOUSJ_SYS_unlink:
         return sys_unlink_sys(a1);
     case YOUSJ_SYS_unlinkat:

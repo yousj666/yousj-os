@@ -218,8 +218,23 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   下跑 mmtest 两轮（anon/私有读/私有写隔离/ramfs 共享
   写回/yfs 共享写回/非零偏移六场景）＋PMM 稳态，其余
   九链不回归。
-- ⏳ 下一步候选：poll/select、符号链接、mmap 缺页填
-  充（真按需分页）、yfs 一致性日志。
+- ✅ 调度 M15（2026-11-02）：poll/select 全家——poll(7)、
+  ppoll(271)、select(23)、pselect6(270) 共用一条就绪探
+  针：普通文件恒就绪；管道读端有数据或对端已关（HUP）
+  时可读，写端有空间时可写、无读者时报错（ERR）；控制
+  台输入用 UART 状态位探活（不消费字节，串口驱动新增
+  serial_rx_ready）。等待沿用 2-tick 轮询＋-ERESTARTSYS
+  协议，信号闸门自动产出 Linux 的 EINTR/自动重启二分。
+  select 遵循 Linux 的坏 fd 规则（任一被查 fd 无效直接
+  -EBADF，poll 则逐个报 POLLNVAL），超时后回写剩余时
+  间。验收：`tools/qemu-poll-test.py` 跑 polltest 两轮
+  （文件恒就绪/空管道超时/数据与 HUP/写端三态/select
+  基本面/信号中断长等待出 EINTR 六场景）＋PMM 稳态；
+  其余十链不回归。注：磁盘套件一处断言在三机并行时出
+  现过缓冲快照竞态（第二行输出未到就断言），已改为显
+  式等待该行后单跑复验全绿，与内核无关。
+- ⏳ 下一步候选：符号链接、mmap 缺页填充（真按需分
+  页）、yfs 一致性日志、epoll。
 
 ## 从零构建
 

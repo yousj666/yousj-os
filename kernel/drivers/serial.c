@@ -82,6 +82,12 @@ void serial_put_hex64(uint64_t v)
         serial_putc(digits[(v >> shift) & 0xF]);
 }
 
+int serial_rx_ready(void)
+{
+    /* LSR bit 0 without consuming the byte (poll/select). */
+    return (inb(SERIAL_PORT + 5) & 0x01) != 0;
+}
+
 int serial_getc_nonblock(void)
 {
     /* LSR (offset 5) bit 0 = data ready in the receive register. */

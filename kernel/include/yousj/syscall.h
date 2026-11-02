@@ -18,9 +18,13 @@
 #define YOUSJ_SYS_open          2
 #define YOUSJ_SYS_close         3
 #define YOUSJ_SYS_lseek         8
+#define YOUSJ_SYS_poll          7   /* M15 */
 #define YOUSJ_SYS_mmap          9
 #define YOUSJ_SYS_munmap       11
 #define YOUSJ_SYS_msync        26   /* M14 */
+#define YOUSJ_SYS_select       23   /* M15 */
+#define YOUSJ_SYS_pselect6     270  /* M15 */
+#define YOUSJ_SYS_ppoll        271  /* M15 */
 #define YOUSJ_SYS_brk          12
 #define YOUSJ_SYS_rt_sigaction 13   /* M7: signal batch */
 #define YOUSJ_SYS_rt_sigprocmask 14

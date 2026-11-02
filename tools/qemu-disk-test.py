@@ -146,6 +146,7 @@ check('p3 yfs mounted existing',
       b'formatted' not in sess.buf)
 sess.buf = b''
 ok = sess.run_expect('cat /data/renamed.txt', 'persist-me')
+ok = ok and sess.until('second-boot', 15)
 seg = sess.buf.decode(errors='replace')
 check('p3 renamed.txt has both lines',
       ok and 'second-boot' in seg)

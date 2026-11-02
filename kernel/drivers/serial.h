@@ -54,5 +54,7 @@ void serial_put_hex64(uint64_t v);
  * (sys_read on fd 0) sleeps between polls in the caller. Added for
  * milestone M4 (init's command loop). */
 int serial_getc_nonblock(void);
+/* Non-consuming receive check for poll/select readiness. */
+int serial_rx_ready(void);
 
 #endif /* YOUSJ_DRIVERS_SERIAL_H */
