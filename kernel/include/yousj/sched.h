@@ -246,6 +246,7 @@ uint64_t sched_count_state(enum task_state state);
 /* Find a live task by tid (NULL when absent). The returned pointer
  * is invalidated if the task exits or is killed. */
 struct task *sched_find_task(int tid);
+uint32_t sched_live_tids(uint64_t *tids, uint32_t cap); /* M28 */
 void         sched_set_name(struct task *t, const char *name);
 /* M5 process genealogy (SCHED_DESIGN sec. 6.3): zombie-child
  * lookup and child existence under the wait4 pid filter

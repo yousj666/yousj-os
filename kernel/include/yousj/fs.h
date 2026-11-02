@@ -65,6 +65,8 @@ struct yousj_file {
     uint32_t yfs_ino;              /* valid when backend == 1 */
     int proc_id;                   /* backend 2: 0 = the /proc
                                       directory, else PROC_ID_* */
+    uint32_t proc_pid;             /* backend 2, M28: the tid
+                                      for PROC_ID_PID* entries */
     uint32_t proc_len;             /* backend 2: snapshot size */
     char proc_buf[288];            /* backend 2: content snapshot
                                       taken at open (M25) */

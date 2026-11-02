@@ -879,10 +879,21 @@ static long yfs_open_path_fs(const char *rel, long flags,
  * generation, and re-opening refreshes it (Linux readers
  * like cat open per read anyway). Writes and mutations
  * are refused with EACCES; the directory itself can be
- * listed and chdir'd into like any other. */
+ * listed and chdir'd into like any other.
+ *
+ * M28: per-task subdirectories. /proc/<pid> exists for
+ * every live task (zombies included, until reaped) and
+ * carries two generated leaves, status and stat. A pid
+ * that names no live task is ENOENT everywhere, exactly
+ * like a name that was never there. Generation resolves
+ * the task afresh at open/stat time; a task that dies
+ * mid-read simply leaves the opener with its snapshot. */
 #define PROC_ID_UPTIME  1
 #define PROC_ID_MEMINFO 2
 #define PROC_ID_VERSION 3
+#define PROC_ID_PIDDIR  4 /* M28 */
+#define PROC_ID_PSTATUS 5 /* M28 */
+#define PROC_ID_PSTAT   6 /* M28 */
 static const char *const g_proc_names[3] = {
     "uptime", "meminfo", "version"
 };
@@ -894,10 +905,32 @@ static bool is_proc_path(const char *path)
            (path[5] == '\0' || path[5] == '/');
 }
 
-/* "" -> 0 (the directory), a known name -> its id, else -1 */
-static int proc_find(const char *rel)
+static bool proc_is_dir_id(int id)
+{
+    return id == 0 || id == PROC_ID_PIDDIR;
+}
+
+/* Inode numbers: the flat files keep 9000+id; a pid entry
+ * gets 10000 + pid*4 + leaf (0 dir, 1 status, 2 stat). */
+static uint64_t proc_ino_for(int id, uint32_t pid)
+{
+    if (id == PROC_ID_PIDDIR)
+        return 10000 + (uint64_t)pid * 4;
+    if (id == PROC_ID_PSTATUS)
+        return 10000 + (uint64_t)pid * 4 + 1;
+    if (id == PROC_ID_PSTAT)
+        return 10000 + (uint64_t)pid * 4 + 2;
+    return 9000 + (uint64_t)id;
+}
+
+/* "" -> 0 (the directory), a known name -> its id,
+ * "<pid>" / "<pid>/status" / "<pid>/stat" -> the M28 ids
+ * (with *pid_out set), else -1. A numeric head that names
+ * no live task is -1: from the outside it does not exist. */
+static int proc_find(const char *rel, uint32_t *pid_out)
 {
     int i;
+    *pid_out = 0;
     if (rel[0] == '\0')
         return 0;
     for (i = 0; i < 3; i++) {
@@ -908,7 +941,38 @@ static int proc_find(const char *rel)
         if (n[j] == '\0' && rel[j] == '\0')
             return i + 1;
     }
-    return -1;
+    {
+        uint64_t v = 0;
+        uint64_t j = 0;
+        while (rel[j] >= '0' && rel[j] <= '9') {
+            v = v * 10 + (uint64_t)(rel[j] - '0');
+            if (v > 0xFFFFFFu)
+                return -1;
+            j++;
+        }
+        if (j == 0)
+            return -1;
+        if (sched_find_task((int)v) == NULL)
+            return -1;
+        *pid_out = (uint32_t)v;
+        if (rel[j] == '\0')
+            return PROC_ID_PIDDIR;
+        if (rel[j] != '/')
+            return -1;
+        {
+            const char *leaf = rel + j + 1;
+            if (leaf[0] == 's' && leaf[1] == 't' &&
+                leaf[2] == 'a' && leaf[3] == 't' &&
+                leaf[4] == 'u' && leaf[5] == 's' &&
+                leaf[6] == '\0')
+                return PROC_ID_PSTATUS;
+            if (leaf[0] == 's' && leaf[1] == 't' &&
+                leaf[2] == 'a' && leaf[3] == 't' &&
+                leaf[4] == '\0')
+                return PROC_ID_PSTAT;
+        }
+        return -1;
+    }
 }
 
 struct pbuf {
@@ -956,7 +1020,36 @@ static void pb_put_ticks(struct pbuf *b, uint64_t ticks)
     pb_putu(b, cs);
 }
 
-static uint32_t proc_generate(int id, char *buf, uint32_t cap)
+/* Same letters the ps snapshot prints (sched.c). */
+static char proc_state_char(const struct task *t)
+{
+    if (t->sig_stopped)
+        return 'T';
+    switch (t->state) {
+    case TASK_RUNNING: return 'R';
+    case TASK_READY:   return 'r';
+    case TASK_BLOCKED: return 'S';
+    case TASK_ZOMBIE:  return 'Z';
+    case TASK_DEAD:    return 'D';
+    }
+    return '?';
+}
+
+static const char *proc_state_word(char c)
+{
+    switch (c) {
+    case 'R': return "Running";
+    case 'r': return "Ready";
+    case 'S': return "Sleeping";
+    case 'Z': return "Zombie";
+    case 'D': return "Dead";
+    case 'T': return "Stopped";
+    default:  return "Unknown";
+    }
+}
+
+static uint32_t proc_generate(int id, uint32_t pid, char *buf,
+                              uint32_t cap)
 {
     struct pbuf b;
     b.buf = buf;
@@ -979,8 +1072,56 @@ static uint32_t proc_generate(int id, char *buf, uint32_t cap)
         pb_puts(&b, " kB\n");
         break;
     case PROC_ID_VERSION:
-        pb_puts(&b, "Yousj OS version 0.9 (M25) x86_64 #1\n");
+        pb_puts(&b, "Yousj OS version 0.9 (M28) x86_64 #1\n");
         break;
+    case PROC_ID_PSTATUS: {
+        struct task *t = sched_find_task((int)pid);
+        char c;
+        if (t == NULL)
+            break;
+        c = proc_state_char(t);
+        pb_puts(&b, "Name:\t");
+        pb_puts(&b, t->name);
+        pb_puts(&b, "\nPid:\t");
+        pb_putu(&b, pid);
+        pb_puts(&b, "\nPPid:\t");
+        pb_putu(&b, t->parent_tid);
+        pb_puts(&b, "\nState:\t");
+        {
+            char cs[2];
+            cs[0] = c;
+            cs[1] = '\0';
+            pb_puts(&b, cs);
+        }
+        pb_puts(&b, " (");
+        pb_puts(&b, proc_state_word(c));
+        pb_puts(&b, ")\n");
+        break;
+    }
+    case PROC_ID_PSTAT: {
+        /* Linux field order; the four fields we know are
+         * real, the rest are zero placeholders. */
+        struct task *t = sched_find_task((int)pid);
+        int i;
+        if (t == NULL)
+            break;
+        pb_putu(&b, pid);
+        pb_puts(&b, " (");
+        pb_puts(&b, t->name);
+        pb_puts(&b, ") ");
+        {
+            char cs[2];
+            cs[0] = proc_state_char(t);
+            cs[1] = '\0';
+            pb_puts(&b, cs);
+        }
+        pb_puts(&b, " ");
+        pb_putu(&b, t->parent_tid);
+        for (i = 0; i < 20; i++)
+            pb_puts(&b, " 0");
+        pb_puts(&b, "\n");
+        break;
+    }
     default:
         break;
     }
@@ -994,12 +1135,13 @@ static long proc_open(const char *path, long flags,
     long acc = flags & YOUSJ_O_ACCMODE;
     struct yousj_file *f;
     int id;
+    uint32_t pid = 0;
     if (rel[0] == '/')
         rel++;
-    id = proc_find(rel);
+    id = proc_find(rel, &pid);
     if (id < 0)
         return -YOUSJ_ENOENT_L;
-    if (id == 0) {
+    if (proc_is_dir_id(id)) {
         if (acc != YOUSJ_O_RDONLY)
             return -YOUSJ_EISDIR;
     } else {
@@ -1011,10 +1153,11 @@ static long proc_open(const char *path, long flags,
         return -YOUSJ_ENFILE;
     f->backend = 2;
     f->proc_id = id;
+    f->proc_pid = pid;
     f->flags = flags;
     f->offset = 0;
-    if (id != 0)
-        f->proc_len = proc_generate(id, f->proc_buf,
+    if (!proc_is_dir_id(id))
+        f->proc_len = proc_generate(id, pid, f->proc_buf,
                                     sizeof(f->proc_buf));
     *out = f;
     return 0;
@@ -1354,22 +1497,23 @@ bool fs_path_stat2(const char *path, bool follow,
     if (is_proc_path(path)) {
         const char *rel = path + 5;
         int id;
+        uint32_t pid = 0;
         if (rel[0] == '/')
             rel++;
-        id = proc_find(rel);
+        id = proc_find(rel, &pid);
         if (id < 0)
             return false;
         info->mtime = (uint32_t)yousj_now_unix();
         info->atime = info->mtime;
         info->ctime = info->mtime;
-        info->ino = 9000 + (uint64_t)id;
-        if (id == 0) {
+        info->ino = proc_ino_for(id, pid);
+        if (proc_is_dir_id(id)) {
             info->mode = S_IFDIR_K | 0555u;
             info->size = 0;
         } else {
             char scratch[288];
             info->mode = S_IFREG_K | 0444u;
-            info->size = proc_generate(id, scratch,
+            info->size = proc_generate(id, pid, scratch,
                                        sizeof(scratch));
         }
         return true;
@@ -1410,8 +1554,8 @@ bool fs_file_stat(struct yousj_file *f,
         info->mtime = (uint32_t)yousj_now_unix();
         info->atime = info->mtime;
         info->ctime = info->mtime;
-        info->ino = 9000 + (uint64_t)f->proc_id;
-        if (f->proc_id == 0) {
+        info->ino = proc_ino_for(f->proc_id, f->proc_pid);
+        if (proc_is_dir_id(f->proc_id)) {
             info->mode = S_IFDIR_K | 0555u;
             info->size = 0;
         } else {
@@ -1538,7 +1682,7 @@ long file_read(struct yousj_file *f, uint8_t *dst, uint64_t count)
     long n;
     if (f != NULL && f->backend == 2) {
         uint64_t avail;
-        if (f->proc_id == 0)
+        if (proc_is_dir_id(f->proc_id))
             return -YOUSJ_EISDIR;
         if ((f->flags & YOUSJ_O_ACCMODE) == YOUSJ_O_WRONLY)
             return -YOUSJ_EBADF;
@@ -1618,7 +1762,7 @@ bool fs_file_is_dir(struct yousj_file *f)
     if (f->backend == 1)
         return yfs_is_dir(f->yfs_ino);
     if (f->backend == 2)
-        return f->proc_id == 0;
+        return proc_is_dir_id(f->proc_id);
     return f->node != NULL && f->node->is_dir;
 }
 
@@ -1630,7 +1774,7 @@ long fs_pread_file(struct yousj_file *f, uint64_t off,
         return -YOUSJ_EBADF;
     if (f->backend == 2) {
         uint64_t avail;
-        if (f->proc_id == 0 || off >= f->proc_len)
+        if (proc_is_dir_id(f->proc_id) || off >= f->proc_len)
             return 0;
         avail = f->proc_len - off;
         if (count > avail)
@@ -1693,7 +1837,7 @@ long file_seek(struct yousj_file *f, long off, long whence)
         switch (whence) {
         case 0: base = 0; break;
         case 1: base = (int64_t)f->offset; break;
-        case 2: base = f->proc_id == 0 ? 0 : (int64_t)f->proc_len;
+        case 2: base = proc_is_dir_id(f->proc_id) ? 0 : (int64_t)f->proc_len;
             break;
         default: return -YOUSJ_EINVAL;
         }
@@ -1741,28 +1885,86 @@ long file_getdents(struct yousj_file *f, uint8_t *buf, uint64_t count)
     struct yousj_ramfs_node *c;
     uint64_t used = 0, idx = 0;
     if (f != NULL && f->backend == 2) {
-        /* entries: . .. uptime meminfo version */
-        static const char *const names[5] = {
+        /* The root lists the three flat files plus one
+         * directory per live task (M28); a pid directory
+         * lists status and stat. The live set is re-read
+         * on every call -- entries may shift under a
+         * concurrent exit, the same race Linux has. */
+        static const char *const root_names[5] = {
             ".", "..", "uptime", "meminfo", "version"
         };
-        uint64_t i;
-        if (f->proc_id != 0)
+        static const char *const pid_names[4] = {
+            ".", "..", "status", "stat"
+        };
+        uint64_t tids[YOUSJ_SCHED_MAX_TASKS];
+        uint32_t ntids = 0;
+        uint64_t total, i;
+        if (!proc_is_dir_id(f->proc_id))
             return -YOUSJ_ENOTDIR;
-        for (i = f->offset; i < 5; i++) {
-            uint64_t namelen = str_len(names[i]), reclen;
+        if (f->proc_id == 0) {
+            ntids = sched_live_tids(tids,
+                                    YOUSJ_SCHED_MAX_TASKS);
+            total = 5 + ntids;
+        } else {
+            total = 4;
+        }
+        for (i = f->offset; i < total; i++) {
+            const char *nm;
+            char numbuf[16];
+            uint64_t ino;
+            uint8_t dtype;
+            uint64_t namelen, reclen;
             uint8_t *rec;
+            if (f->proc_id == PROC_ID_PIDDIR) {
+                nm = pid_names[i];
+                dtype = i <= 1 ? YOUSJ_DT_DIR : YOUSJ_DT_REG;
+                if (i == 0)
+                    ino = proc_ino_for(PROC_ID_PIDDIR,
+                                       f->proc_pid);
+                else if (i == 1)
+                    ino = 9000;
+                else if (i == 2)
+                    ino = proc_ino_for(PROC_ID_PSTATUS,
+                                       f->proc_pid);
+                else
+                    ino = proc_ino_for(PROC_ID_PSTAT,
+                                       f->proc_pid);
+            } else if (i < 5) {
+                nm = root_names[i];
+                ino = i <= 1 ? 9000 : 9000 + (i - 1);
+                dtype = i <= 1 ? YOUSJ_DT_DIR : YOUSJ_DT_REG;
+            } else {
+                uint64_t tid = tids[i - 5];
+                uint64_t v = tid;
+                int n = 0, a, b;
+                if (v == 0)
+                    numbuf[n++] = '0';
+                while (v > 0) {
+                    numbuf[n++] = (char)('0' + (v % 10));
+                    v /= 10;
+                }
+                numbuf[n] = '\0';
+                for (a = 0, b = n - 1; a < b; a++, b--) {
+                    char tc = numbuf[a];
+                    numbuf[a] = numbuf[b];
+                    numbuf[b] = tc;
+                }
+                nm = numbuf;
+                ino = proc_ino_for(PROC_ID_PIDDIR,
+                                   (uint32_t)tid);
+                dtype = YOUSJ_DT_DIR;
+            }
+            namelen = str_len(nm);
             reclen = (19 + namelen + 1 + 7) & ~7ULL;
             if (used + reclen > count)
                 break;
             rec = buf + used;
             mem_zero(rec, reclen);
-            *(uint64_t *)(rec + 0) =
-                i <= 1 ? 9000 : 9000 + (i - 1);
+            *(uint64_t *)(rec + 0) = ino;
             *(uint64_t *)(rec + 8) = i + 1;
             *(uint16_t *)(rec + 16) = (uint16_t)reclen;
-            rec[18] = i <= 1 ? YOUSJ_DT_DIR : YOUSJ_DT_REG;
-            mem_copy(rec + 19, (const uint8_t *)names[i],
-                     namelen);
+            rec[18] = dtype;
+            mem_copy(rec + 19, (const uint8_t *)nm, namelen);
             used += reclen;
             f->offset = i + 1;
         }

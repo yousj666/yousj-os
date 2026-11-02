@@ -400,6 +400,27 @@ struct task *sched_find_task(int tid)
     return NULL;
 }
 
+/* M28: enumerate live tasks for /proc/<pid>. Fills up to
+ * cap tids in ascending order and returns the count
+ * written. Zombies count as live (they exist until reaped,
+ * and ps shows them too). */
+uint32_t sched_live_tids(uint64_t *tids, uint32_t cap)
+{
+    uint32_t n = 0;
+    uint64_t want, i;
+    for (want = 0; want < g_next_tid && n < cap; want++) {
+        for (i = 0; i < YOUSJ_SCHED_MAX_TASKS; i++) {
+            if (g_tasks[i].in_use &&
+                (uint64_t)g_tasks[i].tid == want) {
+                tids[n] = want;
+                n++;
+                break;
+            }
+        }
+    }
+    return n;
+}
+
 void sched_set_name(struct task *t, const char *name)
 {
     if (t != NULL)

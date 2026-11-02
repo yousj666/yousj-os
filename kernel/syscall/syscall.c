@@ -515,6 +515,13 @@ static long sys_clone(struct yousj_syscall_ctx *ctx, long flags,
                 child->fx_area[i] = me->fx_area[i];
         }
         signal_clone_inherit(child, me);
+        /* M28: comm is inherited across clone, as on Linux;
+         * execve renames to the image basename. Without
+         * this every forked child was named "clone" (the
+         * create call's placeholder), which is what ps and
+         * /proc/<pid>/status would forever show for
+         * not-yet-exec'd children. */
+        sched_set_name(child, me->name);
         /* M9: the fd table is copied and every open-file object
          * shared (refcount++), so offsets are shared with the
          * parent exactly like Linux. cwd is a value copy. */

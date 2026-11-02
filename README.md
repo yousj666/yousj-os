@@ -452,9 +452,20 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   不回归（disk 套件首轮紧接十五链回归、宿主机高
   负载下 harness 超时假失败一簇，闲时单独重跑
   ALL OK，与 M22 同款）。
+- ✅ /proc/<pid> M28（2026-11-03）：每个存活任务
+  一个目录。根目录动态列出全部 pid（僵尸被收尸
+  前照列），<pid>/status 给 Name/Pid/PPid/State、
+  <pid>/stat 按 Linux 字段序（前四字段真实、其余
+  零占位）；不存在的 pid 处处 ENOENT、与不存在的
+  名字无区别。生成沿用 open 时快照，任务中途死去
+  不影响已打开的读者。顺手修了 clone 命名：子进
+  程改继承父 comm（Linux 语义、exec 再改名），不
+  再人人顶着创建占位名 "clone"——未 exec 的孩子
+  此前在 ps 与 /proc 里永远叫 clone。验收：新套
+  件 pidtest 九场景两轮；其余十九链不回归。
 - ⏳ 下一步候选：yfs 格式升版（inode 扩容、三时
-  间戳独立、为未来字段留白）、/proc/<pid> 子目录、
-  相对 dirfd 支持。
+  间戳独立、为未来字段留白）、相对 dirfd 支持、
+  /proc/self 与 cmdline 等更多生成项。
 
 ## 从零构建
 
