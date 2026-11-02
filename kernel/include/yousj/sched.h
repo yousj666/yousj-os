@@ -51,6 +51,9 @@ struct task {
     uint64_t        parent_tid;
     enum task_state state;
     char            name[16];
+    char            env[512];     /* M34: exec envp joined
+                                     with NULs, for /proc */
+    uint32_t        env_len;
     char            cmdline[128]; /* M31: exec argv joined
                                      by NULs (cmdline_len
                                      bytes incl. final NUL);

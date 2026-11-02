@@ -523,9 +523,19 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   验收：dirfdtest 增六场景（mkdirat/renameat/
   noreplace/readlinkat/faccessat/linkat-eperm）
   两轮全过，disk 套件在 yfs 上同样复跑。
-- ⏳ 下一步候选：更多 /proc 生成项（如
-  environ）、getdents64 的 d_off 语义细化、
-  硬链接（目录项重构）、fchownat/chmod 家族。
+- ✅ /proc/<pid>/environ M34（2026-11-03）：
+  execve 本就把 envp 拷进新镜像初始栈，本轮在
+  提交点把 envp 留存进任务（512 字节，execve
+  上限 4×128 故无损），clone 同样继承；
+  /proc/<pid>/environ 按原始字节生成（pid 项
+  inode 步长 4→8，生成物不落盘故无兼容问题）；
+  proc 快照缓冲 288→640 以容纳完整 environ。
+  验收：pidtest 加 environ-self（shell 以空 env
+  启动故自读为 0 字节）与 environ-child（子进
+  程 exec 带 K1=V1/K2=V2、父逐字节核对）。
+- ⏳ 下一步候选：getdents64 的 d_off 语义细
+  化、硬链接（目录项重构）、fchownat/chmod
+  家族、/proc/<pid>/cwd 与 exe 链接项。
 
 ## 从零构建
 

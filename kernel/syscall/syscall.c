@@ -532,6 +532,13 @@ static long sys_clone(struct yousj_syscall_ctx *ctx, long flags,
                 child->cmdline[i] = me->cmdline[i];
             child->cmdline_len = me->cmdline_len;
         }
+        /* M34: environ inherits the same way. */
+        {
+            uint32_t i;
+            for (i = 0; i < me->env_len; i++)
+                child->env[i] = me->env[i];
+            child->env_len = me->env_len;
+        }
         /* M9: the fd table is copied and every open-file object
          * shared (refcount++), so offsets are shared with the
          * parent exactly like Linux. cwd is a value copy. */
@@ -754,6 +761,25 @@ static long sys_execve(uint64_t path_ptr, uint64_t argv_ptr,
         if (w == 0 && sizeof(me->cmdline) > 1)
             me->cmdline[w++] = '\0';
         me->cmdline_len = w;
+    }
+    /* M34: retain envp the same way for /proc/<pid>/
+     * environ. execve caps envp at 4 x 128 bytes, so the
+     * 512-byte field is lossless in practice. */
+    {
+        uint32_t w = 0;
+        int ei;
+        for (ei = 0; envp_k[ei] != NULL; ei++) {
+            const char *a = envp_k[ei];
+            uint32_t j;
+            for (j = 0; a[j] != '\0' && w + 1 < sizeof(me->env);
+                 j++)
+                me->env[w++] = a[j];
+            if (w + 1 < sizeof(me->env))
+                me->env[w++] = '\0';
+            else
+                break;
+        }
+        me->env_len = w;
     }
     /* M14: release the old image's VMAs (shared file regions
      * write back against the old space before it dies). */

@@ -85,7 +85,8 @@ def free_count():
 SCEN = ['root-list', 'self-status', 'self-stat',
         'child-status', 'zombie', 'dead-pid', 'bad-names',
         'piddir-dents', 'stat-modes', 'self-link',
-        'cmdline-self', 'cmdline-child']
+        'cmdline-self', 'cmdline-child', 'environ-self',
+        'environ-child']
 
 check('shell prompt', until('sh> ', 60))
 free_counts = []

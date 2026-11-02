@@ -31,6 +31,7 @@
 #define SYS_nanosleep 35
 #define SYS_getpid 39
 #define SYS_clone 56
+#define SYS_execve 59
 #define SYS_wait4 61
 #define SYS_exit_group 231
 #define SYS_getdents64 217
@@ -228,9 +229,19 @@ static long read_file(const char *path, char *buf, long cap)
     return n;
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
     long me = sys_call1(SYS_getpid, 0);
+    /* M34: the exec'd child in the environ-child scenario
+     * just has to stay alive with its env on display. */
+    if (argc > 1 && argv[1][0] == 'e' && argv[1][1] == 'n' &&
+        argv[1][2] == 'v' && argv[1][3] == 'c' &&
+        argv[1][4] == 'h' && argv[1][5] == 'i' &&
+        argv[1][6] == 'l' && argv[1][7] == 'd' &&
+        argv[1][8] == '\0') {
+        sleep_ms(2500);
+        return 0;
+    }
     char buf[1024];
     char path[64];
     char key[32];
@@ -373,6 +384,7 @@ int main(void)
                    dent_type(db, got, "status") == 8 &&
                    dent_type(db, got, "stat") == 8 &&
                    dent_type(db, got, "cmdline") == 8 &&
+                   dent_type(db, got, "environ") == 8 &&
                    dent_type(db, got, ".") == 4);
         }
     }
@@ -433,6 +445,44 @@ int main(void)
             sys_call4(SYS_wait4, c, (long)(uintptr_t)&st, 0, 0);
         }
         report("cmdline-child", ok);
+    }
+
+    /* M34: environ is the exec envp, NUL-joined. The
+     * shell execs us with an empty env, so ours is empty;
+     * a child exec'd with K1/K2 shows exactly those. */
+    n = read_file("/proc/self/environ", buf, sizeof(buf));
+    report("environ-self", n == 0);
+    {
+        long c = sys_call4(SYS_clone, 17, 0, 0, 0);
+        int ok = 0;
+        if (c == 0) {
+            static const char *cargv[3];
+            static const char *cenv[3];
+            cargv[0] = "pidtest";
+            cargv[1] = "envchild";
+            cargv[2] = 0;
+            cenv[0] = "K1=V1";
+            cenv[1] = "K2=V2";
+            cenv[2] = 0;
+            sys_call3(SYS_execve,
+                      (long)(uintptr_t)"/bin/pidtest",
+                      (long)(uintptr_t)cargv,
+                      (long)(uintptr_t)cenv);
+            die(90);
+        }
+        sleep_ms(300);
+        pid_path(path, c, "/environ");
+        n = read_file(path, buf, sizeof(buf));
+        ok = n == 12 && buf[0] == 'K' && buf[1] == '1' &&
+             buf[2] == '=' && buf[3] == 'V' && buf[4] == '1' &&
+             buf[5] == '\0' && buf[6] == 'K' && buf[7] == '2' &&
+             buf[8] == '=' && buf[9] == 'V' &&
+             buf[10] == '2' && buf[11] == '\0';
+        {
+            long st = 0;
+            sys_call4(SYS_wait4, c, (long)(uintptr_t)&st, 0, 0);
+        }
+        report("environ-child", ok);
     }
 
     out("PIDTEST DONE\n");
