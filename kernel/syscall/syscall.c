@@ -62,6 +62,8 @@ static void wrmsr(uint32_t msr, uint64_t value);
 static struct yousj_file *fd_file_of(struct task *t, long fd); /* M9, defined with sys_read */
 static void resolve_path(struct task *t, const char *path, char *out);
 static long sys_read_pipe(struct yousj_file *f, uint64_t buf, uint64_t count);
+static long pipe_read_mem(struct yousj_file *f, uint8_t *dst,
+                          uint64_t count);
 static long sys_write_pipe(struct yousj_file *f, uint64_t buf, uint64_t len);
 static long pipe_write_mem(struct yousj_file *f,
                            const uint8_t *src, uint64_t len);
@@ -1137,6 +1139,10 @@ static long sys_sendfile(long out_fd, long in_fd,
     if (in->pipe != NULL)
         return -YOUSJ_EINVAL;
     if (off_ptr != 0) {
+        /* M42 note: fs_pread_file does no access check of
+         * its own, so the positional form guards here. */
+        if ((in->flags & YOUSJ_O_ACCMODE) == YOUSJ_O_WRONLY)
+            return -YOUSJ_EBADF;
         if (!user_range_ok(off_ptr, 8))
             return -YOUSJ_EFAULT;
         off = *(const int64_t *)(uintptr_t)off_ptr;
@@ -1179,6 +1185,116 @@ out:
     if (off_ptr != 0 && done > 0) {
         int64_t noff = off + (int64_t)done;
         *(int64_t *)(uintptr_t)off_ptr = noff;
+    }
+    return done > 0 ? (long)done : result;
+}
+
+/* --- M42: splice -------------------------------------
+ * Same bounce discipline as sendfile, generalized:
+ * either side may be the pipe (at least one must be).
+ * Offsets follow the sendfile rule per side -- a pipe
+ * side must pass NULL, a file side is positional with
+ * a pointer and offset-carried without. SPLICE_F_*
+ * flags are accepted; blocking behavior follows the
+ * descriptors (documented simplification). */
+static long splice_off_read(uint64_t ptr, bool is_pipe,
+                            int64_t *out)
+{
+    if (is_pipe) {
+        if (ptr != 0)
+            return -YOUSJ_EINVAL;
+        *out = -1;
+        return 0;
+    }
+    if (ptr == 0) {
+        *out = -1;
+        return 0;
+    }
+    if (!user_range_ok(ptr, 8))
+        return -YOUSJ_EFAULT;
+    *out = *(const int64_t *)(uintptr_t)ptr;
+    if (*out < 0)
+        return -YOUSJ_EINVAL;
+    return 0;
+}
+
+static long sys_splice(long fd_in, uint64_t off_in_ptr,
+                       long fd_out, uint64_t off_out_ptr,
+                       uint64_t len, long flags)
+{
+    struct task *me = sched_current();
+    struct yousj_file *in = fd_file_of(me, fd_in);
+    struct yousj_file *out = fd_file_of(me, fd_out);
+    uint8_t kbuf[1024];
+    uint64_t done = 0;
+    int64_t off_in = -1, off_out = -1;
+    long rc, result = 0;
+
+    if (in == NULL || out == NULL)
+        return -YOUSJ_EBADF;
+    if (flags & ~(0x1L | 0x2L | 0x4L | 0x8L))
+        return -YOUSJ_EINVAL;
+    if (in->pipe == NULL && out->pipe == NULL)
+        return -YOUSJ_EINVAL; /* splice needs a pipe */
+    rc = splice_off_read(off_in_ptr, in->pipe != NULL,
+                         &off_in);
+    if (rc != 0)
+        return rc;
+    rc = splice_off_read(off_out_ptr, out->pipe != NULL,
+                         &off_out);
+    if (rc != 0)
+        return rc;
+    /* the positional helpers do no access checks */
+    if (off_in >= 0 &&
+        (in->flags & YOUSJ_O_ACCMODE) == YOUSJ_O_WRONLY)
+        return -YOUSJ_EBADF;
+    if (off_out >= 0 &&
+        (out->flags & YOUSJ_O_ACCMODE) == YOUSJ_O_RDONLY)
+        return -YOUSJ_EBADF;
+    while (done < len) {
+        uint64_t want = len - done;
+        long n, w;
+        if (want > sizeof(kbuf))
+            want = sizeof(kbuf);
+        if (in->pipe != NULL)
+            n = pipe_read_mem(in, kbuf, want);
+        else if (off_in >= 0)
+            n = fs_pread_file(in, (uint64_t)off_in + done,
+                              kbuf, want);
+        else
+            n = file_read(in, kbuf, want);
+        if (n < 0) {
+            result = n;
+            goto out;
+        }
+        if (n == 0)
+            break;
+        if (out->pipe != NULL)
+            w = pipe_write_mem(out, kbuf, (uint64_t)n);
+        else if (off_out >= 0)
+            w = fs_pwrite_file(out, (uint64_t)off_out + done,
+                               kbuf, (uint64_t)n);
+        else if (out->backend == 0 && out->node == NULL)
+            w = -YOUSJ_EINVAL; /* the console again */
+        else
+            w = file_write(out, kbuf, (uint64_t)n);
+        if (w < 0) {
+            result = w;
+            goto out;
+        }
+        done += (uint64_t)w;
+        if (w < n)
+            break;
+    }
+    result = (long)done;
+out:
+    if (done > 0) {
+        if (off_in_ptr != 0 && off_in >= 0)
+            *(int64_t *)(uintptr_t)off_in_ptr =
+                off_in + (int64_t)done;
+        if (off_out_ptr != 0 && off_out >= 0)
+            *(int64_t *)(uintptr_t)off_out_ptr =
+                off_out + (int64_t)done;
     }
     return done > 0 ? (long)done : result;
 }
@@ -2225,18 +2341,29 @@ static long sys_read_pipe(struct yousj_file *f, uint64_t buf,
     struct task *me = sched_current();
     struct yousj_pipe *p = f->pipe;
 
+    if (!user_range_ok(buf, count))
+        return -YOUSJ_EFAULT;
+    return pipe_read_mem(f, (uint8_t *)(uintptr_t)buf, count);
+}
+
+/* M42 split: the pipe-read loop into a memory sink;
+ * sendfile's sibling splice() reads through it. */
+static long pipe_read_mem(struct yousj_file *f, uint8_t *dst,
+                          uint64_t count)
+{
+    struct task *me = sched_current();
+    struct yousj_pipe *p = f->pipe;
+
     if ((f->flags & YOUSJ_O_ACCMODE) != YOUSJ_O_RDONLY)
         return -YOUSJ_EBADF;
     if (count == 0)
         return 0;
-    if (!user_range_ok(buf, count))
-        return -YOUSJ_EFAULT;
     for (;;) {
         if (p->count > 0) {
             uint64_t n = count < p->count ? count : p->count;
             uint64_t i;
             for (i = 0; i < n; i++) {
-                ((uint8_t *)(uintptr_t)buf)[i] = p->buf[p->head];
+                dst[i] = p->buf[p->head];
                 p->head = (p->head + 1) % YOUSJ_PIPE_CAP;
             }
             p->count -= (uint32_t)n;
@@ -3129,6 +3256,9 @@ static long dispatch_inner(struct yousj_syscall_ctx *ctx)
         return sys_fchownat((long)a1, a2, (long)a5);
     case YOUSJ_SYS_sendfile:
         return sys_sendfile((long)a1, (long)a2, a3, a4);
+    case YOUSJ_SYS_splice:
+        return sys_splice((long)a1, a2, (long)a3, a4, a5,
+                          (long)ctx->a6);
     case YOUSJ_SYS_umask: {
         struct task *t = sched_current();
         long old = (long)t->umask;

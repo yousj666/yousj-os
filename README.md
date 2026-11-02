@@ -617,8 +617,20 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   fd 不存在即整项不存在。验收：pidtest 加
   fd-dir（控制台/文件/管道三种目标、lstat
   与 stat 分工、目录列表类型、坏 fd ENOENT）。
+- ✅ splice M42（2026-11-03）：splice(275)
+  转正，与 sendfile 同一套栈缓冲中转纪律；
+  sys_read_pipe 拆出 pipe_read_mem 与写入侧
+  对称。三方向（文件→管道、管道→管道、管
+  道→文件）全通；规则齐：至少一端为管道、
+  管道侧偏移指针必须 NULL、文件侧偏移语义
+  同 sendfile、定位读写补了访问模式校验
+  （fs_pread/pwrite_file 本身不查）。阻塞行
+  为随描述符（SPLICE_F_NONBLOCK 只接受不单
+  独实现，明示）。至此零拷贝家族只剩
+  copy_file_range 仍 ENOSYS。验收：
+  pipetest 加 splice（三方向＋两条规则）。
 - ⏳ 下一步候选：硬链接（目录项重构）、
-  splice、/proc/<pid>/fdinfo。
+  copy_file_range、/proc/<pid>/fdinfo。
 
 ## 从零构建
 

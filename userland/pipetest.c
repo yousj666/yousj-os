@@ -28,6 +28,7 @@
 #define SYS_rt_sigaction 13
 #define SYS_pipe         22
 #define SYS_sendfile     40
+#define SYS_splice       275
 #define SYS_unlink       87
 #define SYS_dup          32
 #define SYS_dup2         33
@@ -359,6 +360,78 @@ static void t_sendfile_pipe(void)
     sys_call3(SYS_unlink, (long)(uintptr_t)"/sf.txt", 0, 0);
 }
 
+/* M42: splice in all three directions plus the rules. */
+static long sys_call6(long nr, long a1, long a2, long a3,
+                      long a4, long a5, long a6)
+{
+    long r;
+    register long r10 __asm__("r10") = a4;
+    register long r8 __asm__("r8") = a5;
+    register long r9 __asm__("r9") = a6;
+    __asm__ volatile("syscall"
+                     : "=a"(r)
+                     : "a"(nr), "D"(a1), "S"(a2), "d"(a3),
+                       "r"(r10), "r"(r8), "r"(r9)
+                     : "rcx", "r11", "memory");
+    return r;
+}
+
+static void t_splice(void)
+{
+    int p1[2] = { -1, -1 }, p2[2] = { -1, -1 };
+    char buf[16];
+    long fd, fd2, n, got;
+    int64_t off = 0;
+    int ok;
+    fd = sys_call3(SYS_open, (long)(uintptr_t)"/sp.txt",
+                   0101, 0644);
+    sys_call3(SYS_write, fd,
+              (long)(uintptr_t)"splice-data", 11);
+    sys_call3(SYS_close, fd, 0, 0);
+    fd = sys_call3(SYS_open, (long)(uintptr_t)"/sp.txt", 0,
+                   0);
+    sys_call3(SYS_pipe, (long)(uintptr_t)p1, 0, 0);
+    sys_call3(SYS_pipe, (long)(uintptr_t)p2, 0, 0);
+    /* file -> pipe */
+    n = sys_call6(SYS_splice, fd, 0, p1[1], 0, 11, 0);
+    ok = n == 11;
+    /* pipe -> pipe */
+    n = sys_call6(SYS_splice, p1[0], 0, p2[1], 0, 11, 0);
+    ok = ok && n == 11;
+    /* pipe -> file at an explicit offset */
+    fd2 = sys_call3(SYS_open, (long)(uintptr_t)"/sp2.txt",
+                    0101, 0644);
+    n = sys_call6(SYS_splice, p2[0], 0, fd2,
+                  (long)(uintptr_t)&off, 11, 0);
+    ok = ok && n == 11 && off == 11;
+    sys_call3(SYS_close, fd2, 0, 0);
+    fd2 = sys_call3(SYS_open, (long)(uintptr_t)"/sp2.txt",
+                    0, 0);
+    got = sys_call3(SYS_read, fd2, (long)(uintptr_t)buf,
+                    (long)sizeof(buf));
+    ok = ok && got == 11 &&
+         bytes_eq(buf, "splice-data", 11);
+    /* rule: file->file is EINVAL (fd2 still open here) */
+    ok = ok && sys_call6(SYS_splice, fd, 0, fd2, 0, 1,
+                         0) == -22;
+    sys_call3(SYS_close, fd2, 0, 0);
+    /* rule: a pipe offset pointer is EINVAL (the
+     * file->file rule was checked earlier, while both
+     * file descriptors were still open) */
+    sys_call3(SYS_write, p1[1], (long)(uintptr_t)"z", 1);
+    ok = ok && sys_call6(SYS_splice, p1[0],
+                         (long)(uintptr_t)&off, p2[1], 0, 1,
+                         0) == -22;
+    report2("splice", ok, 0);
+    sys_call3(SYS_close, p1[0], 0, 0);
+    sys_call3(SYS_close, p1[1], 0, 0);
+    sys_call3(SYS_close, p2[0], 0, 0);
+    sys_call3(SYS_close, p2[1], 0, 0);
+    sys_call3(SYS_close, fd, 0, 0);
+    sys_call3(SYS_unlink, (long)(uintptr_t)"/sp.txt", 0, 0);
+    sys_call3(SYS_unlink, (long)(uintptr_t)"/sp2.txt", 0, 0);
+}
+
 int main(int argc, char **argv)
 {
     if (argc > 2 && argv[1][0] >= '0' && argv[1][0] <= '9' &&
@@ -367,6 +440,7 @@ int main(int argc, char **argv)
     out("pipetest: M10 pipe/dup suite\n");
     t_basic();
     t_sendfile_pipe();
+    t_splice();
     t_block_eof();
     t_epipe();
     t_full();
