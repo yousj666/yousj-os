@@ -205,8 +205,15 @@ static void unmap_free_page(struct vmm_space *space, uint64_t va)
 {
     uint64_t frame = 0;
     if (vmm_translate(space, va, &frame, NULL) == 0) {
-        if (vmm_unmap(space, va, YOUSJ_PAGE_SIZE) == 0)
+        if (vmm_unmap(space, va, YOUSJ_PAGE_SIZE) == 0) {
+            /* The current CPU may hold a stale translation
+             * for this VA: without the flush, a same-task
+             * access after a shrink+regrow (or unmap+remap)
+             * silently reads the freed frame's old content
+             * instead of faulting in the new page (M22). */
+            vmm_flush_tlb_va(va);
             (void)pmm_free_page(frame);
+        }
     }
 }
 
@@ -1799,16 +1806,19 @@ static long sys_brk(uint64_t addr)
         return -YOUSJ_EINVAL;
     if (addr == 0)
         return (long)me->brk_end;
-    if (addr < me->brk_start || addr > me->brk_start + YOUSJ_BRK_MAX_GROWTH)
-        return (long)me->brk_end; /* Linux: failure returns the old break */
+    if (addr < me->brk_start || addr > me->brk_start + YOUSJ_BRK_MAX_GROWTH ||
+        addr > YOUSJ_MMAP_BASE)
+        return (long)me->brk_end; /* Linux: failure returns the old break;
+                                      the heap never crosses into the
+                                      mmap region (M22) */
     old_pg = (me->brk_end + YOUSJ_PAGE_SIZE - 1) / YOUSJ_PAGE_SIZE;
     new_pg = (addr + YOUSJ_PAGE_SIZE - 1) / YOUSJ_PAGE_SIZE;
-    for (pg = old_pg; pg < new_pg; pg++) {
-        if (map_zero_page(me->mm, pg * YOUSJ_PAGE_SIZE,
-                          YOUSJ_VMM_READ | YOUSJ_VMM_WRITE |
-                          YOUSJ_VMM_USER) != 0)
-            return (long)me->brk_end; /* partial growth: keep old break */
-    }
+    /* M22: growth is pure bookkeeping -- heap pages are
+     * materialized by the fault path on first touch (see
+     * the heap branch in yousj_page_fault). Shrinking drops
+     * whatever pages above the new break were materialized;
+     * unmap_free_page is a no-op for untouched ones. The
+     * page straddling a non-aligned new break stays. */
     for (pg = new_pg; pg < old_pg; pg++)
         unmap_free_page(me->mm, pg * YOUSJ_PAGE_SIZE);
     me->brk_end = addr;
@@ -2246,6 +2256,19 @@ void yousj_page_fault(struct yousj_pf_info *info)
         if (v != NULL &&
             fault_in_vma(me, v, info->cr2, info->err))
             return; /* resolved: the stub retries the access */
+        /* M22: the heap. Pages between brk_start and the
+         * page-rounded break materialize as anonymous
+         * read/write pages on first touch, like a private
+         * anonymous VMA that needs no slot. */
+        if (me->brk_start != 0 && info->cr2 >= me->brk_start &&
+            info->cr2 < ((me->brk_end + YOUSJ_PAGE_SIZE - 1) &
+                          ~(YOUSJ_PAGE_SIZE - 1ULL)) &&
+            map_zero_page(me->mm,
+                          info->cr2 &
+                              ~(YOUSJ_PAGE_SIZE - 1ULL),
+                          YOUSJ_VMM_READ | YOUSJ_VMM_WRITE |
+                          YOUSJ_VMM_USER) == 0)
+            return;
     }
     if ((info->cs & 3) == 3 && me != NULL && me->mm != NULL) {
         serial_puts("\nYousj OS: task ");
