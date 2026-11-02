@@ -6,9 +6,10 @@
  * (userland/init.c prototype, DESIGN.md sec. 2):
  *
  *   print the banner, then forever: clone a child that execve's
- *   the shell (/bin/sh), wait4 for it, report its exit, sweep
- *   any adopted orphans with WNOHANG, print the smoke marker
- *   after a clean cycle, throttle 1s, respawn.
+ *   the shell (/bin/sh), supervise with wait4(-1) -- reaping
+ *   adopted orphans the moment they die (M27) and reporting
+ *   only the shell's exit -- print the smoke marker after a
+ *   clean cycle, throttle 1s, respawn.
  *
  * init never exits: the kernel panics if it does ("Attempted
  * to kill init"), by design.
@@ -133,8 +134,17 @@ static void print_banner(void)
     out(")\n");
 }
 
-/* Spawn the shell and reap it. Returns its exit code
- * (128+signal if killed, 127 on spawn/exec failure). */
+/* Spawn the shell and supervise it. Returns its exit code
+ * (128+signal if killed, 127 on spawn/exec failure).
+ *
+ * M27: the wait is wait4(-1), not wait4(shell_pid). Any child
+ * exit wakes it -- the shell's, or an adopted orphan's -- and
+ * the loop reaps whatever died, reporting only the shell.
+ * Orphans adopted mid-session are therefore collected the
+ * moment they die; the old shape (block on the shell, then
+ * WNOHANG-sweep) left them as zombies for the whole session,
+ * sometimes forever in practice. An orphan that dies during
+ * the 1 s respawn throttle below is reaped on the next pass. */
 static int spawn_and_reap(void)
 {
     static const char *const shell_argv[] = { "/bin/sh", NULL };
@@ -152,20 +162,17 @@ static int spawn_and_reap(void)
         out("yousj-init: execve of /bin/sh failed\n");
         sys_call3(SYS_exit_group, 127, 0, 0);
     }
-    {
+    for (;;) {
         int status = 0;
-        long got = sys_call4(SYS_wait4, pid, (long)(uintptr_t)&status,
+        long got = sys_call4(SYS_wait4, -1, (long)(uintptr_t)&status,
                              0, 0);
-
-        /* Adopted orphans are init's hard duty: sweep whatever
-         * else is already a zombie. */
-        while (sys_call4(SYS_wait4, -1, 0, WNOHANG, 0) > 0)
-            ;
 
         if (got < 0) {
             out("yousj-init: wait4 failed\n");
             return 127;
         }
+        if (got != pid)
+            continue; /* an adopted orphan, reaped: quiet duty */
         if ((status & 0x7F) == 0) {
             out("yousj-init: child exited code=");
             out_long((status >> 8) & 0xFF);
