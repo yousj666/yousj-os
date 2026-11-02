@@ -510,9 +510,22 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   查询位（明示）。验收：sigtest 加 altstack 场
   景（查询/过小/往返/ONSTACK 落栈/无标志回主栈/
   禁用后回主栈）；其余二十三链不回归。
-- ⏳ 下一步候选：renameat 与 faccessat 等其余
-  *at 补齐、更多 /proc 生成项（如 environ）、
-  getdents 的 d_off 语义细化。
+- ✅ *at 家族补齐 M33（2026-11-03）：mkdirat、
+  readlinkat 为 resolve_at 薄封装；renameat 双
+  dirfd 独立解析，renameat2 仅支持
+  RENAME_NOREPLACE（目标预检 lstat，存在即
+  EEXIST，非原子已明示）；access/faccessat/
+  faccessat2 新增（无 uid 模型，请求位按所有者
+  权限三联字面校验，AT_EACCESS 空转，
+  AT_EMPTY_PATH 可查 dirfd 本身）。link/linkat
+  明确回 -EPERM：ramfs 名字在节点内（单父单
+  名），硬链接需目录项重构、另立里程碑。
+  验收：dirfdtest 增六场景（mkdirat/renameat/
+  noreplace/readlinkat/faccessat/linkat-eperm）
+  两轮全过，disk 套件在 yfs 上同样复跑。
+- ⏳ 下一步候选：更多 /proc 生成项（如
+  environ）、getdents64 的 d_off 语义细化、
+  硬链接（目录项重构）、fchownat/chmod 家族。
 
 ## 从零构建
 

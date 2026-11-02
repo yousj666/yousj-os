@@ -36,6 +36,14 @@
 #define SYS_unlinkat 263
 #define SYS_symlinkat 266
 #define SYS_utimensat 280
+#define SYS_access 21
+#define SYS_mkdirat 258
+#define SYS_renameat 264
+#define SYS_linkat 265
+#define SYS_readlinkat 267
+#define SYS_faccessat 269
+#define SYS_renameat2 316
+#define SYS_faccessat2 439
 
 #define AT_FDCWD (-100)
 #define AT_SYMLINK_NOFOLLOW 0x100
@@ -81,6 +89,18 @@ static long sys_call4(long n, long a, long b, long c, long d)
     register long r10 __asm__("r10") = d;
     __asm__ volatile("syscall" : "=a"(r)
                      : "a"(n), "D"(a), "S"(b), "d"(c), "r"(r10)
+                     : "rcx", "r11", "memory");
+    return r;
+}
+static long sys_call5(long n, long a, long b, long c, long d,
+                      long e)
+{
+    long r;
+    register long r10 __asm__("r10") = d;
+    register long r8 __asm__("r8") = e;
+    __asm__ volatile("syscall" : "=a"(r)
+                     : "a"(n), "D"(a), "S"(b), "d"(c), "r"(r10),
+                       "r"(r8)
                      : "rcx", "r11", "memory");
     return r;
 }
@@ -170,6 +190,16 @@ int main(int argc, char **argv)
     sys_call1(SYS_unlink, (long)(uintptr_t)p);
     join(p, dir, "del.txt");
     sys_call1(SYS_unlink, (long)(uintptr_t)p);
+    join(p, dir, "r.txt");
+    sys_call1(SYS_unlink, (long)(uintptr_t)p);
+    join(p, dir, "r2.txt");
+    sys_call1(SYS_unlink, (long)(uintptr_t)p);
+    join(p, dir, "r3.txt");
+    sys_call1(SYS_unlink, (long)(uintptr_t)p);
+    join(p, dir, "ln3");
+    sys_call1(SYS_unlink, (long)(uintptr_t)p);
+    join(p, dir, "sub2");
+    sys_call1(SYS_rmdir, (long)(uintptr_t)p);
     join(p, dir, "sub");
     sys_call1(SYS_mkdir, (long)(uintptr_t)dir);
     join(p, dir, "sub");
@@ -315,11 +345,94 @@ int main(int argc, char **argv)
                streq(buf, "dirfd-data", n));
     }
 
+    /* --- M33: the rest of the *at family --- */
+
+    /* mkdirat-rel */
+    {
+        long rc = sys_call3(SYS_mkdirat, dfd,
+                            (long)(uintptr_t)"sub2", 0755);
+        long a = sys_call4(SYS_newfstatat, dfd,
+                           (long)(uintptr_t)"sub2",
+                           (long)(uintptr_t)&sb, 0);
+        report("mkdirat-rel", rc == 0 && a == 0 &&
+               (sb.mode & 0170000) == 0040000);
+    }
+
+    /* renameat-rel */
+    join(p, dir, "r.txt");
+    mkfile(p, "rr");
+    {
+        long rc = sys_call4(SYS_renameat, dfd,
+                            (long)(uintptr_t)"r.txt", dfd,
+                            (long)(uintptr_t)"r2.txt");
+        long a = sys_call4(SYS_newfstatat, dfd,
+                           (long)(uintptr_t)"r2.txt",
+                           (long)(uintptr_t)&sb, 0);
+        long b = sys_call4(SYS_newfstatat, dfd,
+                           (long)(uintptr_t)"r.txt",
+                           (long)(uintptr_t)&sb, 0);
+        report("renameat-rel", rc == 0 && a == 0 && b == -2);
+    }
+
+    /* renameat2 NOREPLACE: existing target refuses */
+    {
+        long a = sys_call5(SYS_renameat2, dfd,
+                           (long)(uintptr_t)"r2.txt", dfd,
+                           (long)(uintptr_t)"f.txt", 1);
+        long b = sys_call5(SYS_renameat2, dfd,
+                           (long)(uintptr_t)"r2.txt", dfd,
+                           (long)(uintptr_t)"r3.txt", 1);
+        report("renameat2-noreplace", a == -17 && b == 0);
+    }
+
+    /* readlinkat-rel */
+    sys_call3(SYS_symlinkat, (long)(uintptr_t)"f.txt", dfd,
+              (long)(uintptr_t)"ln3");
+    {
+        long n = sys_call4(SYS_readlinkat, dfd,
+                           (long)(uintptr_t)"ln3",
+                           (long)(uintptr_t)buf, sizeof(buf));
+        report("readlinkat-rel", n == 5 && streq(buf, "f.txt", n));
+    }
+
+    /* faccessat-rel + faccessat2 + access */
+    {
+        long a = sys_call4(SYS_faccessat, dfd,
+                           (long)(uintptr_t)"f.txt", 0, 0);
+        long b = sys_call4(SYS_faccessat, dfd,
+                           (long)(uintptr_t)"f.txt", 4, 0);
+        long c = sys_call4(SYS_faccessat, dfd,
+                           (long)(uintptr_t)"f.txt", 1, 0);
+        long d = sys_call4(SYS_faccessat, dfd,
+                           (long)(uintptr_t)"ghost", 0, 0);
+        long e = sys_call4(SYS_faccessat2, dfd,
+                           (long)(uintptr_t)"ln3", 4, 0x100);
+        join(p, dir, "f.txt");
+        long g = sys_call3(SYS_access, (long)(uintptr_t)p,
+                           0, 0);
+        report("faccessat-rel", a == 0 && b == 0 && c == -13 &&
+               d == -2 && e == 0 && g == 0);
+    }
+
+    /* linkat: hard links are -EPERM by design (M33) */
+    {
+        long rc = sys_call5(SYS_linkat, dfd,
+                            (long)(uintptr_t)"f.txt", dfd,
+                            (long)(uintptr_t)"hard", 0);
+        report("linkat-eperm", rc == -1);
+    }
+
     sys_call1(SYS_close, dfd);
 
     /* teardown: remove the whole tree so a second run in
      * the same boot starts from the same state (and the
      * harness's free-page comparison stays meaningful) */
+    join(p, dir, "r3.txt");
+    sys_call1(SYS_unlink, (long)(uintptr_t)p);
+    join(p, dir, "ln3");
+    sys_call1(SYS_unlink, (long)(uintptr_t)p);
+    join(p, dir, "sub2");
+    sys_call1(SYS_rmdir, (long)(uintptr_t)p);
     join(p, dir, "f.txt");
     sys_call1(SYS_unlink, (long)(uintptr_t)p);
     join(p, dir, "ln");

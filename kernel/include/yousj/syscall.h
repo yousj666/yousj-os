@@ -70,6 +70,15 @@
 #define YOUSJ_SYS_symlink      88   /* M16 */
 #define YOUSJ_SYS_readlink     89   /* M16 */
 #define YOUSJ_SYS_symlinkat   266   /* M16 */
+#define YOUSJ_SYS_access       21   /* M33 */
+#define YOUSJ_SYS_link         86   /* M33: -EPERM, no hard links */
+#define YOUSJ_SYS_mkdirat     258   /* M33 */
+#define YOUSJ_SYS_renameat    264   /* M33 */
+#define YOUSJ_SYS_linkat      265   /* M33: -EPERM, no hard links */
+#define YOUSJ_SYS_readlinkat  267   /* M33 */
+#define YOUSJ_SYS_faccessat   269   /* M33 */
+#define YOUSJ_SYS_renameat2   316   /* M33 */
+#define YOUSJ_SYS_faccessat2  439   /* M33 */
 #define YOUSJ_SYS_dup3        292  /* M10 */
 #define YOUSJ_SYS_pipe2       293  /* M10 */
 #define YOUSJ_SYS_time        201  /* M23 */

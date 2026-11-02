@@ -86,7 +86,9 @@ def free_count():
 
 SCEN = ['openat-rel', 'openat-sub', 'fdcwd', 'statat-rel',
         'utimensat-rel', 'abs-ignores', 'bad-dfd', 'notdir',
-        'unlinkat-rel', 'symlinkat-rel']
+        'unlinkat-rel', 'symlinkat-rel', 'mkdirat-rel',
+        'renameat-rel', 'renameat2-noreplace',
+        'readlinkat-rel', 'faccessat-rel', 'linkat-eperm']
 
 check('shell prompt', until('sh> ', 60))
 free_counts = []

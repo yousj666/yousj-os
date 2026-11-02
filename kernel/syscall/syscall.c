@@ -141,6 +141,7 @@ void syscall_init(void)
 
 /* Errno values are Linux's (the ABI promises the same numbers). */
 #define YOUSJ_EPERM  1
+#define YOUSJ_EACCES 13 /* M33 (EACCES_K below is the mmap-local twin) */
 #define YOUSJ_ESRCH  3
 #define YOUSJ_EBADF  9
 #define YOUSJ_ECHILD 10
@@ -1848,6 +1849,131 @@ static long sys_unlinkat(long dirfd, uint64_t path_ptr)
     return fs_unlink_path(resolved);
 }
 
+/* --- M33: the remaining *at family ---------------------------
+ * mkdirat/readlinkat are thin resolve_at wrappers.
+ * renameat2's RENAME_NOREPLACE is a pre-stat on the
+ * target (lstat semantics: any existing name refuses,
+ * even a dangling link) -- honest best-effort, the fs
+ * layer has no atomic test-and-rename. link/linkat
+ * answer -EPERM: ramfs names live inside the node
+ * (one parent, one name), so hard links need a
+ * directory-entry redesign, not a wrapper. */
+
+static long sys_mkdirat(long dirfd, uint64_t path_ptr)
+{
+    struct task *me = sched_current();
+    static char pb[256], rp[256];
+    long rc;
+    if (copy_user_string(path_ptr, pb, sizeof pb) != 0)
+        return -YOUSJ_EFAULT;
+    rc = resolve_at(me, dirfd, pb, rp);
+    if (rc != 0)
+        return rc;
+    return fs_mkdir_path(rp);
+}
+
+static long sys_readlinkat(long dirfd, uint64_t path_ptr,
+                           uint64_t buf_ptr, uint64_t cap)
+{
+    char path[264], target[264];
+    static char rp[264];
+    struct task *me = sched_current();
+    long n, rc;
+    n = copy_user_string(path_ptr, path, sizeof path);
+    if (n != 0)
+        return n;
+    if (!user_range_ok(buf_ptr, 1) || cap == 0)
+        return -YOUSJ_EFAULT;
+    if (cap > sizeof target)
+        cap = sizeof target;
+    rc = resolve_at(me, dirfd, path, rp);
+    if (rc != 0)
+        return rc;
+    n = fs_readlink_path(rp, target, cap);
+    if (n < 0)
+        return n;
+    if (!user_range_ok(buf_ptr, (uint64_t)n))
+        return -YOUSJ_EFAULT;
+    {
+        uint64_t i;
+        for (i = 0; i < (uint64_t)n; i++)
+            ((char *)(uintptr_t)buf_ptr)[i] = target[i];
+    }
+    return n;
+}
+
+#define RENAME_NOREPLACE_K 1
+static long sys_renameat(long odfd, uint64_t op, long ndfd,
+                         uint64_t np, long flags)
+{
+    struct task *me = sched_current();
+    static char ob[256], nb[256], ro[256], rn[256];
+    long rc;
+    if (flags & ~RENAME_NOREPLACE_K)
+        return -YOUSJ_EINVAL;
+    if (copy_user_string(op, ob, sizeof ob) != 0 ||
+        copy_user_string(np, nb, sizeof nb) != 0)
+        return -YOUSJ_EFAULT;
+    rc = resolve_at(me, odfd, ob, ro);
+    if (rc != 0)
+        return rc;
+    rc = resolve_at(me, ndfd, nb, rn);
+    if (rc != 0)
+        return rc;
+    if (flags & RENAME_NOREPLACE_K) {
+        struct yousj_stat_info info;
+        if (fs_path_stat2(rn, false, &info))
+            return -YOUSJ_EEXIST;
+    }
+    return fs_rename_path(ro, rn);
+}
+
+/* faccessat family + access(21). No uid model exists
+ * (everyone is uid 0), so the requested R_OK/W_OK/X_OK
+ * bits are checked against the file's owner permission
+ * triplet literally. AT_EACCESS is accepted as a
+ * no-op. AT_EMPTY_PATH with an empty path stats the
+ * dirfd itself, like Linux. */
+static long sys_faccessat(long dirfd, uint64_t path_ptr,
+                          long mode, long flags)
+{
+    struct task *me = sched_current();
+    static char pb[256], rp[256];
+    struct yousj_stat_info info;
+    long rc;
+    if (mode & ~7L)
+        return -YOUSJ_EINVAL;
+    if (flags & ~(0x100L | 0x200L | 0x1000L))
+        return -YOUSJ_EINVAL;
+    if (copy_user_string(path_ptr, pb, sizeof pb) != 0)
+        return -YOUSJ_EFAULT;
+    if (pb[0] == '\0') {
+        struct yousj_file *f;
+        uint64_t i;
+        if (!(flags & 0x1000L))
+            return -YOUSJ_ENOENT;
+        f = fd_file_of(me, dirfd);
+        if (f == NULL)
+            return -YOUSJ_EBADF;
+        if (f->open_path[0] == '\0')
+            return -YOUSJ_ENOENT;
+        for (i = 0; i < sizeof rp - 1 && f->open_path[i]; i++)
+            rp[i] = f->open_path[i];
+        rp[i] = '\0';
+    } else {
+        rc = resolve_at(me, dirfd, pb, rp);
+        if (rc != 0)
+            return rc;
+    }
+    if (!fs_path_stat2(rp, !(flags & 0x100L), &info))
+        return -YOUSJ_ENOENT;
+    if (mode == 0)
+        return 0;
+    if ((mode & ~((long)((info.mode >> 6) & 7))) != 0)
+        return -YOUSJ_EACCES;
+    return 0;
+}
+
 static long sys_rmdir_sys(uint64_t path_ptr)
 {
     struct task *me = sched_current();
@@ -2736,6 +2862,25 @@ static long dispatch_inner(struct yousj_syscall_ctx *ctx)
         return sys_symlinkat(a1, (long)a2, a3);
     case YOUSJ_SYS_unlinkat:
         return sys_unlinkat((long)a1, a2);
+    case YOUSJ_SYS_mkdirat:
+        return sys_mkdirat((long)a1, a2);
+    case YOUSJ_SYS_readlinkat:
+        return sys_readlinkat((long)a1, a2, a3, a4);
+    case YOUSJ_SYS_renameat:
+        return sys_renameat((long)a1, a2, (long)a3, a4, 0);
+    case YOUSJ_SYS_renameat2:
+        return sys_renameat((long)a1, a2, (long)a3, a4,
+                            (long)a5);
+    case YOUSJ_SYS_access:
+        return sys_faccessat(YOUSJ_AT_FDCWD, a1, (long)a2, 0);
+    case YOUSJ_SYS_faccessat:
+        return sys_faccessat((long)a1, a2, (long)a3, 0);
+    case YOUSJ_SYS_faccessat2:
+        return sys_faccessat((long)a1, a2, (long)a3,
+                             (long)a4);
+    case YOUSJ_SYS_link:
+    case YOUSJ_SYS_linkat:
+        return -YOUSJ_EPERM; /* M33: no hard links (see above) */
     case YOUSJ_SYS_rmdir:
         return sys_rmdir_sys(a1);
     case YOUSJ_SYS_rename:
