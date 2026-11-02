@@ -956,6 +956,109 @@ static long sys_getcwd_sys(uint64_t buf, uint64_t size)
     return (long)len;
 }
 
+static short fd_ready_file(struct yousj_file *f, long fd,
+                           short events);
+
+/* --- M18: epoll ---------------------------------------- */
+
+#define EPOLL_CLOEXEC_K 0x80000 /* == YOUSJ_O_CLOEXEC */
+
+struct epoll_event_k {
+    uint32_t events;
+    uint32_t pad;
+    uint64_t data;
+};
+
+static long sys_epoll_create1(long flags)
+{
+    struct task *me = sched_current();
+    struct yousj_file *f;
+    long rc, fd;
+    if (flags & ~EPOLL_CLOEXEC_K)
+        return -YOUSJ_EINVAL;
+    rc = fs_epoll_create(&f);
+    if (rc != 0)
+        return rc;
+    fd = fd_alloc(me, f);
+    if (fd < 0) {
+        file_put(f);
+        return fd;
+    }
+    if (flags & EPOLL_CLOEXEC_K)
+        me->fd_cloexec |= (uint16_t)(1u << fd);
+    return fd;
+}
+
+static long sys_epoll_ctl(long epfd, long op, long fd,
+                          uint64_t event_ptr)
+{
+    struct task *me = sched_current();
+    struct yousj_file *epf = fd_file_of(me, epfd);
+    struct yousj_file *target;
+    struct epoll_event_k ev = {0, 0, 0};
+    if (epf == NULL || epf->epoll == NULL)
+        return -YOUSJ_EBADF;
+    target = fd_file_of(me, fd);
+    if (target == NULL)
+        return -YOUSJ_EBADF;
+    if (target->epoll != NULL)
+        return -YOUSJ_EINVAL; /* no nested epoll sets */
+    if (op != 2) { /* ADD/MOD carry an event; DEL ignores it */
+        if (!user_range_ok(event_ptr, sizeof ev))
+            return -YOUSJ_EFAULT;
+        ev = *(const struct epoll_event_k *)(uintptr_t)event_ptr;
+    }
+    return fs_epoll_ctl(epf, op, (int)fd, target, ev.events,
+                        ev.data);
+}
+
+static long sys_epoll_wait(long epfd, uint64_t events_ptr,
+                           long maxevents, long timeout_ms)
+{
+    struct task *me = sched_current();
+    struct yousj_file *epf = fd_file_of(me, epfd);
+    uint64_t deadline = 0;
+    if (epf == NULL || epf->epoll == NULL)
+        return -YOUSJ_EBADF;
+    if (maxevents <= 0)
+        return -YOUSJ_EINVAL;
+    if (!user_range_ok(events_ptr,
+                       (uint64_t)maxevents * sizeof(struct epoll_event_k)))
+        return -YOUSJ_EFAULT;
+    if (timeout_ms > 0)
+        deadline = sched_uptime_ticks() +
+                   ((uint64_t)timeout_ms + 9) / 10;
+    for (;;) {
+        int i, n = 0, cnt = fs_epoll_count(epf);
+        struct epoll_event_k *out =
+            (struct epoll_event_k *)(uintptr_t)events_ptr;
+        for (i = 0; i < cnt && n < maxevents; i++) {
+            struct yousj_epoll_entry e;
+            short rev;
+            if (!fs_epoll_entry(epf, i, &e))
+                break;
+            rev = fd_ready_file(e.file, e.fd,
+                                (short)e.events);
+            if (rev != 0) {
+                out[n].events = (uint32_t)rev;
+                out[n].pad = 0;
+                out[n].data = e.data;
+                n++;
+            }
+        }
+        if (n > 0)
+            return n;
+        if (timeout_ms == 0)
+            return 0;
+        if (timeout_ms > 0 &&
+            sched_uptime_ticks() >= deadline)
+            return 0;
+        if (signal_deliverable_pending(me))
+            return -YOUSJ_ERESTARTSYS;
+        sched_sleep_ticks(2);
+    }
+}
+
 /* --- M16: symlink / readlink -------------------------- */
 
 static long sys_symlink(uint64_t target_ptr, uint64_t link_ptr)
@@ -1024,13 +1127,15 @@ static long sys_readlink(uint64_t path_ptr, uint64_t buf_ptr,
 #define POLLHUP_K 0x0010
 #define POLLNVAL_K 0x0020
 
-static short fd_ready(struct task *me, long fd, short events)
+static short fd_ready_file(struct yousj_file *f, long fd,
+                           short events)
 {
-    struct yousj_file *f = fd_file_of(me, fd);
     short rev = 0;
 
     if (f == NULL)
         return POLLNVAL_K;
+    if (f->epoll != NULL)
+        return 0; /* epoll sets are never ready themselves */
     if (f->pipe == NULL && f->backend == 0 && f->node == NULL) {
         /* the console: fd 0 is the readable side */
         if (fd == 0) {
@@ -1062,6 +1167,11 @@ static short fd_ready(struct task *me, long fd, short events)
     }
     /* regular file on either backend */
     return (short)(events & (POLLIN_K | POLLOUT_K));
+}
+
+static short fd_ready(struct task *me, long fd, short events)
+{
+    return fd_ready_file(fd_file_of(me, fd), fd, events);
 }
 
 struct pollfd_k {
@@ -2024,6 +2134,14 @@ static long dispatch_inner(struct yousj_syscall_ctx *ctx)
         return sys_pselect_sys((long)a1, a2, a3, a4, a5);
     case YOUSJ_SYS_unlink:
         return sys_unlink_sys(a1);
+    case YOUSJ_SYS_epoll_create1:
+        return sys_epoll_create1((long)a1);
+    case YOUSJ_SYS_epoll_ctl:
+        return sys_epoll_ctl((long)a1, (long)a2, (long)a3, a4);
+    case YOUSJ_SYS_epoll_wait:
+        return sys_epoll_wait((long)a1, a2, (long)a3, (long)a4);
+    case YOUSJ_SYS_epoll_pwait:
+        return sys_epoll_wait((long)a1, a2, (long)a3, (long)a4);
     case YOUSJ_SYS_symlink:
         return sys_symlink(a1, a2);
     case YOUSJ_SYS_readlink:

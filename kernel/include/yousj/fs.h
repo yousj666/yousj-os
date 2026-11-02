@@ -54,9 +54,12 @@ struct yousj_pipe {
     bool in_use;
 };
 
+struct yousj_epoll; /* M18: defined in fs.c */
+
 struct yousj_file {
     struct yousj_ramfs_node *node; /* NULL and pipe NULL: console */
     struct yousj_pipe *pipe;       /* non-NULL: a pipe end (M10) */
+    struct yousj_epoll *epoll;     /* non-NULL: an epoll set (M18) */
     int backend;                   /* 0 ramfs, 1 yfs (M12) */
     uint32_t yfs_ino;              /* valid when backend == 1 */
     uint64_t offset;               /* shared across fork (the
@@ -101,6 +104,24 @@ struct yousj_file *fs_console_file(void);
  * 0 or a negative errno. */
 long fs_pipe_create(struct yousj_file **rd_out,
                     struct yousj_file **wr_out);
+
+/* M18: epoll instances. ctl ops mirror Linux: ADD 1, DEL 2,
+ * MOD 3. Entries pin their target file (a reference is
+ * held), so closing the target fd does not drop the
+ * interest -- exactly like Linux. */
+struct yousj_epoll_entry {
+    struct yousj_file *file;
+    int fd;
+    uint32_t events;
+    uint64_t data;
+};
+long fs_epoll_create(struct yousj_file **out);
+long fs_epoll_ctl(struct yousj_file *epf, long op, int fd,
+                  struct yousj_file *target, uint32_t events,
+                  uint64_t data);
+int  fs_epoll_count(struct yousj_file *epf);
+bool fs_epoll_entry(struct yousj_file *epf, int idx,
+                    struct yousj_epoll_entry *out);
 
 /* M12: mount the yfs data disk at /data when one is present.
  * Returns yfs_mount's code (1 mounted, 2 formatted, 0 none,

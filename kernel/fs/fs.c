@@ -398,6 +398,8 @@ void file_get(struct yousj_file *f)
         f->refcount++;
 }
 
+static void epoll_release(struct yousj_epoll *ep);
+
 void file_put(struct yousj_file *f)
 {
     if (f == NULL || f == &g_console_file)
@@ -420,6 +422,10 @@ void file_put(struct yousj_file *f)
         if (f->node != NULL) {
             node_ref_dec(f->node);
             f->node = NULL;
+        }
+        if (f->epoll != NULL) {
+            epoll_release(f->epoll);
+            f->epoll = NULL;
         }
         if (f->backend == 1)
             yfs_note_close(f->yfs_ino);
@@ -466,6 +472,122 @@ long fs_pipe_create(struct yousj_file **rd_out,
     *rd_out = rd;
     *wr_out = wr;
     return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* M18: epoll instances. An instance is a small interest
+ * table; each entry pins its target file object. The wait
+ * loop lives in syscall.c (it owns the readiness probe and
+ * the sleep/signal protocol); fs.c owns storage and the
+ * file-lifecycle hook (file_put -> epoll_release). */
+
+#define MAX_EPOLLS      8
+#define EPOLL_MAX_ENTRIES 32
+
+struct yousj_epoll {
+    bool in_use;
+    int count;
+    struct yousj_epoll_entry entries[EPOLL_MAX_ENTRIES];
+};
+
+static struct yousj_epoll g_epolls[MAX_EPOLLS];
+
+static void epoll_release(struct yousj_epoll *ep)
+{
+    int i;
+    for (i = 0; i < ep->count; i++)
+        file_put(ep->entries[i].file);
+    ep->count = 0;
+    ep->in_use = false;
+}
+
+long fs_epoll_create(struct yousj_file **out)
+{
+    int i;
+    struct yousj_epoll *ep = NULL;
+    struct yousj_file *f;
+    for (i = 0; i < MAX_EPOLLS; i++) {
+        if (!g_epolls[i].in_use) {
+            ep = &g_epolls[i];
+            break;
+        }
+    }
+    if (ep == NULL)
+        return -YOUSJ_ENFILE;
+    f = file_alloc();
+    if (f == NULL)
+        return -YOUSJ_ENFILE;
+    ep->in_use = true;
+    ep->count = 0;
+    f->epoll = ep;
+    f->flags = YOUSJ_O_RDONLY;
+    *out = f;
+    return 0;
+}
+
+long fs_epoll_ctl(struct yousj_file *epf, long op, int fd,
+                  struct yousj_file *target, uint32_t events,
+                  uint64_t data)
+{
+    struct yousj_epoll *ep;
+    int i, at = -1;
+    if (epf == NULL || epf->epoll == NULL)
+        return -YOUSJ_EINVAL;
+    ep = epf->epoll;
+    for (i = 0; i < ep->count; i++) {
+        if (ep->entries[i].file == target &&
+            ep->entries[i].fd == fd) {
+            at = i;
+            break;
+        }
+    }
+    switch (op) {
+    case 1: /* EPOLL_CTL_ADD */
+        if (at >= 0)
+            return -YOUSJ_EEXIST_L;
+        if (ep->count >= EPOLL_MAX_ENTRIES)
+            return -YOUSJ_ENOSPC;
+        file_get(target);
+        ep->entries[ep->count].file = target;
+        ep->entries[ep->count].fd = fd;
+        ep->entries[ep->count].events = events;
+        ep->entries[ep->count].data = data;
+        ep->count++;
+        return 0;
+    case 2: /* EPOLL_CTL_DEL */
+        if (at < 0)
+            return -YOUSJ_ENOENT;
+        file_put(ep->entries[at].file);
+        for (i = at + 1; i < ep->count; i++)
+            ep->entries[i - 1] = ep->entries[i];
+        ep->count--;
+        return 0;
+    case 3: /* EPOLL_CTL_MOD */
+        if (at < 0)
+            return -YOUSJ_ENOENT;
+        ep->entries[at].events = events;
+        ep->entries[at].data = data;
+        return 0;
+    default:
+        return -YOUSJ_EINVAL;
+    }
+}
+
+int fs_epoll_count(struct yousj_file *epf)
+{
+    if (epf == NULL || epf->epoll == NULL)
+        return 0;
+    return epf->epoll->count;
+}
+
+bool fs_epoll_entry(struct yousj_file *epf, int idx,
+                    struct yousj_epoll_entry *out)
+{
+    if (epf == NULL || epf->epoll == NULL || idx < 0 ||
+        idx >= epf->epoll->count)
+        return false;
+    *out = epf->epoll->entries[idx];
+    return true;
 }
 
 

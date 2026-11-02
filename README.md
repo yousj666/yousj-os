@@ -264,8 +264,22 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   读共享页）四场景与原六场景两轮全过；其余十一链不回
   归。边界：已物化页与 write() 的一致性仍不保证（无页
   缓存）；整页越过 EOF 只给零页、不发 SIGBUS。
-- ⏳ 下一步候选：epoll、yfs 一致性日志、lstat、
-  mprotect。
+- ✅ 调度 M18（2026-11-02）：epoll——epoll_create1(291)、
+  epoll_ctl(233)、epoll_wait(232)、epoll_pwait(281，sigmask
+  忽略）。实例是 fs 层对象（池 8 个、每实例至多 32 条兴
+  趣），条目持有目标文件对象的引用（关 fd 不掉兴趣，与
+  Linux 一致），close 实例时逐条放引用。就绪判定直接复
+  用 M15 的探针（fd_ready 抽出 file 版），等待沿用
+  2-tick 轮询＋-ERESTARTSYS，EINTR/重启由信号闸门分。
+  电平触发；EPOLLET/EPOLLONESHOT 接受但按电平触发处理；
+  嵌套 epoll（把 epoll fd 加入另一个 epoll）拒绝。
+  验收：epolltest 六场景（基本就绪＋data 回传、超时、
+  双 fd 甄别、DEL 静默与 MOD 换 data、HUP、信号中断长
+  等待出 EINTR）两轮全过；其余十二链不回归。附带修复
+  fstest 的 dents 辅助函数：/bin 程序数涨过单次
+  getdents 缓冲后改为循环读尽（测试侧问题，内核无恙）。
+- ⏳ 下一步候选：yfs 一致性日志、lstat、mprotect、
+  brk 按需化。
 
 ## 从零构建
 

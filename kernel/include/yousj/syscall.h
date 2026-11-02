@@ -24,6 +24,10 @@
 #define YOUSJ_SYS_msync        26   /* M14 */
 #define YOUSJ_SYS_select       23   /* M15 */
 #define YOUSJ_SYS_pselect6     270  /* M15 */
+#define YOUSJ_SYS_epoll_wait   232  /* M18 */
+#define YOUSJ_SYS_epoll_ctl    233  /* M18 */
+#define YOUSJ_SYS_epoll_pwait  281  /* M18 */
+#define YOUSJ_SYS_epoll_create1 291 /* M18 */
 #define YOUSJ_SYS_ppoll        271  /* M15 */
 #define YOUSJ_SYS_brk          12
 #define YOUSJ_SYS_rt_sigaction 13   /* M7: signal batch */

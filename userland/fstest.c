@@ -266,26 +266,32 @@ static int dents_has(const char *path, const char *want, int want_type)
 {
     char buf[512];
     long fd = open_(path, O_RDONLY | O_DIRECTORY);
-    long n;
     if (fd < 0)
         return 0;
-    n = sys_call3(SYS_getdents64, fd, (long)(uintptr_t)buf,
-                  (long)sizeof(buf));
-    sys_call3(SYS_close, fd, 0, 0);
+    /* A directory may hold more entries than one buffer:
+     * keep reading until the kernel says it is drained
+     * (/bin outgrew 512 bytes of records at M18). */
+    for (;;) {
+    long n = sys_call3(SYS_getdents64, fd, (long)(uintptr_t)buf,
+                       (long)sizeof(buf));
     long off = 0;
-    if (n <= 0)
+    if (n <= 0) {
+        sys_call3(SYS_close, fd, 0, 0);
         return 0;
+    }
     while (off < n) {
         unsigned short reclen = *(const unsigned short *)(buf + off + 16);
         unsigned char type = (unsigned char)buf[off + 18];
         const char *name = buf + off + 19;
-        if (type == want_type && str_eq(name, want))
+        if (type == want_type && str_eq(name, want)) {
+            sys_call3(SYS_close, fd, 0, 0);
             return 1;
+        }
         if (reclen == 0)
             break;
         off += reclen;
     }
-    return 0;
+    }
 }
 
 static void t_dents(void)
