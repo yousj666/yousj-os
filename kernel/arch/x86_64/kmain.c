@@ -143,53 +143,6 @@ static void demo_sleeper_thread(void *arg)
  *              argc=1, argv[0]=top-16, argv[1]=NULL, envp=NULL,
  *              auxv AT_PAGESZ(6)=4096, auxv AT_NULL(0)=0
  * The initial RSP is top-80 (16-byte aligned, as crt0 expects). */
-static int build_init_stack(struct vmm_space *space)
-{
-    uint64_t top_frame = pmm_alloc_page();
-    uint64_t *block;
-    uint8_t *bytes;
-    int i;
-
-    if (top_frame == 0)
-        return -1;
-    bytes = (uint8_t *)(uintptr_t)top_frame;
-    for (i = 0; i < (int)YOUSJ_PAGE_SIZE; i++)
-        bytes[i] = 0;
-    bytes[YOUSJ_PAGE_SIZE - 16] = '/';
-    bytes[YOUSJ_PAGE_SIZE - 15] = 'i';
-    bytes[YOUSJ_PAGE_SIZE - 14] = 'n';
-    bytes[YOUSJ_PAGE_SIZE - 13] = 'i';
-    bytes[YOUSJ_PAGE_SIZE - 12] = 't';
-    block = (uint64_t *)(uintptr_t)(top_frame + YOUSJ_PAGE_SIZE - 80);
-    block[0] = 1;                            /* argc */
-    block[1] = YOUSJ_INIT_STACK_TOP - 16;    /* argv[0] -> "/init" */
-    block[2] = 0;                            /* argv[1] = NULL */
-    block[3] = 0;                            /* envp = NULL */
-    block[4] = 6;                            /* AT_PAGESZ */
-    block[5] = YOUSJ_PAGE_SIZE;
-    block[6] = 0;                            /* AT_NULL */
-    block[7] = 0;
-    if (vmm_map(space, YOUSJ_INIT_STACK_TOP - YOUSJ_PAGE_SIZE,
-                top_frame, YOUSJ_PAGE_SIZE,
-                YOUSJ_VMM_READ | YOUSJ_VMM_WRITE | YOUSJ_VMM_USER) != 0)
-        return -1;
-    for (i = 1; i < 4; i++) {
-        uint64_t frame = pmm_alloc_page();
-        uint64_t j;
-        if (frame == 0)
-            return -1;
-        for (j = 0; j < YOUSJ_PAGE_SIZE; j++)
-            ((uint8_t *)(uintptr_t)frame)[j] = 0;
-        if (vmm_map(space,
-                    YOUSJ_INIT_STACK_TOP - (uint64_t)(i + 1) * YOUSJ_PAGE_SIZE,
-                    frame, YOUSJ_PAGE_SIZE,
-                    YOUSJ_VMM_READ | YOUSJ_VMM_WRITE |
-                    YOUSJ_VMM_USER) != 0)
-            return -1;
-    }
-    return 0;
-}
-
 /* Boot orchestrator for everything after M2 (a queued kernel
  * thread -- see the monitor's comment for why idle cannot do this
  * job). First the M3 smoke: one user task gets its own address
@@ -325,9 +278,14 @@ static void boot_launcher_thread(void *arg)
         }
         /* User stack: 4 pages below YOUSJ_INIT_STACK_TOP; the top
          * page carries the Linux initial-stack block (argc/argv/
-         * envp/auxv) built by build_init_stack(). */
-        if (ok && build_init_stack(&ispace) != 0)
-            ok = 0;
+         * envp/auxv) built by elf_build_initial_stack(). */
+        if (ok) {
+            static const char *const init_argv[] = { "/init", NULL };
+            if (elf_build_initial_stack(&ispace, YOUSJ_INIT_STACK_TOP,
+                                        init_argv, NULL,
+                                        &istart.sp) != 0)
+                ok = 0;
+        }
         if (!ok) {
             serial_puts("Yousj OS: sched M4 FAILED (init load)\n");
             halt_forever();
@@ -335,7 +293,6 @@ static void boot_launcher_thread(void *arg)
         heap_base = (img_brk + YOUSJ_PAGE_SIZE - 1) &
                     ~(YOUSJ_PAGE_SIZE - 1);
         istart.ip = entry;
-        istart.sp = YOUSJ_INIT_STACK_TOP - 80;
 
         __asm__ volatile("cli");
         itask = kthread_create_auto("init", user_task_start, &istart);

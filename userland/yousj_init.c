@@ -43,6 +43,9 @@ static long sys_call2(long n, long a, long b)
 #define SYS_nanosleep  35
 #define SYS_getpid     39
 #define SYS_kill       62
+#define SYS_clone      56
+#define SYS_execve     59
+#define SYS_wait4      61
 #define SYS_uname      63
 #define SYS_exit_group 231
 #define SYS_PS_NATIVE  0x1000
@@ -198,7 +201,7 @@ static void run_command(const char *line)
     if (line[0] == '\0')
         return;
     if (starts_with(line, "help")) {
-        out("built-ins: help ps uname kill <tid> exit\n");
+        out("built-ins: help ps uname exec <path> kill <tid> exit\n");
         out("ps states: R running, r ready, S sleeping, Z zombie, D dead\n");
     } else if (starts_with(line, "ps")) {
         cmd_ps();
@@ -211,6 +214,27 @@ static void run_command(const char *line)
             out(" ");
             out(u.machine);
             out("\n");
+        }
+    } else if (starts_with(line, "exec")) {
+        /* exec <path>: replace this process image (M5). On
+         * failure the syscall returns and we report it; on
+         * success this code never runs again. */
+        const char *path = line + 4;
+        const char *argv[2];
+        while (*path == ' ')
+            path++;
+        if (*path == '\0') {
+            out("usage: exec <path>\n");
+            return;
+        }
+        argv[0] = path;
+        argv[1] = NULL;
+        {
+            long r = sys_call3(SYS_execve, (long)(uintptr_t)path,
+                               (long)(uintptr_t)argv, 0);
+            out("exec failed (");
+            out_long(r);
+            out(")\n");
         }
     } else if (starts_with(line, "kill")) {
         cmd_kill(line);

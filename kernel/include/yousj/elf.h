@@ -30,6 +30,19 @@ struct vmm_space;
  * initial program break (end of the highest segment, the heap
  * base a brk(0) should report). On any inconsistency returns -1
  * and the space may hold partial mappings (callers discard it). */
+/* Build the Linux initial stack in a fresh space: 4 pages
+ * below stack_top, argument/environment strings packed at the
+ * top, then the [argc][argv...][NULL][envp...][NULL][auxv]
+ * block (AT_PAGESZ + AT_NULL). argv/envp are NULL-terminated
+ * arrays of kernel-side strings (either may be NULL). On
+ * success *sp_out is the initial RSP. Shared by the boot init
+ * wiring and execve (M5). */
+int elf_build_initial_stack(struct vmm_space *space,
+                            uint64_t stack_top,
+                            const char *const *argv,
+                            const char *const *envp,
+                            uint64_t *sp_out);
+
 int elf_load_user_image(const uint8_t *image, uint64_t size,
                         struct vmm_space *space,
                         uint64_t *entry_out, uint64_t *brk_out);

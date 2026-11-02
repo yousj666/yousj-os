@@ -367,6 +367,12 @@ struct task *sched_find_task(int tid)
     return NULL;
 }
 
+void sched_set_name(struct task *t, const char *name)
+{
+    if (t != NULL)
+        name_copy(t->name, name);
+}
+
 struct task *sched_find_zombie_child(uint64_t parent_tid, int pid)
 {
     uint64_t i;

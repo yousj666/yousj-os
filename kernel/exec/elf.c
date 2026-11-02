@@ -87,12 +87,22 @@ int elf_load_user_image(const uint8_t *image, uint64_t size,
 
         if (ph->type != PT_LOAD)
             continue;
-        if (ph->memsz < ph->filesz || ph->memsz == 0)
+        if (ph->memsz == 0)
+            continue; /* empty segment (e.g. an all-bss data
+                       * segment with no content in this image) */
+        if (ph->memsz < ph->filesz)
             return -1;
         if (ph->offset > size || ph->filesz > size - ph->offset)
             return -1;
         seg_start = ph->vaddr;
         seg_end = ph->vaddr + ph->memsz;
+        /* A PT_LOAD lying entirely below the window is the ELF
+         * headers coverage segment GNU ld adds to some images;
+         * nothing in the image references it (entry and all
+         * sections live in the window), so it is skipped. A
+         * segment straddling the base still fails below. */
+        if (seg_end <= YOUSJ_USER_BASE)
+            continue;
         if (seg_start < YOUSJ_USER_BASE || seg_end > YOUSJ_USER_LIMIT ||
             seg_end < seg_start)
             return -1;
@@ -145,5 +155,100 @@ int elf_load_user_image(const uint8_t *image, uint64_t size,
         return -1; /* no PT_LOAD at all */
     *entry_out = eh->entry;
     *brk_out = brk;
+    return 0;
+}
+
+/* --- initial stack ------------------------------------------------------ */
+
+#define YOUSJ_AT_NULL   0
+#define YOUSJ_AT_PAGESZ 6
+#define YOUSJ_STACK_PAGES 4
+
+int elf_build_initial_stack(struct vmm_space *space, uint64_t stack_top,
+                            const char *const *argv,
+                            const char *const *envp,
+                            uint64_t *sp_out)
+{
+    uint64_t top_frame = pmm_alloc_page();
+    uint8_t *page;
+    uint64_t str_off = YOUSJ_PAGE_SIZE; /* strings grow down from here */
+    uint64_t argc = 0, envc = 0, i, block_qwords, block_off;
+    uint64_t *block;
+    uint64_t argv_ptrs[16];
+    uint64_t envp_ptrs[16];
+
+    if (top_frame == 0)
+        return -1;
+    page = (uint8_t *)(uintptr_t)top_frame;
+    for (i = 0; i < YOUSJ_PAGE_SIZE; i++)
+        page[i] = 0;
+
+    if (argv != NULL)
+        while (argv[argc] != NULL && argc < 16)
+            argc++;
+    if (envp != NULL)
+        while (envp[envc] != NULL && envc < 16)
+            envc++;
+
+    /* Lay the strings down from the top of the page (argv first,
+     * then envp), recording each string's user VA. */
+    for (i = 0; i < argc + envc; i++) {
+        const char *str = i < argc ? argv[i] : envp[i - argc];
+        uint64_t len = 0, j;
+        while (str[len] != '\0')
+            len++;
+        if (str_off < len + 1 + 512)
+            return -1; /* keep strings + block inside the top page */
+        str_off -= len + 1;
+        for (j = 0; j <= len; j++)
+            page[str_off + j] = (uint8_t)str[j];
+        if (i < argc)
+            argv_ptrs[i] = stack_top - YOUSJ_PAGE_SIZE + str_off;
+        else
+            envp_ptrs[i - argc] = stack_top - YOUSJ_PAGE_SIZE + str_off;
+    }
+
+    /* The block sits below the strings, 16-byte aligned. */
+    block_qwords = 1 + argc + 1 + envc + 1 + 4;
+    block_off = (str_off & ~15ULL) - block_qwords * 8;
+    block = (uint64_t *)(uintptr_t)(top_frame + block_off);
+    i = 0;
+    block[i++] = argc;
+    {
+        uint64_t k;
+        for (k = 0; k < argc; k++)
+            block[i++] = argv_ptrs[k];
+        block[i++] = 0;
+        for (k = 0; k < envc; k++)
+            block[i++] = envp_ptrs[k];
+        block[i++] = 0;
+    }
+    block[i++] = YOUSJ_AT_PAGESZ;
+    block[i++] = YOUSJ_PAGE_SIZE;
+    block[i++] = YOUSJ_AT_NULL;
+    block[i++] = 0;
+
+    if (vmm_map(space, stack_top - YOUSJ_PAGE_SIZE, top_frame,
+                YOUSJ_PAGE_SIZE,
+                YOUSJ_VMM_READ | YOUSJ_VMM_WRITE | YOUSJ_VMM_USER) != 0)
+        return -1;
+    {
+        uint64_t p;
+        for (p = 1; p < YOUSJ_STACK_PAGES; p++) {
+            uint64_t frame = pmm_alloc_page();
+            uint64_t j;
+            if (frame == 0)
+                return -1;
+            for (j = 0; j < YOUSJ_PAGE_SIZE; j++)
+                ((uint8_t *)(uintptr_t)frame)[j] = 0;
+            if (vmm_map(space,
+                        stack_top - (p + 1) * YOUSJ_PAGE_SIZE,
+                        frame, YOUSJ_PAGE_SIZE,
+                        YOUSJ_VMM_READ | YOUSJ_VMM_WRITE |
+                        YOUSJ_VMM_USER) != 0)
+                return -1;
+        }
+    }
+    *sp_out = stack_top - YOUSJ_PAGE_SIZE + block_off;
     return 0;
 }

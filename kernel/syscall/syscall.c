@@ -21,6 +21,7 @@
 #include <yousj/user.h>
 #include <yousj/gdt.h>
 #include <yousj/vmm.h>
+#include <yousj/elf.h>
 #include <yousj/pmm.h>
 #include <drivers/serial.h>
 
@@ -116,6 +117,7 @@ void syscall_init(void)
 #define YOUSJ_ESRCH  3
 #define YOUSJ_EBADF  9
 #define YOUSJ_ECHILD 10
+#define YOUSJ_ENOENT 2
 #define YOUSJ_ENOMEM 12
 #define YOUSJ_EFAULT 14
 #define YOUSJ_ENODEV 19
@@ -368,6 +370,181 @@ static long sys_clone(long flags, uint64_t child_stack)
 }
 
 
+/* --- execve: the embedded image registry -------------------------------- */
+
+/* Until a filesystem exists, execve resolves paths against the
+ * images embedded in the kernel (the same transition option (b)
+ * the boot init uses, SCHED_DESIGN sec. 7.1). */
+extern const uint8_t _binary_yousj_init_elf_start[];
+extern const uint8_t _binary_yousj_init_elf_end[];
+extern const uint8_t _binary_hello_elf_start[];
+extern const uint8_t _binary_hello_elf_end[];
+
+struct exec_image {
+    const char   *path;
+    const uint8_t *start;
+    const uint8_t *end;
+};
+
+static const struct exec_image g_exec_images[] = {
+    { "/init",      _binary_yousj_init_elf_start, _binary_yousj_init_elf_end },
+    { "/bin/hello", _binary_hello_elf_start,      _binary_hello_elf_end },
+};
+
+static int kstreq(const char *a, const char *b)
+{
+    while (*a != '\0' && *a == *b) {
+        a++;
+        b++;
+    }
+    return *a == *b;
+}
+
+/* Bounded copies out of user memory (the caller's space is
+ * active, so user pointers dereference directly after the
+ * range check). */
+static long copy_user_string(uint64_t uptr, char *dst, uint64_t cap)
+{
+    uint64_t i;
+    if (!user_range_ok(uptr, 1))
+        return -YOUSJ_EFAULT;
+    for (i = 0; i + 1 < cap; i++) {
+        char ch = ((const char *)(uintptr_t)uptr)[i];
+        dst[i] = ch;
+        if (ch == '\0')
+            return 0;
+    }
+    dst[cap - 1] = '\0';
+    return 0; /* truncated: acceptable for paths at this stage */
+}
+
+static long sys_execve(uint64_t path_ptr, uint64_t argv_ptr,
+                       uint64_t envp_ptr)
+{
+    struct task *me = sched_current();
+    static char path_buf[128];
+    static char arg_store[8][128];
+    static char env_store[4][128];
+    static const char *argv_k[9];
+    static const char *envp_k[5];
+    const struct exec_image *img = NULL;
+    struct vmm_space *space, *old;
+    uint64_t entry = 0, img_brk = 0, heap_base, new_sp = 0;
+    uint64_t i;
+
+    if (me->mm == NULL)
+        return -YOUSJ_EINVAL;
+    if (copy_user_string(path_ptr, path_buf, sizeof(path_buf)) != 0)
+        return -YOUSJ_EFAULT;
+    for (i = 0; i < sizeof(g_exec_images) / sizeof(g_exec_images[0]); i++) {
+        if (kstreq(path_buf, g_exec_images[i].path)) {
+            img = &g_exec_images[i];
+            break;
+        }
+    }
+    if (img == NULL)
+        return -YOUSJ_ENOENT;
+
+    /* Copy argv/envp out of the old image BEFORE building the
+     * new space; everything the new image needs must be in
+     * kernel hands by the commit point. */
+    argv_k[0] = NULL;
+    if (argv_ptr != 0) {
+        uint64_t n = 0;
+        if (!user_range_ok(argv_ptr, 8))
+            return -YOUSJ_EFAULT;
+        while (n < 8) {
+            uint64_t uptr = ((const uint64_t *)(uintptr_t)argv_ptr)[n];
+            if (uptr == 0)
+                break;
+            if (copy_user_string(uptr, arg_store[n],
+                                 sizeof(arg_store[n])) != 0)
+                return -YOUSJ_EFAULT;
+            argv_k[n] = arg_store[n];
+            n++;
+        }
+        argv_k[n] = NULL;
+    }
+    envp_k[0] = NULL;
+    if (envp_ptr != 0) {
+        uint64_t n = 0;
+        if (!user_range_ok(envp_ptr, 8))
+            return -YOUSJ_EFAULT;
+        while (n < 4) {
+            uint64_t uptr = ((const uint64_t *)(uintptr_t)envp_ptr)[n];
+            if (uptr == 0)
+                break;
+            if (copy_user_string(uptr, env_store[n],
+                                 sizeof(env_store[n])) != 0)
+                return -YOUSJ_EFAULT;
+            envp_k[n] = env_store[n];
+            n++;
+        }
+        envp_k[n] = NULL;
+    }
+    if (argv_k[0] == NULL)
+        argv_k[0] = path_buf; /* argv[0] defaults to the path */
+
+    /* Build the new image on the side; on any failure the
+     * current image is untouched (SYSCALL_DESIGN batch 2). */
+    space = vmm_space_alloc();
+    if (space == NULL)
+        return -YOUSJ_ENOMEM;
+    if (vmm_create_space(space) != 0)
+        goto fail_release;
+    vmm_share_kernel_identity(space);
+    if (elf_load_user_image(img->start,
+                            (uint64_t)(img->end - img->start),
+                            space, &entry, &img_brk) != 0)
+        goto fail_destroy;
+    heap_base = (img_brk + YOUSJ_PAGE_SIZE - 1) & ~(YOUSJ_PAGE_SIZE - 1);
+    if (elf_build_initial_stack(space, YOUSJ_INIT_STACK_TOP,
+                                argv_k, envp_k, &new_sp) != 0)
+        goto fail_destroy;
+
+    /* Commit: swap the space, drop the old one, land. This
+     * syscall never returns on success. The old boot space
+     * (non-owned, kmain's static) is destroyed the same way:
+     * its frames and tables are ordinary PMM property, and no
+     * other task references it. */
+    old = me->mm;
+    me->mm = space;
+    me->mm_owned = true;
+    me->brk_start = heap_base;
+    me->brk_end = heap_base;
+    me->mmap_next = YOUSJ_MMAP_BASE;
+    me->fs_base = 0;
+    me->has_resume = false;
+    {
+        const char *base = path_buf;
+        const char *p = path_buf;
+        while (*p != '\0') {
+            if (*p == '/')
+                base = p + 1;
+            p++;
+        }
+        sched_set_name(me, base);
+    }
+    vmm_load_cr3(space->pml4_phys);
+    if (old != NULL && old != space) {
+        vmm_free_user_data(old);
+        vmm_destroy_space(old);
+        /* No-op for the boot space: release only matches pool
+         * slots, and the boot ispace is kmain's static struct. */
+        vmm_space_release(old);
+    }
+    user_gs_normalize();
+    enter_user_mode(entry, new_sp);
+    __builtin_unreachable();
+
+fail_destroy:
+    vmm_free_user_data(space);
+    vmm_destroy_space(space);
+fail_release:
+    vmm_space_release(space);
+    return -YOUSJ_ENOMEM;
+}
+
 /* --- batch 1 ------------------------------------------------------------ */
 
 static long sys_read(long fd, uint64_t buf, uint64_t count)
@@ -613,6 +790,8 @@ long yousj_syscall_dispatch(long no, long a1, long a2, long a3,
         return sys_wait4(a1, (uint64_t)a2, a3, (uint64_t)a4);
     case YOUSJ_SYS_clone:
         return sys_clone(a1, (uint64_t)a2);
+    case YOUSJ_SYS_execve:
+        return sys_execve((uint64_t)a1, (uint64_t)a2, (uint64_t)a3);
     case YOUSJ_SYS_exit:
     case YOUSJ_SYS_exit_group:
         sys_exit_common(a1);
@@ -626,6 +805,7 @@ long yousj_syscall_dispatch(long no, long a1, long a2, long a3,
         return -YOUSJ_ENOSYS;
     }
 }
+
 
 /* --- user task landing -------------------------------------------------- */
 
