@@ -177,13 +177,15 @@ struct task *kthread_create_auto(const char *name, void (*entry)(void *arg),
     uint64_t stack_phys = pmm_alloc_pages(YOUSJ_SCHED_STACK_SIZE / YOUSJ_PAGE_SIZE);
     if (stack_phys == 0)
         return NULL;
-    /* Early kernels run identity-mapped (stub tables / future HHDM),
-     * so the physical address is the pointer. No guard page yet:
-     * VMM_DESIGN/SCHED_DESIGN note this as an M1-accepted gap; the
-     * guard arrives when the kernel switches to its own tables. */
+    /* The stack is addressed through the HHDM (M6): the pointer
+     * handed down is HHDM_BASE + stack_phys, and kernel_stack_top
+     * inherits it, so TSS rsp0 and the syscall entry switch to a
+     * stack that is mapped in every address space. No guard page
+     * yet: VMM_DESIGN/SCHED_DESIGN note this as an M1-accepted
+     * gap; the guard arrives with per-space kernel stacks. */
     {
         struct task *t = kthread_create(name, entry, arg,
-                                        (void *)(uintptr_t)stack_phys,
+                                        yousj_phys_to_virt(stack_phys),
                                         YOUSJ_SCHED_STACK_SIZE);
         if (t != NULL)
             t->kernel_stack_base = stack_phys; /* reaper frees it */

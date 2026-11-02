@@ -69,8 +69,24 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   命令与外部命令执行。验收：`tools/qemu-proc-test.py` 全项
   PASS，含多轮命令后 PMM 空闲页数对账归零（无泄漏），UEFI
   链到 Shell 提示符。
-- ⏳ 下一步：高半区＋HHDM 布局（退役内核恒等共享子树）、
-  信号机制与 FPU/SSE 状态、文件系统（execve 映像表退役）。
+- ✅ 内存 M6（2026-11-02）：高半区＋HHDM 布局落地——内核改链
+  接到 0xFFFFFFFF80000000（物理仍 1 MiB 装载，`-mcmodel=kernel`），
+  主空间只含 HHDM 全 RAM 直映＋映像分段权限（.text RX、.rodata R、
+  .data/.bss RW，全部 NX 按位），不再有任何恒等映射；
+  `vmm_share_kernel_identity()` 退役，用户空间靠 create 时拷贝的
+  主空间高半区运行内核代码。全部物理帧访问（页表后端、ELF
+  装载、clone 拷贝、内核栈）统一走 HHDM 指针。两条启动链同步
+  改造：Multiboot 桩早期表加 4 KiB 粒度映像映射＋64 位跳板
+  （映像 1 MiB 基址非 2 MiB 对齐，巨页表项会落保留位）；UEFI
+  加载器改为统一 V2P 差值校验＋交接页表（恒等 1 GiB＋映像
+  高半区），经新增入口 `_kentry64_rdi` 进入。迁移中修复一处
+  既有启发式：定时器帧选择子归正只认用户窗口
+  [0x8000000000, 0x8003000000)，不再把高半区内核帧误判为用户
+  帧。验收：`make check`/`make test`、Multiboot 冒烟、
+  `tools/qemu-proc-test.py`（三轮 hello 后 PMM 对账归零）、
+  UEFI 链到 Shell 提示符，全部 PASS。
+- ⏳ 下一步：信号机制、FPU/SSE 状态、文件系统（execve 映像
+  表退役）。
 
 ## 从零构建
 

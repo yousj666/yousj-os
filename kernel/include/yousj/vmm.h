@@ -11,7 +11,10 @@
  *   - Higher-half kernel layout: user space is the canonical low half
  *     (PML4 0-255), kernel space the high half (256-511), with the
  *     direct map (HHDM) at 0xFFFF800000000000 and the kernel image at
- *     0xFFFFFFFF80000000. Identity mapping is a transition tool only.
+ *     0xFFFFFFFF80000000. Since M6 the kernel is linked and runs in
+ *     the higher half; there is no identity map anywhere (the boot
+ *     chains' early tables are the only place one ever existed, and
+ *     they are discarded at vmm_hw_init()).
  *   - Abstract flags (READ/WRITE/EXEC/USER) at the API; hardware PTE
  *     bits stay inside vmm.c except for the pure encode/decode helpers
  *     below, which exist so the translation can be unit-tested.
@@ -88,9 +91,30 @@ struct vmm_backend {
 };
 void vmm_use_backend(const struct vmm_backend *backend);
 
-/* Register the in-kernel backend (PMM + identity table access, valid
- * while the boot/early identity mapping is in effect). */
+/* Register the in-kernel backend (PMM + table access). Table access
+ * starts out identity-based, which is valid while the boot chain's
+ * early tables are in effect; vmm_hw_init() switches it to HHDM
+ * access (see below) in the same breath as it loads the master
+ * space's CR3, and every mapping in effect from then on (master and
+ * user spaces alike) contains the HHDM. */
 void vmm_use_kernel_backend(void);
+
+/* Switch the kernel backend's page-table access from identity
+ * (phys == virt) to HHDM (YOUSJ_HHDM_BASE + phys). Called exactly
+ * once, by vmm_hw_init() immediately after the CR3 switch; the
+ * HHDM must be mapped in the newly loaded space. */
+void vmm_use_hhdm_table_access(void);
+
+/* Kernel pointer to a physical frame, through the HHDM. Valid
+ * everywhere after vmm_hw_init(): the HHDM is part of the kernel
+ * half that vmm_create_space() shares into every user space, so
+ * this works under any task's CR3. ALL kernel accesses to PMM
+ * frames (ELF loading, fork copies, kernel stacks, zero pages)
+ * go through here -- a raw physical address is never a pointer. */
+static inline void *yousj_phys_to_virt(uint64_t phys)
+{
+    return (void *)(uintptr_t)(YOUSJ_HHDM_BASE + phys);
+}
 
 /* Create an empty address space: a zeroed PML4, with entries 256-511
  * copied from the kernel master space when one has been designated.
@@ -121,12 +145,10 @@ int               vmm_clone_user_window(struct vmm_space *dst,
 
 void               vmm_set_kernel_master(struct vmm_space *space);
 struct vmm_space  *vmm_kernel_master(void);
-/* Transition helper (identity-kernel period): share the master's
- * PML4 entry 0 -- the kernel identity subtree -- into a user
- * space, so the space can execute kernel code after a CR3 switch.
- * The shared subtree is recognised by vmm_destroy_space() and is
- * never freed through a user space. */
-void               vmm_share_kernel_identity(struct vmm_space *space);
+/* (M6 retired vmm_share_kernel_identity(): with the kernel in the
+ * higher half, vmm_create_space()'s copy of master entries
+ * 256-511 is all a user space needs to run kernel code after a
+ * CR3 switch -- text via entry 511, HHDM and stacks via 256.) */
 
 int  vmm_map(struct vmm_space *space, uint64_t virt, uint64_t phys,
              uint64_t length, uint32_t flags);
@@ -139,20 +161,24 @@ int  vmm_translate(struct vmm_space *space, uint64_t virt,
 int  vmm_protect(struct vmm_space *space, uint64_t virt, uint64_t length,
                  uint32_t flags);
 
-/* Load a space's PML4 into CR3 (arch code, kernel/arch/x86_64/vmm_arch.c).
- * Deliberately NOT called anywhere yet: switching CR3 waits for the
- * bootloader paging contract (VMM_DESIGN.md sec. 2.3 / 6.2). */
+/* Load a space's PML4 into CR3 (arch code,
+ * kernel/arch/x86_64/vmm_arch.c). Called by vmm_hw_init() for the
+ * master space and by the scheduler on every task switch. */
 void vmm_load_cr3(uint64_t pml4_phys);
 uint64_t vmm_read_cr3(void);
 
-/* Hardware bring-up step 1 (arch glue, vmm_arch.c): enable
- * EFER.NXE + CR0.WP, build the kernel master space as an identity
- * map of [0, ram_top_phys), mark the kernel image range executable,
- * register it via vmm_set_kernel_master() and load it into CR3.
- * Execution continues at identity addresses, so no trampoline is
- * needed; the higher-half/HHDM layout of VMM_DESIGN.md sec. 6.2 is
- * a later step tied to the UEFI bootloader chain. Returns 0 or a
- * negative errno from the mapping layer. */
+/* Hardware bring-up (arch glue, vmm_arch.c): enable EFER.NXE +
+ * CR0.WP, build the kernel master space in the final layout --
+ * HHDM direct map of [0, ram_top_phys) at YOUSJ_HHDM_BASE plus the
+ * kernel image at YOUSJ_KERNEL_BASE with per-section permissions,
+ * and NO identity map -- register it via vmm_set_kernel_master(),
+ * load it into CR3 and switch page-table access to the HHDM.
+ * Execution continues at the same (higher-half) addresses across
+ * the switch: the boot chains map the image at its linked base in
+ * their early tables, and every live stack at this point lives in
+ * the kernel image's BSS, so nothing references the discarded
+ * identity map. Returns 0 or a negative errno from the mapping
+ * layer. */
 int vmm_hw_init(uint64_t ram_top_phys);
 
 #endif /* YOUSJ_VMM_H */

@@ -128,7 +128,7 @@ int elf_load_user_image(const uint8_t *image, uint64_t size,
                 if (frame == 0)
                     return -1;
                 for (k = 0; k < YOUSJ_PAGE_SIZE; k++)
-                    ((uint8_t *)(uintptr_t)frame)[k] = 0;
+                    ((uint8_t *)yousj_phys_to_virt(frame))[k] = 0;
                 if (vmm_map(space, page, frame, YOUSJ_PAGE_SIZE,
                             want) != 0) {
                     (void)pmm_free_page(frame);
@@ -144,7 +144,7 @@ int elf_load_user_image(const uint8_t *image, uint64_t size,
             if (copy_hi > ph->vaddr + ph->filesz)
                 copy_hi = ph->vaddr + ph->filesz;
             for (j = copy_lo; j < copy_hi; j++)
-                ((uint8_t *)(uintptr_t)frame)[j - page] =
+                ((uint8_t *)yousj_phys_to_virt(frame))[j - page] =
                     image[ph->offset + (j - ph->vaddr)];
         }
         if (seg_end > brk)
@@ -179,7 +179,7 @@ int elf_build_initial_stack(struct vmm_space *space, uint64_t stack_top,
 
     if (top_frame == 0)
         return -1;
-    page = (uint8_t *)(uintptr_t)top_frame;
+    page = (uint8_t *)yousj_phys_to_virt(top_frame);
     for (i = 0; i < YOUSJ_PAGE_SIZE; i++)
         page[i] = 0;
 
@@ -211,7 +211,7 @@ int elf_build_initial_stack(struct vmm_space *space, uint64_t stack_top,
     /* The block sits below the strings, 16-byte aligned. */
     block_qwords = 1 + argc + 1 + envc + 1 + 4;
     block_off = (str_off & ~15ULL) - block_qwords * 8;
-    block = (uint64_t *)(uintptr_t)(top_frame + block_off);
+    block = (uint64_t *)yousj_phys_to_virt(top_frame + block_off);
     i = 0;
     block[i++] = argc;
     {
@@ -240,7 +240,7 @@ int elf_build_initial_stack(struct vmm_space *space, uint64_t stack_top,
             if (frame == 0)
                 return -1;
             for (j = 0; j < YOUSJ_PAGE_SIZE; j++)
-                ((uint8_t *)(uintptr_t)frame)[j] = 0;
+                ((uint8_t *)yousj_phys_to_virt(frame))[j] = 0;
             if (vmm_map(space,
                         stack_top - (p + 1) * YOUSJ_PAGE_SIZE,
                         frame, YOUSJ_PAGE_SIZE,

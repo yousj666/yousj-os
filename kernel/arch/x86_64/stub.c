@@ -11,8 +11,10 @@
  *      u64 field of boot.h lands on an 8-byte boundary, and the size
  *      is asserted in boot_multiboot.c);
  *   3. publishes the buffer's physical address in g_boot_info_phys
- *      and returns the kernel's ELF entry address, or 0 on failure
- *      (stub.S then hangs instead of jumping into garbage).
+ *      and the kernel's ELF entry point (a full 64-bit VIRTUAL
+ *      address since the M6 higher-half link) in g_kernel_entry,
+ *      returning 1, or 0 on failure (stub.S then hangs instead of
+ *      jumping into garbage).
  */
 #include <yousj/types.h>
 #include <yousj/boot.h>
@@ -21,6 +23,7 @@ void mb1_build_boot_info(uint64_t mb_info_addr, struct yousj_boot_info *out);
 
 static struct yousj_boot_info g_boot_info;
 uint32_t g_boot_info_phys;
+uint64_t g_kernel_entry;
 
 static uint32_t rd32(uint32_t addr) { return *(const volatile uint32_t *)(uintptr_t)addr; }
 
@@ -90,5 +93,6 @@ uint32_t stub_main(uint32_t mb_info)
 
     mb1_build_boot_info(mb_info, &g_boot_info);
     g_boot_info_phys = (uint32_t)(uintptr_t)&g_boot_info;
-    return (uint32_t)entry;
+    g_kernel_entry = entry;
+    return 1;
 }

@@ -146,7 +146,7 @@ static void demo_sleeper_thread(void *arg)
 /* Boot orchestrator for everything after M2 (a queued kernel
  * thread -- see the monitor's comment for why idle cannot do this
  * job). First the M3 smoke: one user task gets its own address
- * space (kernel identity subtree shared, image + stack at
+ * space (kernel half shared from the master, image + stack at
  * YOUSJ_USER_BASE), lands in ring 3 via iretq, and must print its
  * pid through the write syscall and exit with status 42. Then M4:
  * the ELF init is loaded into its own space and started as the
@@ -173,8 +173,6 @@ static void boot_launcher_thread(void *arg)
 
     if (vmm_create_space(&uspace) != 0)
         ok = 0;
-    if (ok)
-        vmm_share_kernel_identity(&uspace);
     /* Image pages: RWX for now (the flat binary keeps its strings
      * in the same page); W^X separation arrives when the ELF
      * loader distinguishes segments (M4). */
@@ -188,7 +186,7 @@ static void boot_launcher_thread(void *arg)
         if (chunk > YOUSJ_PAGE_SIZE)
             chunk = YOUSJ_PAGE_SIZE;
         for (j = 0; j < chunk; j++)
-            ((uint8_t *)(uintptr_t)frame)[j] = src[j];
+            ((uint8_t *)yousj_phys_to_virt(frame))[j] = src[j];
         if (vmm_map(&uspace, YOUSJ_USER_CODE_VA + i * YOUSJ_PAGE_SIZE,
                     frame, YOUSJ_PAGE_SIZE,
                     YOUSJ_VMM_READ | YOUSJ_VMM_WRITE |
@@ -239,8 +237,7 @@ static void boot_launcher_thread(void *arg)
         serial_puts(")\n");
         halt_forever();
     }
-    /* The user space is deliberately NOT destroyed: its entry 0
-     * is shared with the master (destroy handles that), but the
+    /* The user space is deliberately NOT destroyed: the
      * image/stack frames have no owner-tracking yet. Stage-1
      * smoke leak; reaper arrives with real process teardown. */
 
@@ -270,7 +267,6 @@ static void boot_launcher_thread(void *arg)
         if (ok && vmm_create_space(&ispace) != 0)
             ok = 0;
         if (ok) {
-            vmm_share_kernel_identity(&ispace);
             if (elf_load_user_image(_binary_yousj_init_elf_start,
                                     elf_size, &ispace,
                                     &entry, &img_brk) != 0)
@@ -408,19 +404,20 @@ void kmain(struct yousj_boot_info *boot_info)
         }
     }
 
-    /* Stage 1, step 2b (VMM hardware step 1): switch CR3 from the
-     * boot stub's tables to a kernel-owned master space (identity
-     * map of all RAM, built by vmm_hw_init). Everything after this
-     * block -- scheduler, threads, interrupts -- runs on OUR page
-     * tables; the M1/M2 self-tests below double as the regression
-     * proof. The post-switch check maps a scratch page at 2 GiB
-     * (above RAM, previously unmapped in both table sets), writes
-     * through the NEW tables, and translates it back. */
+    /* Stage 1, step 2b (M6 layout switch): switch CR3 from the
+     * boot chain's early tables to the kernel-owned master space
+     * (HHDM + higher-half image, NO identity map -- built by
+     * vmm_hw_init). Everything after this block -- scheduler,
+     * threads, interrupts -- runs on OUR page tables; the
+     * M1/M2 self-tests below double as the regression proof.
+     * The post-switch check exercises the new layout only: a
+     * fresh frame written and read back through its HHDM
+     * address, that address translated in the master, and the
+     * kernel image base translated to its physical 1 MiB. */
     {
         uint64_t old_cr3 = vmm_read_cr3();
         uint64_t ram_top = pmm_total_page_count() * YOUSJ_PAGE_SIZE;
         uint64_t frame, translated = 0;
-        volatile uint64_t *scratch = (volatile uint64_t *)(uintptr_t)0x80000000ULL;
         int ok = 1;
 
         if (vmm_hw_init(ram_top) != 0)
@@ -428,21 +425,22 @@ void kmain(struct yousj_boot_info *boot_info)
         frame = ok ? pmm_alloc_page() : 0;
         if (frame == 0)
             ok = 0;
-        if (ok && vmm_map(vmm_kernel_master(), 0x80000000ULL, frame,
-                          YOUSJ_PAGE_SIZE,
-                          YOUSJ_VMM_READ | YOUSJ_VMM_WRITE) != 0)
-            ok = 0;
         if (ok) {
-            *scratch = 0xA5A5DEADBEEF5A5AULL;
-            if (*scratch != 0xA5A5DEADBEEF5A5AULL)
+            volatile uint64_t *hw =
+                (volatile uint64_t *)yousj_phys_to_virt(frame);
+            *hw = 0xA5A5DEADBEEF5A5AULL;
+            if (*hw != 0xA5A5DEADBEEF5A5AULL)
                 ok = 0;
         }
-        if (ok && (vmm_translate(vmm_kernel_master(), 0x80000000ULL,
+        if (ok && (vmm_translate(vmm_kernel_master(),
+                                 YOUSJ_HHDM_BASE + frame,
                                  &translated, NULL) != 0 ||
                    translated != frame))
             ok = 0;
-        if (ok && vmm_unmap(vmm_kernel_master(), 0x80000000ULL,
-                            YOUSJ_PAGE_SIZE) != 0)
+        if (ok && (vmm_translate(vmm_kernel_master(),
+                                 YOUSJ_KERNEL_BASE,
+                                 &translated, NULL) != 0 ||
+                   translated != 0x100000ULL))
             ok = 0;
         if (frame != 0)
             (void)pmm_free_page(frame);
@@ -451,7 +449,8 @@ void kmain(struct yousj_boot_info *boot_info)
             serial_put_hex64(old_cr3);
             serial_puts(" -> ");
             serial_put_hex64(vmm_read_cr3());
-            serial_puts(", kernel master identity map live)\n");
+            serial_puts(", HHDM + higher-half master live, "
+                        "no identity map)\n");
         } else {
             serial_puts("Yousj OS: VMM hw-init FAILED, halting\n");
             halt_forever();

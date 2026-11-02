@@ -43,17 +43,25 @@ void vmm_use_backend(const struct vmm_backend *backend)
     g_backend_ready = true;
 }
 
-/* --- kernel backend: PMM + identity access ------------------------ */
+/* --- kernel backend: PMM + offset table access -------------------- */
+
+/* Added to a page table's physical address to reach its entries:
+ * 0 while the boot chain's early identity tables are in effect,
+ * YOUSJ_HHDM_BASE after vmm_hw_init() loads the master space (M6).
+ * Host tests never see this backend, so the switch is invisible
+ * to them. */
+static uint64_t g_table_offset;
 
 static uint64_t kernel_alloc(void) { return pmm_alloc_page(); }
 static void kernel_free(uint64_t phys) { (void)pmm_free_page(phys); }
 static uint64_t *kernel_table_ptr(uint64_t phys)
 {
-    /* Valid only while an identity (or HHDM-offset) mapping for the
-     * physical memory containing page tables is in effect. That is
-     * true in the boot environment today; when the higher-half switch
-     * happens this becomes HHDM_BASE + phys (VMM_DESIGN.md sec. 6). */
-    return (uint64_t *)(uintptr_t)phys;
+    return (uint64_t *)(uintptr_t)(phys + g_table_offset);
+}
+
+void vmm_use_hhdm_table_access(void)
+{
+    g_table_offset = YOUSJ_HHDM_BASE;
 }
 
 void vmm_use_kernel_backend(void)
@@ -303,17 +311,12 @@ void vmm_destroy_space(struct vmm_space *space)
     if (space->pml4_phys == 0)
         return;
     pml4 = table_of(space->pml4_phys);
-    /* User half only: the kernel half is shared with the master and
-     * its tables are never owned by this space. Entry 0 needs the
-     * same care in the transition period: when it is byte-identical
-     * to the master's entry 0, it is the SHARED kernel identity
-     * subtree (see vmm_share_kernel_identity) and must not be
-     * freed either. */
+    /* User half only: the kernel half (entries 256-511) is shared
+     * with the master and its tables are never owned by this
+     * space. Since M6 nothing in the user half is shared, so
+     * every present entry here is freed unconditionally. */
     for (i = 0; i < 256; i++) {
         if (pml4[i] & YOUSJ_PTE_PRESENT) {
-            if (i == 0 && g_kernel_master != NULL &&
-                pml4[0] == table_of(g_kernel_master->pml4_phys)[0])
-                continue;
             free_table_tree(pml4[i] & YOUSJ_PTE_ADDR_MASK, 0);
             pml4[i] = 0;
         }
@@ -409,11 +412,10 @@ static int clone_window_level(struct vmm_space *dst,
             new_phys = g_backend.alloc_page();
             if (new_phys == 0)
                 return -YOUSJ_ENOMEM;
-            /* Identity period: a physical frame is directly
-             * dereferenceable from the kernel. */
+            /* Frame contents are reached through the HHDM (M6). */
             {
-                const uint8_t *sp = (const uint8_t *)(uintptr_t)phys;
-                uint8_t *dp = (uint8_t *)(uintptr_t)new_phys;
+                const uint8_t *sp = (const uint8_t *)yousj_phys_to_virt(phys);
+                uint8_t *dp = (uint8_t *)yousj_phys_to_virt(new_phys);
                 uint32_t b;
                 for (b = 0; b < YOUSJ_PAGE_SIZE; b++)
                     dp[b] = sp[b];
@@ -446,23 +448,6 @@ int vmm_clone_user_window(struct vmm_space *dst, struct vmm_space *src)
 void vmm_set_kernel_master(struct vmm_space *space)
 {
     g_kernel_master = space;
-}
-
-void vmm_share_kernel_identity(struct vmm_space *space)
-{
-    if (!g_backend_ready || space == NULL || g_kernel_master == NULL ||
-        space == g_kernel_master)
-        return;
-    /* Transition arrangement (identity-kernel period): the kernel
-     * occupies the low half under PML4 entry 0, so every user
-     * space must see that exact subtree to be able to run kernel
-     * code at all after a CR3 switch. The entries carry no USER
-     * flag, so ring 3 cannot touch them; they point at the
-     * master's tables, which vmm_destroy_space() now recognises
-     * and refuses to free. When the kernel moves to the higher
-     * half (VMM_DESIGN sec. 6.2), create-space already shares the
-     * kernel half and this helper goes away. */
-    table_of(space->pml4_phys)[0] = table_of(g_kernel_master->pml4_phys)[0];
 }
 
 struct vmm_space *vmm_kernel_master(void)

@@ -4,7 +4,7 @@
 # hosted, so allocator logic is verified without needing to boot.
 CC      ?= gcc
 CFLAGS  := -DYOUSJ_KERNEL -ffreestanding -fno-stack-protector -fno-pic -m64 -mno-red-zone \
-           -mno-sse -mno-mmx \
+           -mcmodel=kernel -mno-sse -mno-mmx \
            -Wall -Wextra -I kernel/include -I kernel
 HOSTCFLAGS := -Wall -Wextra -I kernel/include
 BUILD   := build
@@ -141,6 +141,7 @@ kernel: $(KERNEL) $(STUB)
 
 $(KERNEL): $(KERNEL_LINK_OBJS) kernel/arch/x86_64/link.ld
 	ld -T kernel/arch/x86_64/link.ld -o $@ $(KERNEL_LINK_OBJS)
+	@nm $@ | python3 -c "import sys; d={p[2]:int(p[0],16) for p in (l.split() for l in sys.stdin) if len(p)==3}; s=d['__kernel_end']-d['__kernel_start']; print(f'kernel image span: {s} bytes'); sys.exit('span exceeds the Multiboot stub 2 MiB early-map window' if s>2097152 else None)"
 
 $(STUB): $(STUB_LINK_OBJS) kernel/arch/x86_64/stub.ld
 	ld -m elf_i386 -T kernel/arch/x86_64/stub.ld -o $@ $(STUB_LINK_OBJS)

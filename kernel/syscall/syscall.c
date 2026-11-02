@@ -150,7 +150,7 @@ static int map_zero_page(struct vmm_space *space, uint64_t va,
     uint64_t frame = pmm_alloc_page();
     if (frame == 0)
         return -1;
-    mem_fill((void *)(uintptr_t)frame, 0, YOUSJ_PAGE_SIZE);
+    mem_fill(yousj_phys_to_virt(frame), 0, YOUSJ_PAGE_SIZE);
     if (vmm_map(space, va, frame, YOUSJ_PAGE_SIZE, flags) != 0) {
         (void)pmm_free_page(frame);
         return -1;
@@ -327,7 +327,6 @@ static long sys_clone(long flags, uint64_t child_stack)
         vmm_space_release(space);
         return -YOUSJ_ENOMEM;
     }
-    vmm_share_kernel_identity(space);
     if (vmm_clone_user_window(space, me->mm) != 0) {
         vmm_free_user_data(space);
         vmm_destroy_space(space);
@@ -495,7 +494,6 @@ static long sys_execve(uint64_t path_ptr, uint64_t argv_ptr,
         return -YOUSJ_ENOMEM;
     if (vmm_create_space(space) != 0)
         goto fail_release;
-    vmm_share_kernel_identity(space);
     if (elf_load_user_image(img->start,
                             (uint64_t)(img->end - img->start),
                             space, &entry, &img_brk) != 0)

@@ -61,14 +61,22 @@ irq0_stub:
      * so a task resumed from a syscall runs in ring 3 with
      * CS=0x1B / SS=0x13 (fabricated caches) and a timer frame
      * captured there fails iretq's GDT checks. If the frame's
-     * RIP is a user address, rewrite CS/SS to the canonical
-     * user pair; on silicon the frame already holds them and
-     * this is a no-op. Kernel frames are never touched. The
-     * hardware frame lies above the 9 saved registers: RIP at
-     * +72, CS at +80, SS at +104 from here. */
-    movq $0x8000000000, %rax
+     * RIP lies in the user window, rewrite CS/SS to the
+     * canonical user pair; on silicon the frame already holds
+     * them and this is a no-op. The window test must be exact:
+     * since M6 the kernel itself executes at 0xFFFFFFFF80000000+
+     * and kernel stacks live in the HHDM, both far ABOVE the
+     * window -- a bare "RIP >= user base" test would misread
+     * every kernel frame as a user frame and iretq into ring 3
+     * (this exact bug halted the first M6 boot). The hardware
+     * frame lies above the 9 saved registers: RIP at +72, CS
+     * at +80, SS at +104 from here. */
+    movq $0x8000000000, %rax     /* YOUSJ_USER_BASE */
     cmpq %rax, 72(%rsp)
     jb 1f
+    movq $0x8003000000, %rax     /* YOUSJ_USER_LIMIT */
+    cmpq %rax, 72(%rsp)
+    jae 1f
     movq $0x23, 80(%rsp)
     movq $0x1B, 104(%rsp)
     jmp 2f

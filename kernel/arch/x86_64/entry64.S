@@ -1,9 +1,18 @@
-/* Yousj OS - 64-bit kernel entry for the QEMU Multiboot smoke boot.
- * Written by Muse (coordinator). The 32-bit stub (stub.S/stub.c)
- * has already loaded this ELF's segments to their physical addresses,
- * built struct yousj_boot_info, switched to long mode with an
- * identity map, and stored the boot_info pointer at physical 0x9008.
- * All we do here is set up the kernel stack and call kmain(). */
+/* Yousj OS - 64-bit kernel entry, shared by both boot chains.
+ * Written by Muse (coordinator). The kernel image is mapped at
+ * its higher-half link base by the chain's early tables before
+ * either entry is reached.
+ *
+ * _kentry64 (Multiboot chain): the 32-bit stub has loaded this
+ * ELF's segments to their physical addresses, built struct
+ * yousj_boot_info, and stored its pointer at physical 0x9008.
+ *
+ * _kentry64_rdi (UEFI chain): the bootloader jumps here with the
+ * boot_info pointer already in RDI (see bootloader/efi_main.c).
+ *
+ * Both then do the same: reload data segments with our own
+ * selectors, switch to the kernel stack in this image's BSS, and
+ * call kmain(). */
 
     .section .bss
     .align 16
@@ -15,8 +24,13 @@ kernel_stack_top:
     .code64
     .global _kentry64
 _kentry64:
-    /* Data segments: selector 0x10 in the stub's GDT (still the
-     * active GDT at this point) is its flat data descriptor. */
+    mov 0x9008, %rdi          /* boot_info pointer left by the stub */
+
+    .global _kentry64_rdi
+_kentry64_rdi:
+    /* Data segments: selector 0x10 is a flat data descriptor in
+     * both chains' hand-off GDTs (and in ours, once gdt_init()
+     * runs inside kmain). */
     mov $0x10, %ax
     mov %ax, %ds
     mov %ax, %es
@@ -24,7 +38,6 @@ _kentry64:
     mov %ax, %gs
     mov %ax, %ss
     mov $kernel_stack_top, %rsp
-    mov 0x9008, %rdi          /* boot_info pointer left by the stub */
     call kmain
 
 hang:
