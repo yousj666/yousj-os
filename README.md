@@ -50,8 +50,18 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   上线，调度器按任务切换 CR3；扁平二进制用户程序在自有地址空间
   里打印出自己的 pid 并以状态 42 退出，Multiboot 与 UEFI 两条
   启动链均实测 PASS。
-- ⏳ 下一步：M4 ELF 加载（init 正式成为 PID 1）、高半区＋HHDM
-  布局、Shell 上机。
+- ✅ 调度 M4（2026-11-02）：静态 ELF64 加载器上线，init 以真
+  ELF 形象正式上岗（过渡方案：映像内嵌进内核）——banner＋
+  `yousj-init: INIT_SMOKE_OK` 后进入串口命令循环（help/ps/
+  uname/kill/exit）。syscall 批次 1 落地：read（串口控制台）/
+  nanosleep/uname（sysname "Yousj"）/brk/匿名 mmap/munmap/
+  arch_prctl（FS）/kill；exit 掉 init 触发内核 panic
+  （"Attempted to kill init"）。验收：`make check`/`make test`、
+  Multiboot 冒烟、串口交互实测（`tools/qemu-init-test.py`：
+  help→ps→kill 演示线程→ps 验消失→exit 验 panic）与 UEFI 链
+  全部 PASS。
+- ⏳ 下一步：M5 进程模型（clone/execve/wait4、独立 Shell、
+  监管型 init 接管）、高半区＋HHDM 布局。
 
 ## 从零构建
 
