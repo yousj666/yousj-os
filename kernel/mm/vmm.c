@@ -13,6 +13,7 @@
  * this exact file against a fake RAM array on the host.
  */
 #include <yousj/vmm.h>
+#include <yousj/user.h> /* YOUSJ_USER_BASE */
 
 static struct vmm_backend g_backend;
 static bool g_backend_ready;
@@ -319,6 +320,63 @@ void vmm_destroy_space(struct vmm_space *space)
     }
     g_backend.free_page(space->pml4_phys);
     space->pml4_phys = 0;
+}
+
+/* --- owned-space pool (M5) -------------------------------------- */
+
+#define YOUSJ_SPACE_POOL 32
+static struct vmm_space g_space_pool[YOUSJ_SPACE_POOL];
+static bool             g_space_pool_used[YOUSJ_SPACE_POOL];
+
+struct vmm_space *vmm_space_alloc(void)
+{
+    uint32_t i;
+    for (i = 0; i < YOUSJ_SPACE_POOL; i++) {
+        if (!g_space_pool_used[i]) {
+            g_space_pool_used[i] = true;
+            g_space_pool[i].pml4_phys = 0;
+            return &g_space_pool[i];
+        }
+    }
+    return NULL;
+}
+
+void vmm_space_release(struct vmm_space *space)
+{
+    uint32_t i;
+    for (i = 0; i < YOUSJ_SPACE_POOL; i++) {
+        if (&g_space_pool[i] == space)
+            g_space_pool_used[i] = false;
+    }
+}
+
+/* Free every present 4 KiB leaf under one PML4 entry (the tables
+ * themselves are destroy_space()'s job). */
+static void free_data_tree(uint64_t table_phys, int depth)
+{
+    uint64_t *table = table_of(table_phys);
+    uint32_t i;
+    for (i = 0; i < YOUSJ_VMM_ENTRIES; i++) {
+        uint64_t e = table[i];
+        if (!(e & YOUSJ_PTE_PRESENT))
+            continue;
+        if (depth < 2)
+            free_data_tree(e & YOUSJ_PTE_ADDR_MASK, depth + 1);
+        else
+            g_backend.free_page(e & YOUSJ_PTE_ADDR_MASK);
+    }
+}
+
+void vmm_free_user_data(struct vmm_space *space)
+{
+    uint64_t *pml4;
+    uint64_t idx;
+    if (!g_backend_ready || space == NULL || space->pml4_phys == 0)
+        return;
+    pml4 = table_of(space->pml4_phys);
+    idx = (YOUSJ_USER_BASE >> 39) & 0x1FFULL;
+    if (pml4[idx] & YOUSJ_PTE_PRESENT)
+        free_data_tree(pml4[idx] & YOUSJ_PTE_ADDR_MASK, 0);
 }
 
 void vmm_set_kernel_master(struct vmm_space *space)

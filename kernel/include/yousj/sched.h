@@ -64,6 +64,18 @@ struct task {
     uint64_t        wake_tick;    /* nonzero while sleeping: tick at
                                      which sched_tick() wakes the
                                      task (M2). Cleared on wake. */
+    int64_t         wait_target;  /* wait4 (M5): 0 = not waiting,
+                                     -1 = any child, >0 = that child
+                                     tid. sched_exit_current() wakes
+                                     a blocked parent whose target
+                                     matches the exiting task. */
+    uint64_t        kernel_stack_base; /* PMM base of the owned
+                                     kernel stack (auto-created
+                                     tasks); 0 = not owned, never
+                                     freed by the reaper. */
+    bool            mm_owned;     /* mm points at a pool space from
+                                     vmm_space_alloc(): the exit
+                                     path destroys it (M5). */
     bool            in_use;
 };
 
@@ -124,6 +136,14 @@ uint64_t sched_count_state(enum task_state state);
 /* Find a live task by tid (NULL when absent). The returned pointer
  * is invalidated if the task exits or is killed. */
 struct task *sched_find_task(int tid);
+/* M5 process genealogy (SCHED_DESIGN sec. 6.3): zombie-child
+ * lookup and child existence under the wait4 pid filter
+ * (pid == -1 matches any child), orphan adoption, and the
+ * reaper that frees a zombie's kernel stack and pool slot. */
+struct task *sched_find_zombie_child(uint64_t parent_tid, int pid);
+int          sched_has_children(uint64_t parent_tid, int pid);
+void         sched_adopt_children(uint64_t from_tid, uint64_t to_tid);
+int          sched_reap_zombie(struct task *victim);
 
 /* Stage-1 kill ( backs the kill syscall and the M4 acceptance
  * scenario): forcibly retire a READY or BLOCKED task -- it is

@@ -102,7 +102,6 @@ void syscall_init(void)
     wrmsr(MSR_LSTAR, (uint64_t)(uintptr_t)&syscall_entry);
     wrmsr(MSR_SFMASK, 0x700); /* IF + TF + DF masked on entry */
     wrmsr(MSR_KERNEL_GS_BASE, (uint64_t)(uintptr_t)&g_cpu_local);
-    /* BISECT: watchpoint disarmed */
     wrmsr(MSR_EFER, rdmsr(MSR_EFER) | EFER_SCE);
 }
 
@@ -112,6 +111,7 @@ void syscall_init(void)
 #define YOUSJ_EPERM  1
 #define YOUSJ_ESRCH  3
 #define YOUSJ_EBADF  9
+#define YOUSJ_ECHILD 10
 #define YOUSJ_ENOMEM 12
 #define YOUSJ_EFAULT 14
 #define YOUSJ_ENODEV 19
@@ -181,7 +181,9 @@ static long sys_write(long fd, uint64_t buf, uint64_t len)
 
 static void sys_exit_common(long status)
 {
-    if (g_init_task != NULL && sched_current() == g_init_task) {
+    struct task *me = sched_current();
+
+    if (g_init_task != NULL && me == g_init_task) {
         /* Linux: "Attempted to kill init". Stage 1 has no way to
          * recover the console once init is gone, so this is a
          * panic, exactly as the design prescribes. */
@@ -191,7 +193,84 @@ static void sys_exit_common(long status)
         for (;;)
             __asm__ volatile("cli; hlt");
     }
+
+    /* Process teardown (SCHED_DESIGN 6.1): an owned address
+     * space is destroyed here, while this task is still the one
+     * running -- detach it from the task first and switch CR3
+     * to the master, so no later schedule can ever reload the
+     * dying space, then free its data frames and its tables.
+     * Non-owned spaces (the boot images) are deliberately kept,
+     * as before. This task's kernel stack survives until the
+     * parent reaps the zombie in wait4. */
+    if (me->mm != NULL && me->mm_owned) {
+        struct vmm_space *sp = me->mm;
+        struct vmm_space *master = vmm_kernel_master();
+
+        me->mm = NULL;
+        me->mm_owned = false;
+        if (master != NULL)
+            vmm_load_cr3(master->pml4_phys);
+        vmm_free_user_data(sp);
+        vmm_destroy_space(sp);
+        vmm_space_release(sp);
+    }
+
+    /* Orphans are adopted by init, which reaps them (6.1). */
+    if (g_init_task != NULL)
+        sched_adopt_children(me->tid, g_init_task->tid);
+
     sched_exit_current((int)status);
+}
+
+/* --- batch 2: the process family (M5) ----------------------------------- */
+
+#define YOUSJ_WNOHANG 1
+#define YOUSJ_RUSAGE_SIZE 144 /* struct rusage, zero-filled */
+
+static long sys_wait4(long pid, uint64_t status_ptr, long options,
+                      uint64_t rusage_ptr)
+{
+    struct task *me = sched_current();
+
+    if (pid == 0 || pid < -1)
+        return -YOUSJ_EINVAL; /* no process groups in this subset */
+    if (options & ~YOUSJ_WNOHANG)
+        return -YOUSJ_EINVAL;
+
+    for (;;) {
+        struct task *z = sched_find_zombie_child(me->tid, (int)pid);
+
+        if (z != NULL) {
+            int raw = z->exit_status;
+            uint64_t ztid = z->tid;
+
+            /* Validate and fill the outputs BEFORE reaping: on
+             * EFAULT the zombie stays for a corrected retry. */
+            if (status_ptr != 0) {
+                if (!user_range_ok(status_ptr, 4))
+                    return -YOUSJ_EFAULT;
+                *(int *)(uintptr_t)status_ptr = raw << 8;
+            }
+            if (rusage_ptr != 0) {
+                uint64_t i;
+                if (!user_range_ok(rusage_ptr, YOUSJ_RUSAGE_SIZE))
+                    return -YOUSJ_EFAULT;
+                for (i = 0; i < YOUSJ_RUSAGE_SIZE; i++)
+                    ((uint8_t *)(uintptr_t)rusage_ptr)[i] = 0;
+            }
+            sched_reap_zombie(z);
+            return (long)ztid;
+        }
+        if (!sched_has_children(me->tid, (int)pid))
+            return -YOUSJ_ECHILD;
+        if (options & YOUSJ_WNOHANG)
+            return 0;
+        /* Sleep until a matching child exits: sched_exit_current
+         * wakes us through wait_target. */
+        me->wait_target = pid;
+        sched_block_current();
+        me->wait_target = 0;
+    }
 }
 
 /* --- batch 1 ------------------------------------------------------------ */
@@ -435,6 +514,8 @@ long yousj_syscall_dispatch(long no, long a1, long a2, long a3,
         return sys_kill(a1, a2);
     case YOUSJ_SYS_uname:
         return sys_uname((uint64_t)a1);
+    case YOUSJ_SYS_wait4:
+        return sys_wait4(a1, (uint64_t)a2, a3, (uint64_t)a4);
     case YOUSJ_SYS_exit:
     case YOUSJ_SYS_exit_group:
         sys_exit_common(a1);

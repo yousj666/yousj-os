@@ -181,9 +181,14 @@ struct task *kthread_create_auto(const char *name, void (*entry)(void *arg),
      * so the physical address is the pointer. No guard page yet:
      * VMM_DESIGN/SCHED_DESIGN note this as an M1-accepted gap; the
      * guard arrives when the kernel switches to its own tables. */
-    return kthread_create(name, entry, arg,
-                          (void *)(uintptr_t)stack_phys,
-                          YOUSJ_SCHED_STACK_SIZE);
+    {
+        struct task *t = kthread_create(name, entry, arg,
+                                        (void *)(uintptr_t)stack_phys,
+                                        YOUSJ_SCHED_STACK_SIZE);
+        if (t != NULL)
+            t->kernel_stack_base = stack_phys; /* reaper frees it */
+        return t;
+    }
 }
 
 void sched_kthread_trampoline(void)
@@ -323,6 +328,16 @@ void sched_exit_current(int status)
     }
     g_current->exit_status = status;
     g_current->state = TASK_ZOMBIE;
+    /* Wake a parent blocked in wait4 on this task (M5): the
+     * parent re-scans for its zombie child when it runs. */
+    {
+        struct task *parent = sched_find_task((int)g_current->parent_tid);
+        if (parent != NULL && parent->state == TASK_BLOCKED &&
+            parent->wait_target != 0 &&
+            (parent->wait_target == -1 ||
+             parent->wait_target == (int64_t)g_current->tid))
+            sched_wake(parent);
+    }
     sched_schedule();
     for (;;) {
         /* A zombie is never dequeued again, so sched_schedule()
@@ -350,6 +365,74 @@ struct task *sched_find_task(int tid)
             return &g_tasks[i];
     }
     return NULL;
+}
+
+struct task *sched_find_zombie_child(uint64_t parent_tid, int pid)
+{
+    uint64_t i;
+    for (i = 0; i < YOUSJ_SCHED_MAX_TASKS; i++) {
+        struct task *t = &g_tasks[i];
+        if (t->in_use && t->parent_tid == parent_tid &&
+            t->state == TASK_ZOMBIE &&
+            (pid == -1 || t->tid == (uint64_t)pid))
+            return t;
+    }
+    return NULL;
+}
+
+int sched_has_children(uint64_t parent_tid, int pid)
+{
+    uint64_t i;
+    for (i = 0; i < YOUSJ_SCHED_MAX_TASKS; i++) {
+        struct task *t = &g_tasks[i];
+        if (t->in_use && t->parent_tid == parent_tid &&
+            (pid == -1 || t->tid == (uint64_t)pid))
+            return 1;
+    }
+    return 0;
+}
+
+void sched_adopt_children(uint64_t from_tid, uint64_t to_tid)
+{
+    uint64_t i;
+    for (i = 0; i < YOUSJ_SCHED_MAX_TASKS; i++) {
+        if (g_tasks[i].in_use && g_tasks[i].parent_tid == from_tid)
+            g_tasks[i].parent_tid = to_tid;
+    }
+}
+
+/* Unlink t from the all-tasks list (the pool array is scanned
+ * directly everywhere else, so this is list hygiene). */
+static void all_unlink(struct task *t)
+{
+    struct task *prev = NULL, *cur = g_all_head;
+    while (cur != NULL) {
+        if (cur == t) {
+            if (prev != NULL)
+                prev->all_next = t->all_next;
+            else
+                g_all_head = t->all_next;
+            break;
+        }
+        prev = cur;
+        cur = cur->all_next;
+    }
+    t->all_next = NULL;
+}
+
+int sched_reap_zombie(struct task *victim)
+{
+    if (victim == NULL || !victim->in_use ||
+        victim->state != TASK_ZOMBIE)
+        return -1;
+    if (victim->kernel_stack_base != 0) {
+        pmm_free_pages(victim->kernel_stack_base,
+                       YOUSJ_SCHED_STACK_SIZE / YOUSJ_PAGE_SIZE);
+        victim->kernel_stack_base = 0;
+    }
+    all_unlink(victim);
+    victim->in_use = false;
+    return 0;
 }
 
 /* Remove t from the run queue if present (READY tasks only are

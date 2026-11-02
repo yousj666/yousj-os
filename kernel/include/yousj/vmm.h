@@ -101,6 +101,17 @@ int  vmm_create_space(struct vmm_space *out);
  * Data pages are NOT freed (see header note). Destroying the kernel
  * master space is refused silently (a bug; bring-up halts elsewhere). */
 void vmm_destroy_space(struct vmm_space *space);
+/* M5: pool of caller-owned spaces for dynamically created tasks
+ * (clone/execve). vmm_space_alloc() hands out a zeroed slot;
+ * after vmm_destroy_space(), return it with vmm_space_release(). */
+struct vmm_space *vmm_space_alloc(void);
+void              vmm_space_release(struct vmm_space *space);
+/* Free the DATA frames mapped in the user window (PML4 index of
+ * YOUSJ_USER_BASE) -- destroy_space() alone frees only the page
+ * TABLES. Call before vmm_destroy_space(), while no task runs
+ * on the space. Assumes 4 KiB leaves, which is all the user
+ * window ever gets in this layout. */
+void              vmm_free_user_data(struct vmm_space *space);
 
 void               vmm_set_kernel_master(struct vmm_space *space);
 struct vmm_space  *vmm_kernel_master(void);
