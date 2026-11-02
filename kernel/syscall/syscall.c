@@ -1299,6 +1299,88 @@ out:
     return done > 0 ? (long)done : result;
 }
 
+/* --- M43: copy_file_range ------------------------------
+ * The last of the copy family: file to file, both ends
+ * taking splice's offset rules (pointer = positional,
+ * NULL = the descriptor's own offset). No pipe may take
+ * part (EINVAL). Same stack bounce; directories are
+ * rejected by the read/write paths themselves. */
+static long sys_copy_file_range(long fd_in,
+                                uint64_t off_in_ptr,
+                                long fd_out,
+                                uint64_t off_out_ptr,
+                                uint64_t len, long flags)
+{
+    struct task *me = sched_current();
+    struct yousj_file *in = fd_file_of(me, fd_in);
+    struct yousj_file *out = fd_file_of(me, fd_out);
+    uint8_t kbuf[1024];
+    uint64_t done = 0;
+    int64_t off_in = -1, off_out = -1;
+    long rc, result = 0;
+
+    if (in == NULL || out == NULL)
+        return -YOUSJ_EBADF;
+    if (flags != 0)
+        return -YOUSJ_EINVAL;
+    if (in->pipe != NULL || out->pipe != NULL ||
+        in->epoll != NULL || out->epoll != NULL)
+        return -YOUSJ_EINVAL;
+    rc = splice_off_read(off_in_ptr, false, &off_in);
+    if (rc != 0)
+        return rc;
+    rc = splice_off_read(off_out_ptr, false, &off_out);
+    if (rc != 0)
+        return rc;
+    if (off_in >= 0 &&
+        (in->flags & YOUSJ_O_ACCMODE) == YOUSJ_O_WRONLY)
+        return -YOUSJ_EBADF;
+    if (off_out >= 0 &&
+        (out->flags & YOUSJ_O_ACCMODE) == YOUSJ_O_RDONLY)
+        return -YOUSJ_EBADF;
+    while (done < len) {
+        uint64_t want = len - done;
+        long n, w;
+        if (want > sizeof(kbuf))
+            want = sizeof(kbuf);
+        if (off_in >= 0)
+            n = fs_pread_file(in, (uint64_t)off_in + done,
+                              kbuf, want);
+        else
+            n = file_read(in, kbuf, want);
+        if (n < 0) {
+            result = n;
+            goto out;
+        }
+        if (n == 0)
+            break;
+        if (off_out >= 0)
+            w = fs_pwrite_file(out,
+                               (uint64_t)off_out + done,
+                               kbuf, (uint64_t)n);
+        else
+            w = file_write(out, kbuf, (uint64_t)n);
+        if (w < 0) {
+            result = w;
+            goto out;
+        }
+        done += (uint64_t)w;
+        if (w < n)
+            break;
+    }
+    result = (long)done;
+out:
+    if (done > 0) {
+        if (off_in_ptr != 0 && off_in >= 0)
+            *(int64_t *)(uintptr_t)off_in_ptr =
+                off_in + (int64_t)done;
+        if (off_out_ptr != 0 && off_out >= 0)
+            *(int64_t *)(uintptr_t)off_out_ptr =
+                off_out + (int64_t)done;
+    }
+    return done > 0 ? (long)done : result;
+}
+
 static long sys_mkdir_sys(uint64_t path_ptr, long mode)
 {
     struct task *me = sched_current();
@@ -3259,6 +3341,9 @@ static long dispatch_inner(struct yousj_syscall_ctx *ctx)
     case YOUSJ_SYS_splice:
         return sys_splice((long)a1, a2, (long)a3, a4, a5,
                           (long)ctx->a6);
+    case YOUSJ_SYS_copy_file_range:
+        return sys_copy_file_range((long)a1, a2, (long)a3,
+                                   a4, a5, (long)ctx->a6);
     case YOUSJ_SYS_umask: {
         struct task *t = sched_current();
         long old = (long)t->umask;

@@ -53,6 +53,8 @@
 #define SYS_lseek 8
 #define SYS_getdents64 217
 #define SYS_sendfile 40
+#define SYS_copy_file_range 326
+#define SYS_pipe 22
 
 #define AT_FDCWD (-100)
 #define AT_SYMLINK_NOFOLLOW 0x100
@@ -101,6 +103,21 @@ static long sys_call4(long n, long a, long b, long c, long d)
                      : "rcx", "r11", "memory");
     return r;
 }
+static long sys_call6(long n, long a, long b, long c, long d,
+                      long e, long f)
+{
+    long r;
+    register long r10 __asm__("r10") = d;
+    register long r8 __asm__("r8") = e;
+    register long r9 __asm__("r9") = f;
+    __asm__ volatile("syscall"
+                     : "=a"(r)
+                     : "a"(n), "D"(a), "S"(b), "d"(c),
+                       "r"(r10), "r"(r8), "r"(r9)
+                     : "rcx", "r11", "memory");
+    return r;
+}
+
 static long sys_call5(long n, long a, long b, long c, long d,
                       long e)
 {
@@ -258,6 +275,10 @@ int main(int argc, char **argv)
     join(p, dir, "sf-src");
     sys_call1(SYS_unlink, (long)(uintptr_t)p);
     join(p, dir, "sf-dst");
+    sys_call1(SYS_unlink, (long)(uintptr_t)p);
+    join(p, dir, "cf-src");
+    sys_call1(SYS_unlink, (long)(uintptr_t)p);
+    join(p, dir, "cf-dst");
     sys_call1(SYS_unlink, (long)(uintptr_t)p);
     join(p, dir, "r3.txt");
     sys_call1(SYS_unlink, (long)(uintptr_t)p);
@@ -704,6 +725,56 @@ int main(int argc, char **argv)
         report("sendfile", ok);
     }
 
+    /* --- M43: copy_file_range --- */
+    {
+        char rb[32];
+        long ifd, ofd, n, i;
+        int64_t io = 2, oo = 3;
+        int pf[2];
+        join(p, dir, "cf-src");
+        ifd = sys_call4(SYS_open, (long)(uintptr_t)p,
+                        0101, 0644, 0);
+        sys_call3(SYS_write, ifd,
+                  (long)(uintptr_t)"0123456789ABCDEF", 16);
+        sys_call1(SYS_close, ifd);
+        ifd = sys_call3(SYS_open, (long)(uintptr_t)p, 0,
+                        0);
+        join(p, dir, "cf-dst");
+        ofd = sys_call4(SYS_open, (long)(uintptr_t)p,
+                        0101, 0644, 0);
+        n = sys_call6(SYS_copy_file_range, ifd,
+                      (long)(uintptr_t)&io, ofd,
+                      (long)(uintptr_t)&oo, 5, 0);
+        int ok = n == 5 && io == 7 && oo == 8;
+        /* streaming form: descriptor offsets rule --
+         * the positional leg left ofd's offset at 0, so
+         * seek to the end first (8) */
+        sys_call3(SYS_lseek, ofd, 8, 0);
+        n = sys_call6(SYS_copy_file_range, ifd, 0, ofd, 0,
+                      100, 0);
+        ok = ok && n == 16;
+        /* flags must be zero; pipes may not take part */
+        ok = ok && sys_call6(SYS_copy_file_range, ifd, 0,
+                             ofd, 0, 1, 1) == -22;
+        sys_call3(SYS_pipe, (long)(uintptr_t)pf, 0, 0);
+        ok = ok && sys_call6(SYS_copy_file_range, ifd, 0,
+                             pf[1], 0, 1, 0) == -22;
+        sys_call1(SYS_close, pf[0]);
+        sys_call1(SYS_close, pf[1]);
+        sys_call1(SYS_close, ifd);
+        sys_call1(SYS_close, ofd);
+        ofd = sys_call3(SYS_open, (long)(uintptr_t)p, 0,
+                        0);
+        n = sys_call3(SYS_read, ofd,
+                      (long)(uintptr_t)rb, sizeof(rb));
+        ok = ok && n == 24 && rb[0] == 0 && rb[1] == 0 &&
+             rb[2] == 0 && rb[3] == '2' && rb[7] == '6' &&
+             rb[8] == '0' && rb[23] == 'F';
+        sys_call1(SYS_close, ofd);
+        i = 0; /* silence: i used above via n only */
+        report("copy-range", ok);
+    }
+
     sys_call1(SYS_close, dfd);
 
     /* teardown: remove the whole tree so a second run in
@@ -732,6 +803,10 @@ int main(int argc, char **argv)
     join(p, dir, "sf-src");
     sys_call1(SYS_unlink, (long)(uintptr_t)p);
     join(p, dir, "sf-dst");
+    sys_call1(SYS_unlink, (long)(uintptr_t)p);
+    join(p, dir, "cf-src");
+    sys_call1(SYS_unlink, (long)(uintptr_t)p);
+    join(p, dir, "cf-dst");
     sys_call1(SYS_unlink, (long)(uintptr_t)p);
     join(p, dir, "sub2");
     sys_call1(SYS_rmdir, (long)(uintptr_t)p);

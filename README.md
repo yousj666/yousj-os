@@ -629,8 +629,18 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   独实现，明示）。至此零拷贝家族只剩
   copy_file_range 仍 ENOSYS。验收：
   pipetest 加 splice（三方向＋两条规则）。
-- ⏳ 下一步候选：硬链接（目录项重构）、
-  copy_file_range、/proc/<pid>/fdinfo。
+- ✅ copy_file_range M43（2026-11-03）：
+  copy_file_range(326) 转正，零拷贝家族收
+  齐（sendfile/splice/copy_file_range 全
+  转正）。双端偏移规则同 splice，管道/epoll
+  参与 EINVAL，flags 必须 0。验收：
+  dirfdtest 加 copy-range（定位拷贝含空洞、
+  lseek 后流式追加、内容逐字节比对、flags
+  与管道两条 EINVAL；ramfs/yfs 各一遍）。
+- ⏳ 下一步（M44 专项）：硬链接——ramfs 需
+  把名字从节点里拆成独立目录项（现 33 处树
+  形引用），yfs 目录项已独立相对易行；
+  link/linkat 随之转正。另候选 fdinfo。
 
 ## 从零构建
 

@@ -89,6 +89,7 @@
 #define YOUSJ_SYS_umask        95   /* M37 */
 #define YOUSJ_SYS_sendfile     40   /* M40 */
 #define YOUSJ_SYS_splice      275   /* M42 */
+#define YOUSJ_SYS_copy_file_range 326 /* M43 */
 #define YOUSJ_SYS_dup3        292  /* M10 */
 #define YOUSJ_SYS_pipe2       293  /* M10 */
 #define YOUSJ_SYS_time        201  /* M23 */
