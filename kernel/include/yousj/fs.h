@@ -172,11 +172,34 @@ struct yousj_stat_info {
     uint64_t size;
     uint64_t ino;
     uint64_t mtime; /* M23: seconds since the epoch */
+    uint64_t atime; /* M26: tracked independently on ramfs;
+                       yfs stores one stamp and aliases all
+                       three (its 64-byte inode has no room
+                       for more -- see yfs.c) */
+    uint64_t ctime; /* M26: ditto */
 };
 bool fs_path_stat2(const char *path, bool follow,
                    struct yousj_stat_info *info);
 bool fs_file_stat(struct yousj_file *f,
                   struct yousj_stat_info *info);
+
+/* M26: one timestamp operand of utimensat/futimens, with the
+ * UTIME_NOW / UTIME_OMIT specials already decoded by the
+ * syscall layer. `sec` counts only for YOUSJ_UTIME_SET;
+ * timestamps are second-granularity throughout the fs. */
+#define YOUSJ_UTIME_OMIT 0
+#define YOUSJ_UTIME_NOW  1
+#define YOUSJ_UTIME_SET  2
+struct yousj_utime_op {
+    int kind;
+    int64_t sec;
+};
+long fs_utimens_path(const char *path, bool follow,
+                     const struct yousj_utime_op *aop,
+                     const struct yousj_utime_op *mop);
+long fs_utimens_file(struct yousj_file *f,
+                     const struct yousj_utime_op *aop,
+                     const struct yousj_utime_op *mop);
 
 void file_get(struct yousj_file *f);
 void file_put(struct yousj_file *f);

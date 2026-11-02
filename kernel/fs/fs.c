@@ -88,6 +88,8 @@ struct yousj_ramfs_node {
     struct yousj_ramfs_node *sibling;
     uint32_t size;                      /* regular files */
     uint32_t mtime;                     /* M23: epoch seconds */
+    uint32_t atime;                     /* M26: independent */
+    uint32_t ctime;                     /* M26: independent */
     uint32_t pages[MAX_FILE_PAGES];     /* phys frames, 0 = hole */
     uint16_t open_refs;                 /* M13: live file objects */
     bool unlinked;                      /* M13: name removed; the
@@ -171,6 +173,8 @@ static struct yousj_ramfs_node *node_create(
     n->name[len] = '\0';
     n->is_dir = is_dir;
     n->mtime = (uint32_t)yousj_now_unix();
+    n->atime = n->mtime;
+    n->ctime = n->mtime;
     n->parent = parent;
     n->sibling = parent->child_head;
     parent->child_head = n;
@@ -317,9 +321,12 @@ static long node_pwrite(struct yousj_ramfs_node *n, uint64_t off,
                  src + done, chunk);
         done += chunk;
     }
-    if (done > 0 && off + done > n->size)
-        n->size = (uint32_t)(off + done);
+    if (done > 0) {
+        if (off + done > n->size)
+            n->size = (uint32_t)(off + done);
         n->mtime = (uint32_t)yousj_now_unix();
+        n->ctime = n->mtime;
+    }
     return (long)done;
 }
 
@@ -334,6 +341,7 @@ static void node_truncate(struct yousj_ramfs_node *n)
     }
     n->size = 0;
     n->mtime = (uint32_t)yousj_now_unix();
+    n->ctime = n->mtime;
 }
 
 /* --- M13: detach / deferred free -------------------------------- */
@@ -1182,6 +1190,7 @@ long fs_rename_path(const char *old_path, const char *new_path)
     src->parent = nparent;
     src->sibling = nparent->child_head;
     nparent->child_head = src;
+    src->ctime = (uint32_t)yousj_now_unix(); /* M26 */
     return 0;
 }
 
@@ -1291,6 +1300,8 @@ static void stat_from_ramfs_node(struct yousj_ramfs_node *n,
                                  struct yousj_stat_info *info)
 {
     info->mtime = n->mtime;
+    info->atime = n->atime;
+    info->ctime = n->ctime;
     if (n->is_link) {
         info->mode = S_IFLNK_K | 0777u;
         info->size = n->size;
@@ -1309,6 +1320,8 @@ static bool stat_from_yfs_ino(uint32_t ino,
 {
     int t = yfs_type_of(ino);
     info->mtime = yfs_mtime(ino);
+    info->atime = info->mtime; /* single-stamp fs: alias */
+    info->ctime = info->mtime;
     if (t == 3) {
         info->mode = S_IFLNK_K | 0777u;
         info->size = yfs_size(ino);
@@ -1347,6 +1360,8 @@ bool fs_path_stat2(const char *path, bool follow,
         if (id < 0)
             return false;
         info->mtime = (uint32_t)yousj_now_unix();
+        info->atime = info->mtime;
+        info->ctime = info->mtime;
         info->ino = 9000 + (uint64_t)id;
         if (id == 0) {
             info->mode = S_IFDIR_K | 0555u;
@@ -1376,6 +1391,8 @@ bool fs_file_stat(struct yousj_file *f,
     if (f->epoll != NULL) {
         info->mode = S_IFREG_K | 0600u;
         info->mtime = 0;
+        info->atime = 0;
+        info->ctime = 0;
         info->size = 0;
         info->ino = 0;
         return true;
@@ -1383,12 +1400,16 @@ bool fs_file_stat(struct yousj_file *f,
     if (f->pipe != NULL) {
         info->mode = S_IFIFO_K | 0644u;
         info->mtime = 0;
+        info->atime = 0;
+        info->ctime = 0;
         info->size = 0;
         info->ino = 0;
         return true;
     }
     if (f->backend == 2) {
         info->mtime = (uint32_t)yousj_now_unix();
+        info->atime = info->mtime;
+        info->ctime = info->mtime;
         info->ino = 9000 + (uint64_t)f->proc_id;
         if (f->proc_id == 0) {
             info->mode = S_IFDIR_K | 0555u;
@@ -1408,9 +1429,89 @@ bool fs_file_stat(struct yousj_file *f,
     /* the console */
     info->mode = S_IFCHR_K | 0666u;
     info->mtime = 0;
+    info->atime = 0;
+    info->ctime = 0;
     info->size = 0;
     info->ino = 1;
     return true;
+}
+
+/* --- M26: utimensat / futimens ------------------------- */
+
+static uint32_t utime_value(const struct yousj_utime_op *op,
+                            uint32_t now, uint32_t old)
+{
+    if (op->kind == YOUSJ_UTIME_SET)
+        return (uint32_t)op->sec;
+    if (op->kind == YOUSJ_UTIME_NOW)
+        return now;
+    return old;
+}
+
+static long utimens_ramfs_node(struct yousj_ramfs_node *n,
+                               const struct yousj_utime_op *aop,
+                               const struct yousj_utime_op *mop)
+{
+    uint32_t now = (uint32_t)yousj_now_unix();
+    n->atime = utime_value(aop, now, n->atime);
+    n->mtime = utime_value(mop, now, n->mtime);
+    n->ctime = now; /* a successful utimens always bumps ctime */
+    return 0;
+}
+
+/* yfs stores a single stamp: an explicit/NOW mtime operand
+ * wins; with mtime omitted, an atime operand still moves the
+ * one stamp there is. Both omitted: nothing to store. */
+static long utimens_yfs_ino(uint32_t ino,
+                            const struct yousj_utime_op *aop,
+                            const struct yousj_utime_op *mop)
+{
+    const struct yousj_utime_op *eff =
+        mop->kind != YOUSJ_UTIME_OMIT ? mop : aop;
+    uint32_t now = (uint32_t)yousj_now_unix();
+    if (eff->kind == YOUSJ_UTIME_OMIT)
+        return 0;
+    yfs_set_mtime(ino, utime_value(eff, now, 0));
+    return 0;
+}
+
+long fs_utimens_path(const char *path, bool follow,
+                     const struct yousj_utime_op *aop,
+                     const struct yousj_utime_op *mop)
+{
+    char resolved[PATH_MAX_LEN + 1];
+    if (fs_resolve_links(path, resolved, follow) != 0)
+        return -YOUSJ_ENOENT_L;
+    path = resolved;
+    if (is_data_path(path)) {
+        long ino = yfs_lookup(data_rel(path));
+        if (ino < 0)
+            return -YOUSJ_ENOENT_L;
+        return utimens_yfs_ino((uint32_t)ino, aop, mop);
+    }
+    if (is_proc_path(path))
+        return -YOUSJ_EACCES_L; /* generated files: read-only */
+    {
+        struct yousj_ramfs_node *n = fs_lookup(path);
+        if (n == NULL)
+            return -YOUSJ_ENOENT_L;
+        return utimens_ramfs_node(n, aop, mop);
+    }
+}
+
+long fs_utimens_file(struct yousj_file *f,
+                     const struct yousj_utime_op *aop,
+                     const struct yousj_utime_op *mop)
+{
+    if (f == NULL)
+        return -YOUSJ_EBADF;
+    if (f->backend == 2)
+        return -YOUSJ_EACCES_L;
+    if (f->backend == 1)
+        return utimens_yfs_ino(f->yfs_ino, aop, mop);
+    if (f->node != NULL)
+        return utimens_ramfs_node(f->node, aop, mop);
+    return -YOUSJ_EINVAL; /* pipes, epoll, console: no stamps */
 }
 
 bool fs_path_stat(const char *path, bool *is_dir_out,
@@ -1468,8 +1569,12 @@ long file_read(struct yousj_file *f, uint8_t *dst, uint64_t count)
     if ((f->flags & YOUSJ_O_ACCMODE) == YOUSJ_O_WRONLY)
         return -YOUSJ_EBADF;
     n = node_pread(f->node, f->offset, dst, count);
-    if (n > 0)
+    if (n > 0) {
         f->offset += (uint64_t)n;
+        /* M26: strict atime -- a successful read stamps the
+         * node. (yfs keeps no separate atime; see fs.h.) */
+        f->node->atime = (uint32_t)yousj_now_unix();
+    }
     return n;
 }
 
@@ -1717,6 +1822,8 @@ long file_getdents(struct yousj_file *f, uint8_t *buf, uint64_t count)
         used += reclen;
         f->offset = idx + 1;
     }
+    if (used > 0)
+        f->node->atime = (uint32_t)yousj_now_unix(); /* M26 */
     return (long)used;
 }
 

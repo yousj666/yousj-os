@@ -415,8 +415,30 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   恢复 PASS，其余十六链不回归。顺带记档：被收养
   的孤儿僵尸要等 shell 退出才被 init 清扫（init 主
   循环阻塞在对 shell 的 wait4 上），已列入下一步。
-- ⏳ 下一步候选：utimensat 与独立 atime/ctime 跟踪、
-  孤儿僵尸及时清扫（init 主循环改造）。
+- ✅ 时间戳 M26（2026-11-02）：atime/ctime/mtime 独立
+  跟踪＋utimensat(280)/futimens(261)。ramfs 节点新带
+  三个独立字段：创建时三者同值，读（含 getdents）刷
+  atime（严格模式，读到字节才算），写/截断刷 mtime
+  ＋ctime，rename 刷 ctime，utimens 成功必刷 ctime。
+  yfs 的 64 字节 inode 没有余量存三份时间戳
+  （rsvd[1] 已被 mtime 用满），维持单戳：stat 三者
+  同值，utimens 以 mtime 操作元为准（省略时才轮到
+  atime 操作元）改写那一个戳——三戳独立要等 yfs 格
+  式升版。系统调用面：times 为 NULL 即双 NOW；
+  UTIME_NOW/UTIME_OMIT 解码、nsec 范围与负秒校验
+  回 EINVAL；AT_SYMLINK_NOFOLLOW、AT_EMPTY_PATH
+  （语义与 newfstatat 对齐）、相对 dirfd 仍 ENOSYS；
+  /proc 回 EACCES，futimens 打在管道/epoll/控制台
+  上回 EINVAL。stat 的 atime/ctime 自此是真值（时间
+  戳粒度仍为秒，显式 nsec 只做校验后截断）。验收：
+  新套件 utimetest 九场景（显式设时、OMIT、NULL-
+  now、futimens、NOFOLLOW 只打链本身、读刷 atime、
+  写刷 mtime+ctime、错误面、空路径）在 ramfs 两轮
+  全过，disk 套件 p2 段以别名模式在 yfs 上同套全
+  过，其余十七链不回归。
+- ⏳ 下一步候选：孤儿僵尸及时清扫（init 主循环改
+  造）、yfs 格式升版（inode 扩容、三时间戳独立、
+  为未来字段留白）。
 
 ## 从零构建
 

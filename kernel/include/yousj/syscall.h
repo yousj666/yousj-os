@@ -64,6 +64,8 @@
 #define YOUSJ_SYS_getdents64  217
 #define YOUSJ_SYS_openat      257
 #define YOUSJ_SYS_newfstatat  262  /* M20 */  /* M9 */
+#define YOUSJ_SYS_futimens    261  /* M26 */
+#define YOUSJ_SYS_utimensat   280  /* M26 */
 #define YOUSJ_SYS_unlinkat    263  /* M13 */
 #define YOUSJ_SYS_symlink      88   /* M16 */
 #define YOUSJ_SYS_readlink     89   /* M16 */

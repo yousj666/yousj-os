@@ -148,6 +148,13 @@ check('p2 timetest on yfs (all six, no FAIL)',
       ok and 'timetest: mtime PASS' in seg and
       'timetest: clocks PASS' in seg and
       'FAIL' not in seg)
+sess.buf = b''
+ok = sess.run_expect('utimetest /data/ut-file alias', 'UTIMETEST DONE', 60)
+seg = sess.buf.decode(errors='replace')
+check('p2 utimetest on yfs (alias mode, no FAIL)',
+      ok and 'utimetest: set-explicit PASS' in seg and
+      'utimetest: errors PASS' in seg and
+      'FAIL' not in seg)
 qemu.kill()  # power cut again
 qemu.wait()
 s.close()

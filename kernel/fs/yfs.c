@@ -703,6 +703,18 @@ static void stamp_mtime(struct yfs_inode *n)
     n->rsvd[1] = (uint32_t)yousj_now_unix();
 }
 
+/* M26: utimensat on a single-stamp filesystem -- set the one
+ * stored timestamp outright (inode write-back goes through
+ * the same journaled path as every other metadata write). */
+void yfs_set_mtime(uint32_t ino, uint32_t sec)
+{
+    struct yfs_inode n;
+    if (inode_read(ino, &n) != 0)
+        return;
+    n.rsvd[1] = sec;
+    inode_write(ino, &n);
+}
+
 
 /* Write bytes into a directory's own content (yfs_pwrite
  * refuses directories by design). Direct blocks only: a

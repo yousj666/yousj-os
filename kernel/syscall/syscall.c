@@ -1019,11 +1019,11 @@ static long fill_stat(uint64_t stat_ptr,
     st->size = (int64_t)info->size;
     st->blksize = 4096;
     st->blocks = (int64_t)((info->size + 511) / 512);
-    /* M23: one tracked timestamp serves atime/mtime/ctime
-     * (no separate bookkeeping for the three yet). */
-    st->atime = (int64_t)info->mtime;
+    /* M26: the fs tracks the three independently where it
+     * can (ramfs); single-stamp backends alias in fs.c. */
+    st->atime = (int64_t)info->atime;
     st->mtime = (int64_t)info->mtime;
-    st->ctime = (int64_t)info->mtime;
+    st->ctime = (int64_t)info->ctime;
     return 0;
 }
 
@@ -1089,6 +1089,105 @@ static long sys_newfstatat(long dirfd, uint64_t path_ptr,
         return -YOUSJ_ENOSYS; /* no per-directory base yet */
     return sys_stat_path(path_ptr, stat_ptr,
                          !(flags & AT_SYMLINK_NOFOLLOW_K));
+}
+
+/* --- M26: utimensat / futimens ------------------------- */
+
+#define UTIME_NOW_K  1073741823 /* (1 << 30) - 1 */
+#define UTIME_OMIT_K 1073741822 /* (1 << 30) - 2 */
+
+/* Decode one user timespec into a yousj_utime_op. tv_sec is
+ * ignored for the two specials, as on Linux. Explicit stamps
+ * keep second granularity (the fs stores seconds); the nsec
+ * field is still range-validated. */
+static long utime_op_decode(const struct timespec_k *ts,
+                            struct yousj_utime_op *op)
+{
+    if (ts->nsec == UTIME_NOW_K) {
+        op->kind = YOUSJ_UTIME_NOW;
+        op->sec = 0;
+        return 0;
+    }
+    if (ts->nsec == UTIME_OMIT_K) {
+        op->kind = YOUSJ_UTIME_OMIT;
+        op->sec = 0;
+        return 0;
+    }
+    if (ts->nsec < 0 || ts->nsec > 999999999 || ts->sec < 0)
+        return -YOUSJ_EINVAL;
+    op->kind = YOUSJ_UTIME_SET;
+    op->sec = ts->sec;
+    return 0;
+}
+
+static long utime_ops_decode(uint64_t times_ptr,
+                             struct yousj_utime_op *aop,
+                             struct yousj_utime_op *mop)
+{
+    const struct timespec_k *ts;
+    long rc;
+    if (times_ptr == 0) {
+        aop->kind = YOUSJ_UTIME_NOW;
+        aop->sec = 0;
+        mop->kind = YOUSJ_UTIME_NOW;
+        mop->sec = 0;
+        return 0;
+    }
+    if (!user_range_ok(times_ptr, 2 * sizeof(struct timespec_k)))
+        return -YOUSJ_EFAULT;
+    ts = (const struct timespec_k *)(uintptr_t)times_ptr;
+    rc = utime_op_decode(&ts[0], aop);
+    if (rc != 0)
+        return rc;
+    return utime_op_decode(&ts[1], mop);
+}
+
+static long sys_futimens(long fd, uint64_t times_ptr)
+{
+    struct task *me = sched_current();
+    struct yousj_file *f = fd_file_of(me, fd);
+    struct yousj_utime_op aop, mop;
+    long rc;
+    if (f == NULL)
+        return -YOUSJ_EBADF;
+    rc = utime_ops_decode(times_ptr, &aop, &mop);
+    if (rc != 0)
+        return rc;
+    return fs_utimens_file(f, &aop, &mop);
+}
+
+static long sys_utimensat(long dirfd, uint64_t path_ptr,
+                          uint64_t times_ptr, long flags)
+{
+    struct task *me = sched_current();
+    char path_buf[256];
+    static char resolved[256];
+    struct yousj_utime_op aop, mop;
+    long rc;
+    if (flags & ~(AT_SYMLINK_NOFOLLOW_K | AT_EMPTY_PATH_K))
+        return -YOUSJ_EINVAL;
+    if (!user_range_ok(path_ptr, 1))
+        return -YOUSJ_EFAULT;
+    if (*(const char *)(uintptr_t)path_ptr == '\0') {
+        /* empty path: mirror sys_newfstatat's rule */
+        if (!(flags & AT_EMPTY_PATH_K))
+            return -YOUSJ_ENOENT;
+        if (dirfd == AT_FDCWD_K)
+            return -YOUSJ_ENOENT;
+        return sys_futimens(dirfd, times_ptr);
+    }
+    if (dirfd != AT_FDCWD_K)
+        return -YOUSJ_ENOSYS; /* no per-directory base yet */
+    rc = utime_ops_decode(times_ptr, &aop, &mop);
+    if (rc != 0)
+        return rc;
+    if (copy_user_string(path_ptr, path_buf,
+                         sizeof(path_buf)) != 0)
+        return -YOUSJ_EFAULT;
+    resolve_path(me, path_buf, resolved);
+    return fs_utimens_path(resolved,
+                           !(flags & AT_SYMLINK_NOFOLLOW_K),
+                           &aop, &mop);
 }
 
 /* --- M18: epoll ---------------------------------------- */
@@ -2432,6 +2531,10 @@ static long dispatch_inner(struct yousj_syscall_ctx *ctx)
         return sys_fstat((long)a1, a2);
     case YOUSJ_SYS_newfstatat:
         return sys_newfstatat((long)a1, a2, a3, (long)a4);
+    case YOUSJ_SYS_futimens:
+        return sys_futimens((long)a1, a2);
+    case YOUSJ_SYS_utimensat:
+        return sys_utimensat((long)a1, a2, a3, (long)a4);
     case YOUSJ_SYS_epoll_create1:
         return sys_epoll_create1((long)a1);
     case YOUSJ_SYS_epoll_ctl:
