@@ -9,36 +9,41 @@
  *   2. Loads the kernel's ELF64 PT_LOAD segments to their physical
  *      addresses (claiming those exact pages from the firmware
  *      first, so nothing else can be handed the same pages), and
- *      finds the kmain symbol to jump to.
+ *      finds the kernel's UEFI entry symbol to jump to.
  *   3. Allocates pages for struct yousj_boot_info and a kernel
  *      stack, finds the ACPI RSDP, converts LoadOptions to an
  *      ASCII command line.
- *   4. Fetches the firmware memory map (two-call sizing), converts
+ *   4. Builds the hand-off page tables (see build_handoff_tables):
+ *      a 1 GiB identity map for the loader's own world plus the
+ *      kernel image mapped at its higher-half link base.
+ *   5. Fetches the firmware memory map (two-call sizing), converts
  *      it with the pure functions in boot_info.c -- which force the
  *      kernel image range to YOUSJ_MEM_RESERVED -- and marks the
  *      boot_info / stack / loader-image ranges YOUSJ_MEM_BOOTLOADER.
- *   5. ExitBootServices (one full retry with a fresh map on
+ *   6. ExitBootServices (one full retry with a fresh map on
  *      INVALID_PARAMETER, exactly as the spec's dance requires).
- *   6. cli, RSP = allocated stack, RDI = boot_info, jmp kmain.
+ *   7. cli, CR3 = hand-off tables, RDI = boot_info, jmp to the
+ *      kernel entry (which switches to its own stack in the
+ *      image's BSS before calling kmain).
  *
- * Every failure before step 5 halts with a message on the firmware
+ * Every failure before step 6 halts with a message on the firmware
  * console: fail closed, never jump with a half-built boot_info --
  * the kernel trusts the map completely (see kernel/mm/pmm.c).
  *
- * Scope limits of this revision (deliberate, see DESIGN.md):
- *   - Kernel must be linked identity (p_vaddr == p_paddr for every
- *     PT_LOAD, as kernel/arch/x86_64/link.ld does today). A future
- *     higher-half kernel needs page tables built here plus a
- *     kernel-side entry stub; that is coupled to the coordinator's
- *     VMM hardware step and is NOT improvised in this file.
- *   - The jump target is the ELF symbol `kmain`, i.e. boot.h's
- *     contract taken literally ("bootloader puts boot_info in RDI
- *     and jumps to kmain()"). The Multiboot smoke chain's
- *     _kentry64 entry is stub-specific (it reads the boot_info
- *     pointer from physical 0x9008 and assumes the stub's GDT), so
- *     it is not used here. If a future kernel link strips the
- *     symbol table, this loader fails closed at step 2 and the fix
- *     is a dedicated UEFI entry symbol, owned by the coordinator.
+ * Kernel link contract (M6, coordinated with the kernel's VMM
+ * hardware step, as this file's earlier revision anticipated):
+ *   - The kernel is linked higher-half: every PT_LOAD must share
+ *     one vaddr-paddr delta, 0xFFFFFFFF7FF00000 (image at virtual
+ *     0xFFFFFFFF80000000, physical 1 MiB), enforced in
+ *     load_kernel_image(). Segments are still loaded by p_paddr;
+ *     step 4's tables make the virtual addresses real.
+ *   - The jump target is the ELF symbol `_kentry64_rdi`, the
+ *     dedicated UEFI entry the earlier revision foresaw: it takes
+ *     boot_info in RDI (boot.h's contract), reloads segments and
+ *     switches to the kernel's own stack, then calls kmain. Its
+ *     Multiboot sibling `_kentry64` differs only in reading the
+ *     boot_info pointer from physical 0x9008, where that chain's
+ *     stub publishes it.
  */
 #include <yousj/types.h>
 #include <yousj/boot.h>
@@ -198,14 +203,22 @@ static uint64_t rd64(const uint8_t *p) { return *(const uint64_t *)p; }
 #define ELF_ET_EXEC   2u
 #define ELF_EM_X86_64 62u
 
+/* The kernel's higher-half link contract (kernel/arch/x86_64/
+ * link.ld): virtual base 0xFFFFFFFF80000000, physical base 1 MiB,
+ * one uniform delta for every loadable segment. */
+#define KERNEL_V2P_DELTA 0xFFFFFFFF7FF00000ULL
+#define KERNEL_VIRT_BASE 0xFFFFFFFF80000000ULL
+
 struct kernel_image_info {
     uint64_t base;   /* first claimed page of the loaded image */
     uint64_t length; /* claimed range length (page-rounded) */
-    uint64_t entry;  /* physical address of the kmain symbol */
+    uint64_t entry;  /* VIRTUAL address of the _kentry64_rdi symbol */
 };
 
-/* Find `kmain` in the ELF symbol table; returns its value or 0. */
-static uint64_t elf_find_kmain(const uint8_t *img, uint64_t size)
+/* Find a symbol by name in the ELF symbol table; returns its
+ * value or 0. */
+static uint64_t elf_find_symbol(const uint8_t *img, uint64_t size,
+                                const char *want, uint64_t want_len)
 {
     uint64_t shoff = rd64(img + 40);
     uint32_t shentsize = rd16(img + 58);
@@ -247,17 +260,20 @@ static uint64_t elf_find_kmain(const uint8_t *img, uint64_t size)
             if (name_off >= str_size)
                 continue;
             name = (const char *)(str + name_off);
-            /* Bounded compare against "kmain". The loop MUST stop
-             * at k == 5: "kmain"[5] is the literal's own NUL, which
-             * EQUALS the name's terminator, so an unbounded loop
-             * overshoots to k == 6 (reading past the literal) and
-             * the exact match is never reported. Coordinator fix
-             * on acceptance; verified against a real kernel ELF. */
+            /* Bounded compare against the wanted name. The loop
+             * MUST stop at k == want_len: the literal's own NUL
+             * would EQUAL the name's terminator, so an unbounded
+             * loop overshoots by one (reading past the literal)
+             * and the exact match is never reported. Coordinator
+             * fix on acceptance; verified against a real kernel
+             * ELF. */
             k = 0;
-            while (k < 5 && k < str_size - name_off &&
-                   name[k] == "kmain"[k])
+            while (k < want_len && k < str_size - name_off &&
+                   name[k] == want[k])
                 k++;
-            if (k == 5 && (name_off + 5 >= str_size || name[5] == '\0'))
+            if (k == want_len &&
+                (name_off + want_len >= str_size ||
+                 name[want_len] == '\0'))
                 return value;
         }
         return 0; /* one symtab is all an EXEC image has */
@@ -303,9 +319,10 @@ static void load_kernel_image(const uint8_t *img, uint64_t size,
             fail("kernel PT_LOAD segment escapes the image file", ~(efi_status_t)0);
         if (paddr + memsz < paddr)
             fail("kernel PT_LOAD physical range wraps", ~(efi_status_t)0);
-        if (vaddr != paddr)
-            fail("kernel is not linked identity (vaddr != paddr); "
-                 "higher-half needs the page-table step first",
+        if (vaddr - paddr != KERNEL_V2P_DELTA)
+            fail("kernel PT_LOAD vaddr-paddr delta is not the "
+                 "higher-half contract delta (image at virtual "
+                 "0xFFFFFFFF80000000, physical 1 MiB)",
                  ~(efi_status_t)0);
         if (paddr < base)
             base = paddr;
@@ -347,9 +364,10 @@ static void load_kernel_image(const uint8_t *img, uint64_t size,
             mem_zero((void *)(uintptr_t)(paddr + filesz), memsz - filesz);
     }
 
-    out->entry = elf_find_kmain(img, size);
-    if (out->entry == 0 || out->entry < base || out->entry >= end)
-        fail("kmain symbol not found in the kernel image "
+    out->entry = elf_find_symbol(img, size, "_kentry64_rdi", 13);
+    if (out->entry == 0 || out->entry < base + KERNEL_V2P_DELTA ||
+        out->entry >= end + KERNEL_V2P_DELTA)
+        fail("_kentry64_rdi symbol not found in the kernel image "
              "(symbol table stripped? see DESIGN.md proposals)",
              ~(efi_status_t)0);
 }
@@ -582,11 +600,65 @@ static uint64_t fetch_map_and_build(struct yousj_boot_info *info,
 }
 
 /* ---------------------------------------------------------------- */
+/* Hand-off page tables (M6). Six pages, allocated as               */
+/* EFI_LOADER_DATA so the converted memory map calls them           */
+/* BOOTLOADER and the kernel PMM never hands them out:              */
+/*   [0] PML4:  [0] -> identity PDPT, [511] -> kernel PDPT          */
+/*   [1] identity PDPT: [0] -> identity PD                          */
+/*   [2] identity PD: 512 x 2 MiB pages covering [0, 1 GiB)         */
+/*   [3] kernel PDPT: [510] -> kernel PD                            */
+/*   [4] kernel PD: [0] -> kernel PT                                */
+/*   [5] kernel PT: the image window at 4 KiB granularity           */
+/* The identity half exists only so this loader's own code, its     */
+/* stack and the boot_info page stay reachable between loading CR3  */
+/* and jumping; the kernel discards these tables at vmm_hw_init()   */
+/* and rebuilds the layout in its own master space. The image is    */
+/* mapped with 4 KiB leaves because it is 1 MiB-based: a 2 MiB      */
+/* huge-page entry cannot represent it (the base's low bits would   */
+/* land in the entry's reserved field and fault).                   */
+/* ---------------------------------------------------------------- */
+
+#define HANDOFF_TABLE_PAGES 6
+static uint64_t g_handoff_pml4; /* physical; set by the builder */
+
+static void build_handoff_tables(const struct kernel_image_info *kimg,
+                                 uint64_t tables_phys)
+{
+    uint64_t *pml4   = (uint64_t *)(uintptr_t)(tables_phys + 0 * EFI_PAGE_SIZE);
+    uint64_t *pdpt_i = (uint64_t *)(uintptr_t)(tables_phys + 1 * EFI_PAGE_SIZE);
+    uint64_t *pd_i   = (uint64_t *)(uintptr_t)(tables_phys + 2 * EFI_PAGE_SIZE);
+    uint64_t *pdpt_k = (uint64_t *)(uintptr_t)(tables_phys + 3 * EFI_PAGE_SIZE);
+    uint64_t *pd_k   = (uint64_t *)(uintptr_t)(tables_phys + 4 * EFI_PAGE_SIZE);
+    uint64_t *pt_k   = (uint64_t *)(uintptr_t)(tables_phys + 5 * EFI_PAGE_SIZE);
+    uint64_t i, pages = kimg->length / EFI_PAGE_SIZE;
+
+    if (pages > 512)
+        fail("kernel image exceeds the 2 MiB hand-off window",
+             ~(efi_status_t)0);
+
+    mem_zero(pml4, HANDOFF_TABLE_PAGES * EFI_PAGE_SIZE);
+
+    for (i = 0; i < 512; i++)
+        pd_i[i] = (i * 0x200000ULL) | 0x83; /* identity, 2 MiB, RW */
+    pdpt_i[0] = (tables_phys + 2 * EFI_PAGE_SIZE) | 0x3;
+    pml4[0] = (tables_phys + 1 * EFI_PAGE_SIZE) | 0x3;
+
+    for (i = 0; i < pages; i++)
+        pt_k[i] = (kimg->base + i * EFI_PAGE_SIZE) | 0x3;
+    pd_k[0] = (tables_phys + 5 * EFI_PAGE_SIZE) | 0x3;
+    pdpt_k[510] = (tables_phys + 4 * EFI_PAGE_SIZE) | 0x3;
+    pml4[511] = (tables_phys + 3 * EFI_PAGE_SIZE) | 0x3;
+
+    g_handoff_pml4 = tables_phys;
+}
+
+/* ---------------------------------------------------------------- */
 /* The handoff. Interrupts off FIRST (firmware interrupt state is   */
-/* not ours anymore), one raw-serial breadcrumb, then registers     */
-/* and jump. RSP is set to stack_top - 8 so kmain's entry sees the  */
-/* stack alignment a normal `call` would have produced (RSP % 16    */
-/* == 8); kmain never returns.                                      */
+/* not ours anymore), one raw-serial breadcrumb, then registers,    */
+/* CR3 and jump. RSP is set to stack_top - 8 (the alignment a       */
+/* normal `call` would produce); the kernel entry stub replaces     */
+/* it with the kernel's own stack before calling kmain, and kmain   */
+/* never returns.                                                   */
 /*                                                                  */
 /* GDT contract (found the hard way in OVMF testing, on BOTH      */
 /* sides in parallel): the kernel's IDT entries hardcode selector  */
@@ -614,7 +686,8 @@ struct gdt_ptr {
 } __attribute__((packed));
 
 static void jump_to_kernel(const struct yousj_boot_info *info,
-                           uint64_t stack_top, uint64_t entry)
+                           uint64_t stack_top, uint64_t entry,
+                           uint64_t pml4_phys)
 {
     /* Filled at runtime, not by a link-time initializer: the GDTR
      * base is an absolute address and must not depend on the
@@ -643,10 +716,19 @@ static void jump_to_kernel(const struct yousj_boot_info *info,
         "cld\n\t"
         "mov %1, %%rsp\n\t"
         "mov %2, %%rdi\n\t"
+        /* Switch to the hand-off tables LAST: the instructions
+         * above still execute at this loader's own addresses,
+         * which the identity half of the new tables keeps mapped,
+         * and the very next fetch is the kernel entry at its
+         * higher-half base. The entry stub replaces RSP with the
+         * kernel stack before anything is pushed. */
+        "mov %4, %%rax\n\t"
+        "mov %%rax, %%cr3\n\t"
         "jmp *%3\n\t"
         :
         : "r"(&gdtr), "r"(stack_top - 8),
-          "r"((uint64_t)(uintptr_t)info), "r"(entry)
+          "r"((uint64_t)(uintptr_t)info), "r"(entry),
+          "r"(pml4_phys)
         : "rax", "memory");
     for (;;)
         __asm__ volatile("hlt");
@@ -703,6 +785,16 @@ efi_status_t EFIAPI efi_main(efi_handle_t image_handle,
         fail("AllocatePages for the kernel stack failed", status);
     stack_base = addr;
 
+    /* 4. Hand-off page tables (identity + the kernel image at its
+     * higher-half base). Built now, while boot services can still
+     * allocate; loaded into CR3 only after ExitBootServices. */
+    addr = 0;
+    status = g_bs->allocate_pages(EFI_ALLOCATE_ANY_PAGES, EFI_LOADER_DATA,
+                                  HANDOFF_TABLE_PAGES, &addr);
+    if (EFI_ERROR(status))
+        fail("AllocatePages for the hand-off tables failed", status);
+    build_handoff_tables(&kimg, addr);
+
     rsdp = find_rsdp();
 
     /* LoadOptions (CHAR16, usually the loader's own name/args) ->
@@ -721,7 +813,7 @@ efi_status_t EFIAPI efi_main(efi_handle_t image_handle,
         cmdline_ascii[i] = '\0';
     }
 
-    /* 4-5. Fresh map + build per attempt; exit with its MapKey.
+    /* 5-6. Fresh map + build per attempt; exit with its MapKey.
      * A failed exit leaves boot services alive, so the retry can
      * (and must) redo the whole fetch: the map may have changed. */
     for (attempt = 0; attempt < 2; attempt++) {
@@ -739,8 +831,8 @@ efi_status_t EFIAPI efi_main(efi_handle_t image_handle,
     if (EFI_ERROR(status))
         fail("ExitBootServices failed twice", status);
 
-    /* 6. Gone. */
+    /* 7. Gone. */
     jump_to_kernel(info, stack_base + stack_pages * EFI_PAGE_SIZE,
-                   kimg.entry);
+                   kimg.entry, g_handoff_pml4);
     return EFI_LOAD_ERROR; /* unreachable */
 }
