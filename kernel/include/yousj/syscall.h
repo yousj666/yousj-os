@@ -23,6 +23,7 @@
 #define YOUSJ_SYS_lseek         8
 #define YOUSJ_SYS_poll          7   /* M15 */
 #define YOUSJ_SYS_mmap          9
+#define YOUSJ_SYS_mprotect     10  /* M21 */
 #define YOUSJ_SYS_munmap       11
 #define YOUSJ_SYS_msync        26   /* M14 */
 #define YOUSJ_SYS_select       23   /* M15 */

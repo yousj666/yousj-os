@@ -1817,6 +1817,7 @@ static long sys_brk(uint64_t addr)
 
 #define PROT_READ_K  0x1
 #define PROT_WRITE_K 0x2
+#define PROT_EXEC_K  0x4
 #define MAP_SHARED_K  0x01
 #define MAP_PRIVATE_K 0x02
 #define MAP_ANON_K    0x20
@@ -1967,6 +1968,136 @@ static long sys_mmap(uint64_t addr, uint64_t len, uint64_t prot,
     vma->used = true;
     me->mmap_next = base + npages * YOUSJ_PAGE_SIZE + YOUSJ_PAGE_SIZE;
     return (long)base;
+}
+
+/* --- M21: mprotect -------------------------------------- */
+
+static struct yousj_vma *vma_free_slot(struct task *me)
+{
+    int i;
+    for (i = 0; i < YOUSJ_MAX_VMA; i++)
+        if (!me->vmas[i].used)
+            return &me->vmas[i];
+    return NULL;
+}
+
+/* Re-point every MATERIALIZED page in [lo, hi) at the new
+ * protection. Unmaterialized pages have no PTE to change --
+ * the VMA's prot governs their eventual fault-in. A page
+ * dropping to PROT_NONE keeps its frame: vmm_protect with
+ * no USER bit leaves it present but supervisor-only, so
+ * any user access faults (and the fault path rejects it
+ * against the VMA's prot), while a later re-protect
+ * restores access with the contents intact. */
+static void vma_apply_prot(struct task *me, uint64_t lo,
+                           uint64_t hi, uint32_t prot)
+{
+    uint32_t afl = 0;
+    uint64_t va = lo;
+    if (prot & PROT_READ_K)
+        afl |= YOUSJ_VMM_READ;
+    if (prot & PROT_WRITE_K)
+        afl |= YOUSJ_VMM_WRITE;
+    if (prot & PROT_EXEC_K)
+        afl |= YOUSJ_VMM_EXEC;
+    if (prot != 0)
+        afl |= YOUSJ_VMM_USER;
+    while (va < hi) {
+        uint64_t phys, raw;
+        if (vmm_query_raw(me->mm, va, &phys, &raw) == 0 &&
+            (raw & YOUSJ_PTE_PRESENT)) {
+            uint64_t run = va;
+            while (run < hi) {
+                uint64_t p2, r2;
+                if (vmm_query_raw(me->mm, run, &p2, &r2) != 0 ||
+                    !(r2 & YOUSJ_PTE_PRESENT))
+                    break;
+                run += YOUSJ_PAGE_SIZE;
+            }
+            vmm_protect(me->mm, va, run - va, afl);
+            while (va < run) {
+                vmm_flush_tlb_va(va);
+                va += YOUSJ_PAGE_SIZE;
+            }
+        } else {
+            va += YOUSJ_PAGE_SIZE;
+        }
+    }
+}
+
+static long sys_mprotect(uint64_t addr, uint64_t len,
+                         uint64_t prot)
+{
+    struct task *me = sched_current();
+    uint64_t end, cur;
+    int i;
+
+    if (me->mm == NULL || len == 0 ||
+        (addr & (YOUSJ_PAGE_SIZE - 1)) != 0 ||
+        !user_range_ok(addr, len))
+        return -YOUSJ_EINVAL;
+    prot &= (PROT_READ_K | PROT_WRITE_K | PROT_EXEC_K);
+    len = (len + YOUSJ_PAGE_SIZE - 1) & ~(YOUSJ_PAGE_SIZE - 1ULL);
+    end = addr + len;
+    /* Coverage: every page of the range must belong to a
+     * VMA (Linux: ENOMEM). The ELF image and stacks are not
+     * VMAs here, so protecting them reports ENOMEM. */
+    cur = addr;
+    while (cur < end) {
+        struct yousj_vma *hit = NULL;
+        for (i = 0; i < YOUSJ_MAX_VMA; i++) {
+            struct yousj_vma *v = &me->vmas[i];
+            if (v->used && cur >= v->base &&
+                cur < v->base + v->len) {
+                hit = v;
+                break;
+            }
+        }
+        if (hit == NULL)
+            return -YOUSJ_ENOMEM;
+        cur = hit->base + hit->len;
+    }
+    /* Split at the edges and set the covered prot. */
+    for (i = 0; i < YOUSJ_MAX_VMA; i++) {
+        struct yousj_vma *v = &me->vmas[i];
+        uint64_t vlo, vhi, mlo, mhi;
+        if (!v->used)
+            continue;
+        vlo = v->base;
+        vhi = v->base + v->len;
+        if (addr >= vhi || end <= vlo)
+            continue;
+        mlo = addr > vlo ? addr : vlo;
+        mhi = end < vhi ? end : vhi;
+        if (mhi < vhi) {
+            /* right remainder keeps the old prot */
+            struct yousj_vma *r = vma_free_slot(me);
+            if (r == NULL)
+                return -YOUSJ_ENOMEM;
+            *r = *v;
+            r->base = mhi;
+            r->len = vhi - mhi;
+            r->file_off = v->file_off + (mhi - vlo);
+            if (r->file != NULL)
+                file_get(r->file);
+        }
+        if (mlo > vlo) {
+            /* left remainder keeps the old prot */
+            struct yousj_vma *l = vma_free_slot(me);
+            if (l == NULL)
+                return -YOUSJ_ENOMEM;
+            *l = *v;
+            l->len = mlo - vlo;
+            if (l->file != NULL)
+                file_get(l->file);
+            v->file_off += (mlo - vlo);
+        }
+        v->base = mlo;
+        v->len = mhi - mlo;
+        v->prot = (uint32_t)prot;
+        vma_apply_prot(me, mlo, mhi, (uint32_t)prot);
+    }
+    return 0;
 }
 
 static long sys_munmap(uint64_t addr, uint64_t len)
@@ -2276,6 +2407,8 @@ static long dispatch_inner(struct yousj_syscall_ctx *ctx)
         return sys_mmap(a1, a2, a3, a4, (long)a5, ctx->a6);
     case YOUSJ_SYS_msync:
         return sys_msync(a1, a2, a3);
+    case YOUSJ_SYS_mprotect:
+        return sys_mprotect(a1, a2, a3);
     case YOUSJ_SYS_munmap:
         return sys_munmap(a1, a2);
     case YOUSJ_SYS_brk:

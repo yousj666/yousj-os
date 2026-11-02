@@ -255,8 +255,8 @@ int main(void)
                           (long)(uintptr_t)&mark, 1);
                 sleep_ms(100);
                 sys_call3(SYS_kill, pid, SIGUSR1, 0);
-                sys_call3(SYS_wait4, pid,
-                          (long)(uintptr_t)&status, 0);
+                sys_call4(SYS_wait4, pid,
+                          (long)(uintptr_t)&status, 0, 0);
                 report("eintr", mark == 'R' &&
                        ((status >> 8) & 0xFF) == 42);
             }

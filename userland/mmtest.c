@@ -15,6 +15,7 @@
 #define SYS_open   2
 #define SYS_close  3
 #define SYS_mmap   9
+#define SYS_mprotect 10
 #define SYS_munmap 11
 #define SYS_msync  26
 #define SYS_unlink 87
@@ -41,6 +42,18 @@ static long sys_call3(long nr, long a1, long a2, long a3)
     __asm__ volatile("syscall"
                      : "=a"(ret)
                      : "a"(nr), "D"(a1), "S"(a2), "d"(a3)
+                     : "rcx", "r11", "memory");
+    return ret;
+}
+
+static long sys_call4(long nr, long a1, long a2, long a3, long a4)
+{
+    long ret;
+    register long r10 __asm__("r10") = a4;
+    __asm__ volatile("syscall"
+                     : "=a"(ret)
+                     : "a"(nr), "D"(a1), "S"(a2), "d"(a3),
+                       "r"(r10)
                      : "rcx", "r11", "memory");
     return ret;
 }
@@ -244,7 +257,7 @@ static void t_segv_wild(void)
         *p = 1; /* no VMA covers this: SIGSEGV */
         sys_call3(SYS_exit_group, 99, 0, 0);
     }
-    sys_call3(SYS_wait4, pid, (long)(uintptr_t)&status, 0);
+    sys_call4(SYS_wait4, pid, (long)(uintptr_t)&status, 0, 0);
     report("segv-wild", (status & 0x7F) == 11);
 }
 
@@ -265,11 +278,112 @@ static void t_segv_ro(void)
             m[0] = 'Z'; /* write to a read-only shared page */
             sys_call3(SYS_exit_group, 99, 0, 0);
         }
-        sys_call3(SYS_wait4, pid, (long)(uintptr_t)&status, 0);
+        sys_call4(SYS_wait4, pid, (long)(uintptr_t)&status, 0, 0);
         report("segv-ro", (status & 0x7F) == 11);
     }
     sys_call3(SYS_close, fd, 0, 0);
     sys_call3(SYS_unlink, (long)(uintptr_t)"/mm-ro.bin", 0, 0);
+}
+
+static void t_mprotect_ro(void)
+{
+    char *m = (char *)(uintptr_t)sys_mmap(
+        NULL, 8192, PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANON, -1, 0);
+    long rc;
+    if ((long)(uintptr_t)m < 0) {
+        report("mprotect-ro", 0);
+        return;
+    }
+    m[0] = 'A';
+    m[4096] = 'B';
+    rc = sys_call3(SYS_mprotect, (long)(uintptr_t)m, 8192,
+                   PROT_READ);
+    {
+        long pid = sys_call3(SYS_clone, 17, 0, 0);
+        int status = 0;
+        if (pid == 0) {
+            m[0] = 'Z'; /* write to a now-read-only page */
+            sys_call3(SYS_exit_group, 99, 0, 0);
+        }
+        sys_call4(SYS_wait4, pid, (long)(uintptr_t)&status, 0, 0);
+        rc = rc == 0 && m[0] == 'A' && m[4096] == 'B' &&
+             (status & 0x7F) == 11 ? 0 : -1;
+    }
+    /* and back to writable */
+    if (sys_call3(SYS_mprotect, (long)(uintptr_t)m, 8192,
+                  PROT_READ | PROT_WRITE) == 0)
+        m[0] = 'C';
+    report("mprotect-ro", rc == 0 && m[0] == 'C');
+    sys_call3(SYS_munmap, (long)(uintptr_t)m, 8192, 0);
+}
+
+static void t_mprotect_mid(void)
+{
+    char *m = (char *)(uintptr_t)sys_mmap(
+        NULL, 12288, PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANON, -1, 0);
+    volatile char *vm = (volatile char *)m;
+    int ok;
+    if ((long)(uintptr_t)m < 0) {
+        report("mprotect-mid", 0);
+        return;
+    }
+    vm[0] = 'a';
+    vm[4096] = 'b';
+    vm[8192] = 'c';
+    ok = sys_call3(SYS_mprotect, (long)(uintptr_t)(m + 4096),
+                   4096, 0 /* PROT_NONE */) == 0;
+    ok = ok && vm[0] == 'a' && vm[8192] == 'c';
+    {
+        long pid = sys_call3(SYS_clone, 17, 0, 0);
+        int status = 0;
+        if (pid == 0) {
+            (void)vm[4096]; /* read a PROT_NONE page */
+            sys_call3(SYS_exit_group, 99, 0, 0);
+        }
+        sys_call4(SYS_wait4, pid, (long)(uintptr_t)&status, 0, 0);
+        ok = ok && (status & 0x7F) == 11;
+    }
+    /* re-protect: the contents must have survived */
+    ok = ok && sys_call3(SYS_mprotect,
+                         (long)(uintptr_t)(m + 4096), 4096,
+                         PROT_READ | PROT_WRITE) == 0;
+    ok = ok && vm[4096] == 'b';
+    /* one munmap across the split pieces */
+    ok = ok && sys_call3(SYS_munmap, (long)(uintptr_t)m,
+                         12288, 0) == 0;
+    report("mprotect-mid", ok);
+}
+
+static void t_mprotect_err(void)
+{
+    char *a = (char *)(uintptr_t)sys_mmap(
+        NULL, 4096, PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANON, -1, 0);
+    char *b = (char *)(uintptr_t)sys_mmap(
+        NULL, 4096, PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANON, -1, 0);
+    int ok = (long)(uintptr_t)a >= 0 &&
+             (long)(uintptr_t)b >= 0;
+    if (ok) {
+        /* the allocator leaves a one-page gap between VMAs:
+         * protecting the gap is ENOMEM */
+        char *gap = a + 4096;
+        if (b == a + 8192)
+            ok = sys_call3(SYS_mprotect, (long)(uintptr_t)gap,
+                           4096, PROT_READ) == -12;
+        else
+            ok = 0;
+        ok = ok && sys_call3(SYS_mprotect,
+                             (long)(uintptr_t)(a + 1), 4096,
+                             PROT_READ) == -22;
+        ok = ok && sys_call3(SYS_mprotect, (long)(uintptr_t)a,
+                             0, PROT_READ) == -22;
+        sys_call3(SYS_munmap, (long)(uintptr_t)a, 4096, 0);
+        sys_call3(SYS_munmap, (long)(uintptr_t)b, 4096, 0);
+    }
+    report("mprotect-err", ok);
 }
 
 int main(void)
@@ -368,6 +482,9 @@ int main(void)
     t_cow();
     t_segv_wild();
     t_segv_ro();
+    t_mprotect_ro();
+    t_mprotect_mid();
+    t_mprotect_err();
     sys_call3(SYS_unlink, (long)(uintptr_t)"/mm1.txt", 0, 0);
 
     out("MMTEST DONE\n");

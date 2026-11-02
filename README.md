@@ -310,7 +310,29 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   控制台字符设备、AT_EMPTY_PATH）在 ramfs 与 yfs 两后
   端各全过（fs 套件两轮＋disk 套件 p2），其余各链不
   回归。
-- ⏳ 下一步候选：mprotect、brk 按需化。
+- ✅ 内存 M21（2026-11-02）：mprotect(10)——覆盖检查
+  （区间每页必须属于某个 VMA，否则 ENOMEM；ELF 映像与
+  栈不是 VMA，对其 mprotect 报 ENOMEM）、边缘 VMA 分裂
+  （文件映射的 file_off 随分裂平移、文件引用逐片持有；
+  VMA 总数仍上限 16，分裂无槽位时 ENOMEM）、已物化页
+  同步改 PTE 并逐页刷 TLB。PROT_NONE 不丢内容：页帧保
+  留、仅清 USER 位成主管态，访问照样触发段错误，日后
+  恢复保护时内容完好。munmap 本就支持整段跨多 VMA 释
+  放，分裂后一次 munmap 原始区间照常工作。相邻同保护
+  VMA 不合并（如实记档）。验收：mmtest 新增三场景
+  （整段改只读后子进程写触发 SEGV＋改回可写、中间页
+  NONE 隔离＋内容保全＋跨片 munmap、间隙/未对齐/零长
+  错误码）两轮全过，其余十二链不回归。
+  排查中挖出一个既有隐患（如实记档，留待异常表恢复机
+  制专项）：内核向用户内存写数据是 user_range_ok 后直
+  接解引用，若目标页被 mprotect 成只读（或 M17 的只读
+  文件页），内核态写会触发保护故障并停机——Linux 靠
+  copy_to_user 异常恢复返回 EFAULT，我们尚无此机制；
+  规范调用方（rusage 传 NULL 等）不受影响，本轮已把
+  测试程序里经三参 helper 调 wait4（rusage 寄存器为垃
+  圾值）的旧写法全部改为四参显式传 0。
+- ⏳ 下一步候选：brk 按需化、RTC 时钟（stat 时间戳与
+  文件时间）。
 
 ## 从零构建
 

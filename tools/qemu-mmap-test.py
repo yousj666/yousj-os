@@ -20,7 +20,8 @@ DISK = os.path.join(REPO, 'build', 'mmap-test.img')
 SOCK = '/tmp/serM14'
 SCENARIOS = ['anon', 'priv-read', 'priv-write', 'shared-ramfs',
              'shared-yfs', 'offset',
-             'lazy', 'cow-flip', 'segv-wild', 'segv-ro']
+             'lazy', 'cow-flip', 'segv-wild', 'segv-ro',
+             'mprotect-ro', 'mprotect-mid', 'mprotect-err']
 fails = []
 
 
