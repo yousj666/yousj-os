@@ -533,9 +533,21 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   验收：pidtest 加 environ-self（shell 以空 env
   启动故自读为 0 字节）与 environ-child（子进
   程 exec 带 K1=V1/K2=V2、父逐字节核对）。
+- ✅ /proc/<pid>/cwd 与 exe M35（2026-11-03）：
+  execve 提交点留存解析后的绝对路径
+  （exe_path）；两项为魔法链接——readlink 返回
+  目标路径、lstat 报链接自身（0120777）、stat
+  跟随到目标、open 打开目标本身；其余 /proc
+  项 readlink 改回 EINVAL（此前误报 ENOENT）。
+  从未 exec 的任务 exe 为空、链接不存在。顺手
+  修 stat 尺寸 scratch 288→640（M34 遗漏、
+  environ 大于 288 时 st_size 会被截断）。
+  验收：pidtest 加 cwd-exe 场景（exe/cwd 读
+  链、lstat/stat 分工、open cwd 列目录、生成
+  文件 readlink 应 EINVAL、dents 类型 DT_LNK）。
 - ⏳ 下一步候选：getdents64 的 d_off 语义细
   化、硬链接（目录项重构）、fchownat/chmod
-  家族、/proc/<pid>/cwd 与 exe 链接项。
+  家族、/proc/<pid>/maps 示意。
 
 ## 从零构建
 

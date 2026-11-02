@@ -28,6 +28,9 @@
 #define SYS_open 2
 #define SYS_close 3
 #define SYS_stat 4
+#define SYS_lstat 6
+#define SYS_chdir 80
+#define SYS_readlink 89
 #define SYS_nanosleep 35
 #define SYS_getpid 39
 #define SYS_clone 56
@@ -385,6 +388,8 @@ int main(int argc, char **argv)
                    dent_type(db, got, "stat") == 8 &&
                    dent_type(db, got, "cmdline") == 8 &&
                    dent_type(db, got, "environ") == 8 &&
+                   dent_type(db, got, "cwd") == 10 &&
+                   dent_type(db, got, "exe") == 10 &&
                    dent_type(db, got, ".") == 4);
         }
     }
@@ -483,6 +488,61 @@ int main(int argc, char **argv)
             sys_call4(SYS_wait4, c, (long)(uintptr_t)&st, 0, 0);
         }
         report("environ-child", ok);
+    }
+
+    /* M35: cwd and exe are magic links. */
+    {
+        char lb[128];
+        struct st sb;
+        long ln = sys_call3(SYS_readlink,
+                            (long)(uintptr_t)"/proc/self/exe",
+                            (long)(uintptr_t)lb, sizeof(lb));
+        int ok = ln == 12 && lb[0] == '/' && lb[5] == 'p' &&
+                 lb[11] == 't';
+        sys_call1(SYS_chdir, (long)(uintptr_t)"/bin");
+        ln = sys_call3(SYS_readlink,
+                       (long)(uintptr_t)"/proc/self/cwd",
+                       (long)(uintptr_t)lb, sizeof(lb));
+        ok = ok && ln == 4 && lb[0] == '/' && lb[1] == 'b' &&
+             lb[2] == 'i' && lb[3] == 'n';
+        ok = ok &&
+            sys_call3(SYS_lstat,
+                      (long)(uintptr_t)"/proc/self/cwd",
+                      (long)(uintptr_t)&sb, 0) == 0 &&
+            (sb.mode & 0170000) == 0120000;
+        ok = ok &&
+            sys_call3(SYS_stat,
+                      (long)(uintptr_t)"/proc/self/cwd",
+                      (long)(uintptr_t)&sb, 0) == 0 &&
+            (sb.mode & 0170000) == 0040000;
+        ok = ok &&
+            sys_call3(SYS_stat,
+                      (long)(uintptr_t)"/proc/self/exe",
+                      (long)(uintptr_t)&sb, 0) == 0 &&
+            (sb.mode & 0170000) == 0100000;
+        /* opening cwd opens the directory itself */
+        {
+            char db[512];
+            long fd = sys_call3(SYS_open,
+                                (long)(uintptr_t)"/proc/self/cwd",
+                                0, 0);
+            long got = -1;
+            if (fd >= 0) {
+                got = sys_call3(SYS_getdents64, fd,
+                                (long)(uintptr_t)db,
+                                sizeof(db));
+                sys_call1(SYS_close, fd);
+            }
+            ok = ok && got > 0 &&
+                 dent_type(db, got, "pidtest") == 8;
+        }
+        /* a generated file is not a link */
+        ok = ok && sys_call3(SYS_readlink,
+                             (long)(uintptr_t)"/proc/self/status",
+                             (long)(uintptr_t)lb,
+                             sizeof(lb)) == -22;
+        sys_call1(SYS_chdir, (long)(uintptr_t)"/");
+        report("cwd-exe", ok);
     }
 
     out("PIDTEST DONE\n");

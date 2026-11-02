@@ -896,6 +896,8 @@ static long yfs_open_path_fs(const char *rel, long flags,
 #define PROC_ID_PSTAT   6 /* M28 */
 #define PROC_ID_PCMDLINE 7 /* M31 */
 #define PROC_ID_PENVIRON 8 /* M34 */
+#define PROC_ID_PCWD     9 /* M35 */
+#define PROC_ID_PEXE     10 /* M35 */
 static const char *const g_proc_names[3] = {
     "uptime", "meminfo", "version"
 };
@@ -928,6 +930,10 @@ static uint64_t proc_ino_for(int id, uint32_t pid)
         return 10000 + (uint64_t)pid * 8 + 3;
     if (id == PROC_ID_PENVIRON)
         return 10000 + (uint64_t)pid * 8 + 4;
+    if (id == PROC_ID_PCWD)
+        return 10000 + (uint64_t)pid * 8 + 5;
+    if (id == PROC_ID_PEXE)
+        return 10000 + (uint64_t)pid * 8 + 6;
     return 9000 + (uint64_t)id;
 }
 
@@ -988,9 +994,43 @@ static int proc_find(const char *rel, uint32_t *pid_out)
                 leaf[4] == 'r' && leaf[5] == 'o' &&
                 leaf[6] == 'n' && leaf[7] == '\0')
                 return PROC_ID_PENVIRON;
+            if (leaf[0] == 'c' && leaf[1] == 'w' &&
+                leaf[2] == 'd' && leaf[3] == '\0')
+                return PROC_ID_PCWD;
+            if (leaf[0] == 'e' && leaf[1] == 'x' &&
+                leaf[2] == 'e' && leaf[3] == '\0')
+                return PROC_ID_PEXE;
         }
         return -1;
     }
+}
+
+/* M35: cwd and exe are magic links, not generated
+ * files. Resolve one to its target path; -1 when the
+ * task is gone or (for exe) never exec'd. The cwd of a
+ * task that never chdir'd is "/". */
+static long proc_link_target(int id, uint32_t pid,
+                             char *buf, uint64_t cap)
+{
+    struct task *t = sched_find_task((int)pid);
+    const char *src;
+    uint64_t i = 0;
+    if (t == NULL)
+        return -1;
+    if (id == PROC_ID_PCWD)
+        src = t->cwd_path[0] != '\0' ? t->cwd_path : "/";
+    else if (id == PROC_ID_PEXE) {
+        if (t->exe_path[0] == '\0')
+            return -1;
+        src = t->exe_path;
+    } else
+        return -1;
+    while (src[i] != '\0' && i + 1 < cap) {
+        buf[i] = src[i];
+        i++;
+    }
+    buf[i] = '\0';
+    return (long)i;
 }
 
 struct pbuf {
@@ -1090,7 +1130,7 @@ static uint32_t proc_generate(int id, uint32_t pid, char *buf,
         pb_puts(&b, " kB\n");
         break;
     case PROC_ID_VERSION:
-        pb_puts(&b, "Yousj OS version 0.9 (M34) x86_64 #1\n");
+        pb_puts(&b, "Yousj OS version 0.9 (M35) x86_64 #1\n");
         break;
     case PROC_ID_PCMDLINE: {
         /* Raw bytes, not text: the argv is NUL-joined, so
@@ -1212,7 +1252,24 @@ long fs_open_path(const char *path, long flags,
                   struct yousj_file **out)
 {
     char resolved[PATH_MAX_LEN + 1];
-    long rc = fs_resolve_links(path, resolved, true);
+    long rc;
+    /* M35: opening a magic link opens its target. */
+    if (is_proc_path(path)) {
+        const char *rel = path + 5;
+        uint32_t pid = 0;
+        int id;
+        if (rel[0] == '/')
+            rel++;
+        id = proc_find(rel, &pid);
+        if (id == PROC_ID_PCWD || id == PROC_ID_PEXE) {
+            char target[PATH_MAX_LEN + 1];
+            if (proc_link_target(id, pid, target,
+                                  sizeof(target)) < 0)
+                return -YOUSJ_ENOENT_L;
+            return fs_open_path(target, flags, out);
+        }
+    }
+    rc = fs_resolve_links(path, resolved, true);
     if (rc != 0)
         return rc;
     path = resolved;
@@ -1424,6 +1481,31 @@ long fs_readlink_path(const char *path, char *buf, uint64_t cap)
     long rc = fs_resolve_links(path, resolved, false);
     if (rc != 0)
         return rc;
+    /* M35: /proc magic links; every other /proc entry is
+     * not a link at all (EINVAL, as on Linux). */
+    if (is_proc_path(resolved)) {
+        const char *rel = resolved + 5;
+        uint32_t pid = 0;
+        int id;
+        if (rel[0] == '/')
+            rel++;
+        id = proc_find(rel, &pid);
+        if (id < 0)
+            return -YOUSJ_ENOENT_L;
+        if (id == PROC_ID_PCWD || id == PROC_ID_PEXE) {
+            char target[PATH_MAX_LEN + 1];
+            long tl = proc_link_target(id, pid, target,
+                                        sizeof(target));
+            uint64_t i, n;
+            if (tl < 0)
+                return -YOUSJ_ENOENT_L;
+            n = (uint64_t)tl < cap ? (uint64_t)tl : cap;
+            for (i = 0; i < n; i++)
+                buf[i] = target[i];
+            return (long)n;
+        }
+        return -YOUSJ_EINVAL;
+    }
     if (is_data_path(resolved)) {
         long ino = yfs_lookup(data_rel(resolved));
         if (ino < 0)
@@ -1559,6 +1641,24 @@ bool fs_path_stat2(const char *path, bool follow,
         id = proc_find(rel, &pid);
         if (id < 0)
             return false;
+        /* M35: the magic links either report themselves
+         * (lstat) or the target's stat (follow). */
+        if (id == PROC_ID_PCWD || id == PROC_ID_PEXE) {
+            char target[PATH_MAX_LEN + 1];
+            long tl = proc_link_target(id, pid, target,
+                                        sizeof(target));
+            if (tl < 0)
+                return false;
+            if (follow)
+                return fs_path_stat2(target, true, info);
+            info->mtime = (uint32_t)yousj_now_unix();
+            info->atime = info->mtime;
+            info->ctime = info->mtime;
+            info->ino = proc_ino_for(id, pid);
+            info->mode = S_IFLNK_K | 0777u;
+            info->size = (uint32_t)tl;
+            return true;
+        }
         info->mtime = (uint32_t)yousj_now_unix();
         info->atime = info->mtime;
         info->ctime = info->mtime;
@@ -1567,7 +1667,7 @@ bool fs_path_stat2(const char *path, bool follow,
             info->mode = S_IFDIR_K | 0555u;
             info->size = 0;
         } else {
-            char scratch[288];
+            char scratch[640]; /* M34/35: fit a full environ */
             info->mode = S_IFREG_K | 0444u;
             info->size = proc_generate(id, pid, scratch,
                                        sizeof(scratch));
@@ -1952,9 +2052,9 @@ long file_getdents(struct yousj_file *f, uint8_t *buf, uint64_t count)
         static const char *const root_names[5] = {
             ".", "..", "uptime", "meminfo", "version"
         };
-        static const char *const pid_names[6] = {
+        static const char *const pid_names[8] = {
             ".", "..", "status", "stat", "cmdline",
-            "environ"
+            "environ", "cwd", "exe"
         };
         uint64_t tids[YOUSJ_SCHED_MAX_TASKS];
         uint32_t ntids = 0;
@@ -1966,7 +2066,7 @@ long file_getdents(struct yousj_file *f, uint8_t *buf, uint64_t count)
                                     YOUSJ_SCHED_MAX_TASKS);
             total = 5 + ntids;
         } else {
-            total = 6;
+            total = 8;
         }
         for (i = f->offset; i < total; i++) {
             const char *nm;
@@ -1977,7 +2077,9 @@ long file_getdents(struct yousj_file *f, uint8_t *buf, uint64_t count)
             uint8_t *rec;
             if (f->proc_id == PROC_ID_PIDDIR) {
                 nm = pid_names[i];
-                dtype = i <= 1 ? YOUSJ_DT_DIR : YOUSJ_DT_REG;
+                dtype = i <= 1 ? YOUSJ_DT_DIR
+                        : i >= 6 ? 10 /* DT_LNK: cwd/exe */
+                        : YOUSJ_DT_REG;
                 if (i == 0)
                     ino = proc_ino_for(PROC_ID_PIDDIR,
                                        f->proc_pid);
@@ -1992,8 +2094,14 @@ long file_getdents(struct yousj_file *f, uint8_t *buf, uint64_t count)
                 else if (i == 4)
                     ino = proc_ino_for(PROC_ID_PCMDLINE,
                                        f->proc_pid);
-                else
+                else if (i == 5)
                     ino = proc_ino_for(PROC_ID_PENVIRON,
+                                       f->proc_pid);
+                else if (i == 6)
+                    ino = proc_ino_for(PROC_ID_PCWD,
+                                       f->proc_pid);
+                else
+                    ino = proc_ino_for(PROC_ID_PEXE,
                                        f->proc_pid);
             } else if (i < 5) {
                 nm = root_names[i];

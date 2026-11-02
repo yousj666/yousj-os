@@ -604,6 +604,7 @@ static long sys_execve(uint64_t path_ptr, uint64_t argv_ptr,
     static char env_store[4][128];
     static const char *argv_k[9];
     static const char *envp_k[5];
+    static char exec_resolved[256]; /* M35: for me->exe_path */
     uint64_t stage_phys = 0, stage_len = 0, stage_pages = 0;
     struct vmm_space *space, *old;
     uint64_t entry = 0, img_brk = 0, heap_base, new_sp = 0;
@@ -623,6 +624,13 @@ static long sys_execve(uint64_t path_ptr, uint64_t argv_ptr,
         long got;
 
         resolve_path(me, path_buf, resolved);
+        {
+            uint64_t i;
+            for (i = 0; i < sizeof(exec_resolved) - 1 &&
+                        resolved[i] != '\0'; i++)
+                exec_resolved[i] = resolved[i];
+            exec_resolved[i] = '\0';
+        }
         /* Either backend: ramfs or the /data disk (M12). */
         if (!fs_path_stat(resolved, &is_dir, &len))
             return -YOUSJ_ENOENT;
@@ -780,6 +788,15 @@ static long sys_execve(uint64_t path_ptr, uint64_t argv_ptr,
                 break;
         }
         me->env_len = w;
+    }
+    /* M35: retain the resolved exec path for
+     * /proc/<pid>/exe. */
+    {
+        uint32_t i;
+        for (i = 0; i < sizeof(me->exe_path) - 1 &&
+                    exec_resolved[i] != '\0'; i++)
+            me->exe_path[i] = exec_resolved[i];
+        me->exe_path[i] = '\0';
     }
     /* M14: release the old image's VMAs (shared file regions
      * write back against the old space before it dies). */

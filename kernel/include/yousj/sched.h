@@ -51,6 +51,8 @@ struct task {
     uint64_t        parent_tid;
     enum task_state state;
     char            name[16];
+    char            exe_path[256]; /* M35: resolved exec path,
+                                      "" until the first exec */
     char            env[512];     /* M34: exec envp joined
                                      with NULs, for /proc */
     uint32_t        env_len;
