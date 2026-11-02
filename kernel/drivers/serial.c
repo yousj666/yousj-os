@@ -81,3 +81,11 @@ void serial_put_hex64(uint64_t v)
     for (shift = 60; shift >= 0; shift -= 4)
         serial_putc(digits[(v >> shift) & 0xF]);
 }
+
+int serial_getc_nonblock(void)
+{
+    /* LSR (offset 5) bit 0 = data ready in the receive register. */
+    if ((inb(SERIAL_PORT + 5) & 0x01) == 0)
+        return -1;
+    return (int)inb(SERIAL_PORT + 0);
+}

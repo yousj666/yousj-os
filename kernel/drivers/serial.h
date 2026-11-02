@@ -48,4 +48,11 @@ void serial_puts(const char *s);
 void serial_put_u64(uint64_t v);
 void serial_put_hex64(uint64_t v);
 
+/* Non-blocking receive: returns the next byte (0..255) when the
+ * receiver data register holds one, or -1 when the line is quiet.
+ * Polled counterpart of serial_putc(); the console-input path
+ * (sys_read on fd 0) sleeps between polls in the caller. Added for
+ * milestone M4 (init's command loop). */
+int serial_getc_nonblock(void);
+
 #endif /* YOUSJ_DRIVERS_SERIAL_H */

@@ -340,6 +340,167 @@ uint64_t sched_count_state(enum task_state state)
     return n;
 }
 
+struct task *sched_find_task(int tid)
+{
+    uint64_t i;
+    if (tid < 0)
+        return NULL;
+    for (i = 0; i < YOUSJ_SCHED_MAX_TASKS; i++) {
+        if (g_tasks[i].in_use && g_tasks[i].tid == (uint64_t)tid)
+            return &g_tasks[i];
+    }
+    return NULL;
+}
+
+/* Remove t from the run queue if present (READY tasks only are
+ * ever queued). */
+static void rq_remove(struct task *t)
+{
+    struct task *prev = NULL, *cur = g_rq_head;
+    while (cur != NULL) {
+        if (cur == t) {
+            if (prev != NULL)
+                prev->rq_next = cur->rq_next;
+            else
+                g_rq_head = cur->rq_next;
+            if (g_rq_tail == cur)
+                g_rq_tail = prev;
+            cur->rq_next = NULL;
+            return;
+        }
+        prev = cur;
+        cur = cur->rq_next;
+    }
+}
+
+int sched_kill_task(struct task *victim)
+{
+    struct task *prev = NULL, *cur;
+#ifdef YOUSJ_KERNEL
+    uint64_t flags;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(flags));
+#endif
+    if (victim == NULL || victim == g_idle || victim == g_current ||
+        !victim->in_use ||
+        (victim->state != TASK_READY && victim->state != TASK_BLOCKED)) {
+#ifdef YOUSJ_KERNEL
+        __asm__ volatile("push %0; popfq" : : "r"(flags) : "memory");
+#endif
+        return -1;
+    }
+    if (victim->state == TASK_READY)
+        rq_remove(victim);
+    /* Unlink from the all-tasks list; the tick's wake scan walks
+     * the pool array and skips !in_use slots, so clearing in_use
+     * also cancels any pending wake-up. */
+    cur = g_all_head;
+    while (cur != NULL) {
+        if (cur == victim) {
+            if (prev != NULL)
+                prev->all_next = cur->all_next;
+            else
+                g_all_head = cur->all_next;
+            break;
+        }
+        prev = cur;
+        cur = cur->all_next;
+    }
+    victim->all_next = NULL;
+    victim->wake_tick = 0;
+    victim->state = TASK_ZOMBIE; /* for any stale reader, briefly */
+    victim->in_use = false;
+#ifdef YOUSJ_KERNEL
+    __asm__ volatile("push %0; popfq" : : "r"(flags) : "memory");
+#endif
+    return 0;
+}
+
+/* --- task snapshot (native ps) -------------------------------------- */
+
+struct snap_writer {
+    char    *buf;
+    uint64_t cap;
+    uint64_t len;
+};
+
+static void snap_putc(struct snap_writer *w, char c)
+{
+    if (w->len < w->cap)
+        w->buf[w->len] = c;
+    w->len++;
+}
+
+static void snap_puts(struct snap_writer *w, const char *s)
+{
+    while (*s != '\0')
+        snap_putc(w, *s++);
+}
+
+static void snap_put_u64(struct snap_writer *w, uint64_t v)
+{
+    char tmp[20];
+    int n = 0;
+    if (v == 0) {
+        snap_putc(w, '0');
+        return;
+    }
+    while (v > 0) {
+        tmp[n++] = (char)('0' + (v % 10));
+        v /= 10;
+    }
+    while (n > 0)
+        snap_putc(w, tmp[--n]);
+}
+
+static char snap_state_char(enum task_state s)
+{
+    switch (s) {
+    case TASK_RUNNING: return 'R';
+    case TASK_READY:   return 'r';
+    case TASK_BLOCKED: return 'S';
+    case TASK_ZOMBIE:  return 'Z';
+    case TASK_DEAD:    return 'D';
+    }
+    return '?';
+}
+
+uint64_t sched_snapshot_tasks(char *buf, uint64_t cap)
+{
+    struct snap_writer w;
+    uint64_t want;
+#ifdef YOUSJ_KERNEL
+    uint64_t flags;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(flags));
+#endif
+    w.buf = buf;
+    w.cap = cap;
+    w.len = 0;
+    /* Ascending tid order: tids are handed out monotonically, and
+     * the pool is small, so a linear find per tid is fine. */
+    for (want = 0; want < g_next_tid; want++) {
+        struct task *t = NULL;
+        uint64_t i;
+        for (i = 0; i < YOUSJ_SCHED_MAX_TASKS; i++) {
+            if (g_tasks[i].in_use && (uint64_t)g_tasks[i].tid == want) {
+                t = &g_tasks[i];
+                break;
+            }
+        }
+        if (t == NULL)
+            continue;
+        snap_put_u64(&w, (uint64_t)t->tid);
+        snap_putc(&w, ' ');
+        snap_putc(&w, snap_state_char(t->state));
+        snap_putc(&w, ' ');
+        snap_puts(&w, t->name);
+        snap_putc(&w, '\n');
+    }
+#ifdef YOUSJ_KERNEL
+    __asm__ volatile("push %0; popfq" : : "r"(flags) : "memory");
+#endif
+    return w.len < w.cap ? w.len : w.cap;
+}
+
 /* --- M2: tick, preemption, sleeping -------------------------------------- */
 
 static uint64_t g_ticks;

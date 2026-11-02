@@ -45,7 +45,15 @@
 #define YOUSJ_SYS_arch_prctl  158
 
 /* Yousj-native calls live far above the Linux-compatible range so the
- * two namespaces can never collide. None are in the server-first scope. */
+ * two namespaces can never collide. */
 #define YOUSJ_SYS_NATIVE_BASE 0x1000
+
+/* ps_snapshot(buf, len) -> bytes written: one "<tid> <state> <name>"
+ * line per task (state: R running, r ready, S sleeping, Z zombie).
+ * Linux has no such syscall (the information lives in /proc there);
+ * until Yousj has a VFS, this native call is how init's `ps`
+ * built-in sees the task table. Deliberately text, deliberately
+ * simple; it goes away when /proc arrives. */
+#define YOUSJ_SYS_NATIVE_PS_SNAPSHOT (YOUSJ_SYS_NATIVE_BASE + 0)
 
 #endif /* YOUSJ_SYSCALL_H */

@@ -141,8 +141,21 @@ void exception_handler(uint64_t *stack)
     serial_put_hex64(err);
     serial_puts(" at RIP=");
     serial_put_hex64(rip);
+    if (vec_has_errcode(vec)) {
+        const uint64_t *tgt = (const uint64_t *)(uintptr_t)stack[5];
+        struct task *cur = sched_current();
+        serial_puts(" frame cs=");
+        serial_put_hex64(stack[3]);
+        serial_puts(" rsp=");
+        serial_put_hex64(stack[5]);
+        serial_puts(" ss=");
+        serial_put_hex64(stack[6]);
+        serial_puts(" cur=");
+        serial_puts(cur != NULL ? cur->name : "?");
+    }
     serial_puts(" -- halting\n");
     for (;;) {
         __asm__ volatile("cli; hlt");
     }
 }
+

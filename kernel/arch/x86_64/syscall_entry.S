@@ -35,6 +35,8 @@ syscall_entry:
     mov %rsp, %gs:8
     mov %gs:0, %rsp
 
+
+
     push %r11               /* user RFLAGS */
     push %rcx               /* user RIP */
     push %rdi
@@ -56,7 +58,11 @@ syscall_entry:
     call yousj_syscall_dispatch
     cli
 
-    add $16, %rsp           /* drop a6 slot + pad */
+    pop %r9                 /* restore the user's r9 -- it is a
+                             * normal register (arg 6), NOT a
+                             * scratch: user code may keep live
+                             * state in it across a syscall */
+    add $8, %rsp            /* drop the alignment pad */
     pop %r8
     pop %r10
     pop %rdx

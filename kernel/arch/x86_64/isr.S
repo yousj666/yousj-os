@@ -56,6 +56,34 @@ irq0_stub:
     push %r10
     push %r11
     call irq0_handler
+    /* Canonicalize a ring-3 frame's selectors before iretq.
+     * QEMU's sysret derives CS/SS from the wrong STAR field,
+     * so a task resumed from a syscall runs in ring 3 with
+     * CS=0x1B / SS=0x13 (fabricated caches) and a timer frame
+     * captured there fails iretq's GDT checks. If the frame's
+     * RIP is a user address, rewrite CS/SS to the canonical
+     * user pair; on silicon the frame already holds them and
+     * this is a no-op. Kernel frames are never touched. The
+     * hardware frame lies above the 9 saved registers: RIP at
+     * +72, CS at +80, SS at +104 from here. */
+    movq $0x8000000000, %rax
+    cmpq %rax, 72(%rsp)
+    jb 1f
+    movq $0x23, 80(%rsp)
+    movq $0x1B, 104(%rsp)
+    jmp 2f
+1:
+    /* Kernel frame: heal QEMU's swapped-field syscall artifact
+     * (CS=0x10 / SS=0x18, from its [47:32] entry load) to the
+     * canonical kernel pair. On silicon a kernel frame already
+     * holds 0x08/0x10 and this never triggers. */
+    cmpq $0x10, 80(%rsp)
+    jne 2f
+    cmpq $0x18, 104(%rsp)
+    jne 2f
+    movq $0x08, 80(%rsp)
+    movq $0x10, 104(%rsp)
+2:
     pop %r11
     pop %r10
     pop %r9
@@ -80,3 +108,4 @@ exc_table:
     .endr
 
     .section .note.GNU-stack, "", @progbits
+

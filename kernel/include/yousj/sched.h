@@ -55,6 +55,12 @@ struct task {
     int             exit_status;
     uint64_t        user_ip;      /* user tasks: first ring-3 RIP */
     uint64_t        user_sp;      /* user tasks: initial ring-3 RSP */
+    uint64_t        brk_start;    /* user tasks: heap base (ELF M4) */
+    uint64_t        brk_end;      /* user tasks: current break */
+    uint64_t        fs_base;      /* user tasks: TLS FS base
+                                     (arch_prctl ARCH_SET_FS) */
+    uint64_t        mmap_next;    /* user tasks: next free VA for
+                                     anonymous mmap (bump pointer) */
     uint64_t        wake_tick;    /* nonzero while sleeping: tick at
                                      which sched_tick() wakes the
                                      task (M2). Cleared on wake. */
@@ -114,6 +120,27 @@ void sched_exit_current(int status);
 
 /* Count tasks currently in the given state (pool scan; M0/M1 scale). */
 uint64_t sched_count_state(enum task_state state);
+
+/* Find a live task by tid (NULL when absent). The returned pointer
+ * is invalidated if the task exits or is killed. */
+struct task *sched_find_task(int tid);
+
+/* Stage-1 kill ( backs the kill syscall and the M4 acceptance
+ * scenario): forcibly retire a READY or BLOCKED task -- it is
+ * unlinked from every scheduler structure and its pool slot is
+ * freed, so it vanishes completely (no zombie residue: kernel-side
+ * demo tasks have no parent to reap them). Refuses (-1) the idle
+ * task, the caller itself, RUNNING and ZOMBIE tasks. The victim's
+ * kernel stack pages are deliberately leaked for now (no safe
+ * reclamation while ITS context may sit in IRQ frames); callers
+ * must not hold pointers to the victim afterwards. */
+int sched_kill_task(struct task *victim);
+
+/* Format a one-line-per-task snapshot ("<tid> <state> <name>\n",
+ * state in {R running, r ready, S sleeping, Z zombie}) into buf,
+ * in ascending tid order, truncating at cap bytes; returns the
+ * number of bytes written. Backs the native ps syscall. */
+uint64_t sched_snapshot_tasks(char *buf, uint64_t cap);
 
 /* --- M2: tick-driven preemption and sleeping -------------------------
  * sched_tick() is called from the timer IRQ handler (100 Hz) with
