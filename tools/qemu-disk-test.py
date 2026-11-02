@@ -149,9 +149,9 @@ check('p2 timetest on yfs (all six, no FAIL)',
       'timetest: clocks PASS' in seg and
       'FAIL' not in seg)
 sess.buf = b''
-ok = sess.run_expect('utimetest /data/ut-file alias', 'UTIMETEST DONE', 60)
+ok = sess.run_expect('utimetest /data/ut-file v4', 'UTIMETEST DONE', 60)
 seg = sess.buf.decode(errors='replace')
-check('p2 utimetest on yfs (alias mode, no FAIL)',
+check('p2 utimetest on yfs (v4 mode, no FAIL)',
       ok and 'utimetest: set-explicit PASS' in seg and
       'utimetest: errors PASS' in seg and
       'FAIL' not in seg)
@@ -195,8 +195,10 @@ qemu.wait()
 s.close()
 
 # ---------- M19: journal must be clear after clean ops ----
+# (M29: the journal header lives at sector 41 in format v4;
+# it was sector 25 in v3.)
 with open(DISK, 'rb') as f:
-    f.seek(25 * 512)
+    f.seek(41 * 512)
     jhdr = f.read(512)
 check('jrnl header present after p3',
       jhdr[0:8] == b'YOUSJJR1')

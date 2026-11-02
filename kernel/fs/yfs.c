@@ -22,14 +22,16 @@
 #define SB_SECTOR       0
 #define INODE_SECTOR0   1
 #define INODE_COUNT     128
-#define INODE_SIZE      64
-#define BITMAP_SECTOR0  17
+#define INODE_SIZE      128 /* M29: format v4 (was 64 in v3) */
+#define INODE_SECTORS   ((INODE_COUNT * INODE_SIZE) / 512)
+#define BITMAP_SECTOR0  (INODE_SECTOR0 + INODE_SECTORS) /* 33 */
 #define BITMAP_SECTORS  8
 /* M19: the write-ahead journal lives between the bitmap
  * and the data area: one header sector plus TXN_MAX
  * payload sectors, each holding a full-sector redo image
- * of one metadata operation. */
-#define JRNL_SECTOR0    25
+ * of one metadata operation. M29: starts at sector 41
+ * (1 + 32 inode-table sectors + 8 bitmap sectors). */
+#define JRNL_SECTOR0    (BITMAP_SECTOR0 + BITMAP_SECTORS)
 #define TXN_MAX         48
 #define DATA_SECTOR0    (JRNL_SECTOR0 + 1 + TXN_MAX)
 #define BLOCK_SIZE      4096
@@ -41,19 +43,28 @@
 #define UNALLOC         0xFFFFFFFFu
 
 struct yfs_inode {
-    uint8_t type; /* 0 free, 1 file, 2 dir */
+    uint8_t type; /* 0 free, 1 file, 2 dir, 3 symlink */
     uint8_t pad[3];
     uint32_t size;
     uint32_t blocks[12]; /* DIRECT direct + 1 indirect slot;
-                            the on-disk struct is ALWAYS 64
-                            bytes -- sizing this array from
-                            DIRECT once shrank the struct to
-                            60 and corrupted every caller */
-    uint32_t rsvd[2];
+                            the on-disk struct is ALWAYS 128
+                            bytes (format v4, M29) -- sizing
+                            this array from DIRECT once shrank
+                            the v3 struct to 60 and corrupted
+                            every caller, hence literal sizes
+                            and the assert below */
+    uint32_t atime;      /* M29: real per-field timestamps */
+    uint32_t mtime;
+    uint32_t ctime;
+    uint32_t flags;      /* open-ref count (low 16 bits) +
+                            0x10000 unlinked-pending-delete;
+                            v3 kept this in rsvd[0] */
+    uint32_t future[14]; /* zeroed reserve for future
+                            fields (uid/gid, larger size) */
 };
 
-_Static_assert(sizeof(struct yfs_inode) == 64,
-               "on-disk inode must be exactly 64 bytes");
+_Static_assert(sizeof(struct yfs_inode) == 128,
+               "on-disk inode must be exactly 128 bytes");
 
 static struct ata_drive g_drv;
 static bool g_mounted;
@@ -111,7 +122,7 @@ static bool str_eq_n(const char *a, const char *b, uint64_t n)
  * cleared. File CONTENT writes through yfs_pwrite are not
  * journaled (ordered-mode semantics: structure is atomic,
  * content may reflect a partial write after a crash), and
- * the open-count bumps in rsvd[0] are deliberately not
+ * the open-count bumps in the flags word are deliberately not
  * journaled -- a journal cycle per open/close would cost
  * more than the counter is worth. Like the rest of yfs,
  * transactions are not locked against concurrent tasks. */
@@ -687,31 +698,62 @@ uint32_t yfs_size(uint32_t ino)
     return n.size;
 }
 
-/* M23: the modification time lives in inode rsvd[1] --
- * a field the format always carried but never used, so
- * no format version bump is needed. */
+/* M23 stored the one timestamp in what is now the flags
+ * word's neighbour; M29 (format v4) gives the inode real
+ * atime/mtime/ctime fields. Reads do NOT stamp atime
+ * (journal churn on every read is not worth it); writes
+ * and truncates stamp mtime+ctime; creation stamps all
+ * three; utimens sets the fields independently. */
 uint32_t yfs_mtime(uint32_t ino)
 {
     struct yfs_inode n;
     if (inode_read(ino, &n) != 0)
         return 0;
-    return n.rsvd[1];
+    return n.mtime;
+}
+
+void yfs_times(uint32_t ino, uint32_t *a, uint32_t *m,
+               uint32_t *c)
+{
+    struct yfs_inode n;
+    *a = *m = *c = 0;
+    if (inode_read(ino, &n) != 0)
+        return;
+    *a = n.atime;
+    *m = n.mtime;
+    *c = n.ctime;
 }
 
 static void stamp_mtime(struct yfs_inode *n)
 {
-    n->rsvd[1] = (uint32_t)yousj_now_unix();
+    uint32_t now = (uint32_t)yousj_now_unix();
+    n->mtime = now;
+    n->ctime = now;
 }
 
-/* M26: utimensat on a single-stamp filesystem -- set the one
- * stored timestamp outright (inode write-back goes through
- * the same journaled path as every other metadata write). */
-void yfs_set_mtime(uint32_t ino, uint32_t sec)
+static void stamp_create(struct yfs_inode *n)
+{
+    stamp_mtime(n);
+    n->atime = n->mtime;
+}
+
+/* M29: utimens with independent operands. A negative
+ * value leaves that field alone; when at least one field
+ * is set, ctime bumps to now like everywhere else. The
+ * inode write-back goes through the same journaled path
+ * as every other metadata write. */
+void yfs_set_times(uint32_t ino, long asec, long msec)
 {
     struct yfs_inode n;
+    if (asec < 0 && msec < 0)
+        return;
     if (inode_read(ino, &n) != 0)
         return;
-    n.rsvd[1] = sec;
+    if (asec >= 0)
+        n.atime = (uint32_t)asec;
+    if (msec >= 0)
+        n.mtime = (uint32_t)msec;
+    n.ctime = (uint32_t)yousj_now_unix();
     inode_write(ino, &n);
 }
 
@@ -783,13 +825,13 @@ static int dir_link(uint32_t pino, const char *name, uint32_t target)
 }
 
 /* --- M13: removal, rename, open references -----------------------
- * rsvd[0] of an inode carries the open-file reference count
+ * the flags word of an inode carries the open-file reference count
  * in its low 16 bits and the unlinked flag at 0x10000. An
  * unlinked inode's blocks are freed when the count reaches
  * zero (immediately when it is already zero). */
 
-#define REFS_OF(n)   ((n)->rsvd[0] & 0xFFFFu)
-#define UNLINKED_OF(n) (((n)->rsvd[0] & 0x10000u) != 0)
+#define REFS_OF(n)   ((n)->flags & 0xFFFFu)
+#define UNLINKED_OF(n) (((n)->flags & 0x10000u) != 0)
 
 static int free_inode_impl(uint32_t ino)
 {
@@ -799,7 +841,7 @@ static int free_inode_impl(uint32_t ino)
     if (inode_read(ino, &n) != 0)
         return -E_IO_L;
     n.type = 0;
-    n.rsvd[0] = 0;
+    n.flags = 0;
     return inode_write(ino, &n);
 }
 
@@ -824,7 +866,7 @@ static int remove_dirent(uint32_t pino, uint32_t slot,
         return -E_IO_L;
     if (inode_read(target, &t) != 0)
         return -E_IO_L;
-    t.rsvd[0] |= 0x10000u;
+    t.flags |= 0x10000u;
     if (inode_write(target, &t) != 0)
         return -E_IO_L;
     if (REFS_OF(&t) == 0)
@@ -971,6 +1013,13 @@ static long yfs_rename_impl(const char *old_rel,
                 return -E_IO_L;
         }
     }
+    /* M29: a rename is a metadata change to the moved
+     * inode -- bump its ctime (ramfs has done this since
+     * M26; v3's single stamp was never touched here). */
+    if (inode_read((uint32_t)src, &sn) == 0) {
+        sn.ctime = (uint32_t)yousj_now_unix();
+        inode_write((uint32_t)src, &sn);
+    }
     return 0;
 }
 
@@ -979,7 +1028,7 @@ void yfs_note_open(uint32_t ino)
     struct yfs_inode n;
     if (inode_read(ino, &n) != 0)
         return;
-    n.rsvd[0] = (n.rsvd[0] & 0xFFFF0000u) | ((REFS_OF(&n) + 1) & 0xFFFFu);
+    n.flags = (n.flags & 0xFFFF0000u) | ((REFS_OF(&n) + 1) & 0xFFFFu);
     inode_write(ino, &n);
 }
 
@@ -989,7 +1038,7 @@ void yfs_note_close(uint32_t ino)
     if (inode_read(ino, &n) != 0)
         return;
     if (REFS_OF(&n) > 0)
-        n.rsvd[0] = (n.rsvd[0] & 0xFFFF0000u) | (REFS_OF(&n) - 1);
+        n.flags = (n.flags & 0xFFFF0000u) | (REFS_OF(&n) - 1);
     else
         return;
     inode_write(ino, &n);
@@ -1031,7 +1080,7 @@ static long yfs_mknod_t_impl(const char *parent_rel,
     fresh.size = 0;
     for (i = 0; i < 12; i++)
         fresh.blocks[i] = UNALLOC; /* all slots incl. indirect */
-    stamp_mtime(&fresh);
+    stamp_create(&fresh);
     if (inode_write(free_ino, &fresh) != 0)
         return -E_IO_L;
     if (dir_link((uint32_t)pino, name, free_ino) != 0)
@@ -1144,13 +1193,13 @@ static int yfs_format(struct ata_drive *d)
     g_data_blocks = (d->sectors - DATA_SECTOR0) / BLOCK_SECTORS;
     mem_zero(g_sec, ATA_SECTOR_SIZE);
     mem_copy(g_sec, (const uint8_t *)"YOUSJFS1", 8);
-    *(uint32_t *)(g_sec + 8) = 3; /* version: M19 journal */
+    *(uint32_t *)(g_sec + 8) = 4; /* version: M29 format v4 */
     *(uint32_t *)(g_sec + 12) = d->sectors;
     *(uint32_t *)(g_sec + 16) = g_data_blocks;
     if (ata_write(d, SB_SECTOR, 1, g_sec) != 0)
         return -E_IO_L;
     mem_zero(g_sec, ATA_SECTOR_SIZE);
-    for (s = INODE_SECTOR0; s < INODE_SECTOR0 + 16; s++)
+    for (s = INODE_SECTOR0; s < INODE_SECTOR0 + INODE_SECTORS; s++)
         if (ata_write(d, s, 1, g_sec) != 0)
             return -E_IO_L;
     for (s = 0; s < BITMAP_SECTORS; s++)
@@ -1163,6 +1212,7 @@ static int yfs_format(struct ata_drive *d)
     mem_zero((uint8_t *)&root, sizeof(root));
     root.type = 2;
     root.size = 0;
+    stamp_create(&root);
     for (i = 0; i < 12; i++)
         root.blocks[i] = UNALLOC; /* all slots incl. indirect */
     if (inode_write(0, &root) != 0)
@@ -1176,6 +1226,7 @@ int yfs_mount(void)
     int bus;
     struct ata_drive cand;
     bool have_cand = false;
+    bool have_old = false;
 
     g_mounted = false;
     for (bus = 0; bus < 2; bus++) {
@@ -1185,7 +1236,7 @@ int yfs_mount(void)
         if (ata_read(&d, SB_SECTOR, 1, g_sec) != 0)
             continue;
         if (sector_has_magic(g_sec) &&
-            *(const uint32_t *)(g_sec + 8) == 3) {
+            *(const uint32_t *)(g_sec + 8) == 4) {
             g_drv = d;
             g_data_blocks = *(const uint32_t *)(g_sec + 16);
             if (g_data_blocks == 0)
@@ -1194,6 +1245,14 @@ int yfs_mount(void)
             g_mounted = true;
             journal_replay();
             return 1;
+        }
+        if (sector_has_magic(g_sec)) {
+            /* A yfs disk of another format version (v3 or
+             * older): refuse to mount it and NEVER reformat
+             * it implicitly -- its data is not ours to
+             * destroy. M29 policy. */
+            have_old = true;
+            continue;
         }
         if (!have_cand && sector_is_zero(g_sec)) {
             cand = d;
@@ -1205,6 +1264,8 @@ int yfs_mount(void)
             return -E_IO_L;
         return 2;
     }
+    if (have_old)
+        return 3; /* recognized but unsupported format */
     return 0;
 }
 

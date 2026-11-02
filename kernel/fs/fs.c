@@ -1462,9 +1462,20 @@ static bool stat_from_yfs_ino(uint32_t ino,
                               struct yousj_stat_info *info)
 {
     int t = yfs_type_of(ino);
-    info->mtime = yfs_mtime(ino);
-    info->atime = info->mtime; /* single-stamp fs: alias */
-    info->ctime = info->mtime;
+    /* M29: format v4 stores all three independently.
+     * Fetch through uint32_t locals: info's fields are
+     * uint64_t, and taking their addresses as uint32_t*
+     * would store only the low halves, leaving the high
+     * halves as stack garbage (that exact bug cost a
+     * debugging round -- the values "looked right" in
+     * every uint32-truncated debug print). */
+    {
+        uint32_t a, m, c;
+        yfs_times(ino, &a, &m, &c);
+        info->atime = a;
+        info->mtime = m;
+        info->ctime = c;
+    }
     if (t == 3) {
         info->mode = S_IFLNK_K | 0777u;
         info->size = yfs_size(ino);
@@ -1603,19 +1614,22 @@ static long utimens_ramfs_node(struct yousj_ramfs_node *n,
     return 0;
 }
 
-/* yfs stores a single stamp: an explicit/NOW mtime operand
- * wins; with mtime omitted, an atime operand still moves the
- * one stamp there is. Both omitted: nothing to store. */
+/* M29: yfs v4 stores the stamps independently, so the
+ * operands finally apply one-to-one (M26 aliased them
+ * onto the single stamp the 64-byte inode could hold).
+ * Both omitted: nothing to store, ctime untouched. */
 static long utimens_yfs_ino(uint32_t ino,
                             const struct yousj_utime_op *aop,
                             const struct yousj_utime_op *mop)
 {
-    const struct yousj_utime_op *eff =
-        mop->kind != YOUSJ_UTIME_OMIT ? mop : aop;
     uint32_t now = (uint32_t)yousj_now_unix();
-    if (eff->kind == YOUSJ_UTIME_OMIT)
-        return 0;
-    yfs_set_mtime(ino, utime_value(eff, now, 0));
+    long asec = aop->kind == YOUSJ_UTIME_OMIT
+                    ? -1
+                    : (long)utime_value(aop, now, 0);
+    long msec = mop->kind == YOUSJ_UTIME_OMIT
+                    ? -1
+                    : (long)utime_value(mop, now, 0);
+    yfs_set_times(ino, asec, msec);
     return 0;
 }
 

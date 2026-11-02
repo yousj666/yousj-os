@@ -525,6 +525,8 @@ void kmain(struct yousj_boot_info *boot_info)
                 serial_puts("Yousj OS: yfs mounted on /data\n");
             else if (mrc == 2)
                 serial_puts("Yousj OS: yfs formatted and mounted on /data\n");
+            else if (mrc == 3)
+                serial_puts("Yousj OS: yfs disk has an old format version; not mounted (v4 required, disk left untouched)\n");
             else if (mrc == 0)
                 serial_puts("Yousj OS: no data disk (yfs not mounted)\n");
             else

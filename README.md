@@ -463,9 +463,25 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   再人人顶着创建占位名 "clone"——未 exec 的孩子
   此前在 ps 与 /proc 里永远叫 clone。验收：新套
   件 pidtest 九场景两轮；其余十九链不回归。
-- ⏳ 下一步候选：yfs 格式升版（inode 扩容、三时
-  间戳独立、为未来字段留白）、相对 dirfd 支持、
-  /proc/self 与 cmdline 等更多生成项。
+- ✅ yfs 格式升版 M29（2026-11-03）：格式 v4。
+  inode 64B 扩到 128B：atime/mtime/ctime 三个真
+  字段（M26 的单戳别名退役）、flags 独立收纳原
+  rsvd[0] 的引用计数与 unlinked 位、留 56B 空白
+  给未来字段；布局平移：inode 表 1..32、位图
+  33..40、日志 41..89、数据自 90。utimens 三戳
+  各走各的；写/截断刷 mtime+ctime、创建三戳齐
+  设、rename 补刷被移动者 ctime（此前 yfs 漏刷）；
+  读不刷 atime（省日志流量，明示的取舍）。旧盘
+  策略：超级块版本号 3→4，v3 盘拒挂并打印说明、
+  绝不自动格式化毁数据。验收途中修掉一个真 bug：
+  stat 回填曾把 u64 字段地址当 u32* 写，只落低
+  半、高半是未初始化栈垃圾（调试打印全按 u32 截
+  断、一度"处处正确"）；timetest 的创建三戳相等
+  断言也改为一秒容差（独立戳下跨秒边界本就合
+  法）。disk 五段（含 v4 模式 utimetest 九场景）
+  全绿，其余二十链不回归。
+- ⏳ 下一步候选：相对 dirfd 支持、/proc/self 与
+  cmdline 等更多生成项、sigaltstack。
 
 ## 从零构建
 

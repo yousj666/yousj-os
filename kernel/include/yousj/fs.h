@@ -175,10 +175,9 @@ struct yousj_stat_info {
     uint64_t ino;
     uint64_t mtime; /* M23: seconds since the epoch */
     uint64_t atime; /* M26: tracked independently on ramfs;
-                       yfs stores one stamp and aliases all
-                       three (its 64-byte inode has no room
-                       for more -- see yfs.c) */
-    uint64_t ctime; /* M26: ditto */
+                       M29: yfs format v4 stores all three
+                       independently too */
+    uint64_t ctime; /* M26/M29: ditto */
 };
 bool fs_path_stat2(const char *path, bool follow,
                    struct yousj_stat_info *info);

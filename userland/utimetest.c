@@ -2,8 +2,9 @@
  * independent atime/ctime/mtime tracking.
  *
  *   utimetest [path]         full independence (ramfs)
- *   utimetest [path] alias   single-stamp backend (yfs):
- *                            atime/ctime alias the one mtime
+ *   utimetest [path] v4      yfs backend (format v4, M29):
+ *                            independent stamps like ramfs,
+ *                            except reads never move atime
  *
  * Freestanding: raw syscalls only. Exit code is the
  * number of failed scenarios; each prints PASS/FAIL. */
@@ -129,7 +130,7 @@ static long utimens(const char *path, struct ts *ts2, long flags)
 int main(int argc, char **argv)
 {
     const char *path = argc > 1 ? argv[1] : "/ut-file";
-    int alias = argc > 2 && argv[2][0] == 'a';
+    int yfs = argc > 2 && argv[2][0] == 'v';
     struct st sb;
     struct ts ts2[2];
     long t_start = now_s();
@@ -137,7 +138,7 @@ int main(int argc, char **argv)
 
     out("utimetest: M26 utimens suite on ");
     out(path);
-    out(alias ? " (alias)\n" : "\n");
+    out(yfs ? " (v4)\n" : "\n");
 
     /* 1: explicit set of both stamps */
     sys_call1(SYS_unlink, (long)(uintptr_t)path);
@@ -147,14 +148,9 @@ int main(int argc, char **argv)
     {
         long rc = utimens(path, ts2, 0);
         stat_of(path, &sb);
-        if (alias)
-            report("set-explicit", fd >= 0 && rc == 0 &&
-                   sb.atime == 978307200 && sb.mtime == 978307200 &&
-                   sb.ctime == 978307200);
-        else
-            report("set-explicit", fd >= 0 && rc == 0 &&
-                   sb.atime == 946684800 && sb.mtime == 978307200 &&
-                   sb.ctime >= t_start && sb.ctime <= now_s() + 2);
+        report("set-explicit", fd >= 0 && rc == 0 &&
+               sb.atime == 946684800 && sb.mtime == 978307200 &&
+               sb.ctime >= t_start && sb.ctime <= now_s() + 2);
     }
 
     /* 2: UTIME_OMIT leaves the other stamp alone */
@@ -163,12 +159,8 @@ int main(int argc, char **argv)
     {
         long rc = utimens(path, ts2, 0);
         stat_of(path, &sb);
-        if (alias)
-            report("omit", rc == 0 && sb.mtime == 1000000000 &&
-                   sb.atime == 1000000000);
-        else
-            report("omit", rc == 0 && sb.atime == 946684800 &&
-                   sb.mtime == 1000000000);
+        report("omit", rc == 0 && sb.atime == 946684800 &&
+               sb.mtime == 1000000000);
     }
 
     /* 3: NULL times means "now" for both */
@@ -190,13 +182,9 @@ int main(int argc, char **argv)
         long src = sys_call2(SYS_fstat, fd,
                              (long)(uintptr_t)&sb);
         sys_call1(SYS_close, fd);
-        if (alias)
-            report("futimens", rc == 0 && src == 0 &&
-                   sb.mtime >= t_start && sb.atime == sb.mtime);
-        else
-            report("futimens", rc == 0 && src == 0 &&
-                   sb.atime == 123456789 &&
-                   sb.mtime >= t_start && sb.mtime <= now_s() + 2);
+        report("futimens", rc == 0 && src == 0 &&
+               sb.atime == 123456789 &&
+               sb.mtime >= t_start && sb.mtime <= now_s() + 2);
     }
 
     /* 5: NOFOLLOW stamps the link, not the target (ramfs
@@ -220,8 +208,10 @@ int main(int argc, char **argv)
     sys_call1(SYS_unlink, (long)(uintptr_t)"/ut-link");
     sys_call1(SYS_unlink, (long)(uintptr_t)"/ut-target");
 
-    /* 6: a read moves atime (strict), mtime stays put */
-    if (!alias) {
+    /* 6: a read moves atime on ramfs (strict); on yfs it
+     * must NOT move (M29: reads never stamp atime there,
+     * to keep journal traffic off the read path) */
+    {
         ts2[0].sec = 900000000; ts2[0].nsec = 0;
         ts2[1].sec = 0;         ts2[1].nsec = UTIME_OMIT;
         utimens(path, ts2, 0);
@@ -234,12 +224,16 @@ int main(int argc, char **argv)
         if (fd >= 0)
             sys_call1(SYS_close, fd);
         stat_of(path, &sb);
-        report("read-atime", n == 1 && sb.atime >= t_start &&
-               sb.mtime == m_before);
+        if (yfs)
+            report("read-atime", n == 1 &&
+                   sb.atime == 900000000 &&
+                   sb.mtime == m_before);
+        else
+            report("read-atime", n == 1 && sb.atime >= t_start &&
+                   sb.mtime == m_before);
     }
 
-    /* 7: a write moves mtime + ctime, leaves atime;
-     * in alias mode all three are the one stamp */
+    /* 7: a write moves mtime + ctime, leaves atime */
     ts2[0].sec = 800000000;  ts2[0].nsec = 0;
     ts2[1].sec = 800000000;  ts2[1].nsec = 0;
     utimens(path, ts2, 0);
@@ -250,13 +244,9 @@ int main(int argc, char **argv)
         sys_call1(SYS_close, fd);
     }
     stat_of(path, &sb);
-    if (alias)
-        report("write-stamps", fd >= 0 &&
-               sb.atime == sb.mtime && sb.mtime >= t_start);
-    else
-        report("write-stamps", fd >= 0 &&
-               sb.atime == 800000000 && sb.mtime >= t_start &&
-               sb.ctime >= t_start);
+    report("write-stamps", fd >= 0 &&
+           sb.atime == 800000000 && sb.mtime >= t_start &&
+           sb.ctime >= t_start);
 
     /* 8: error surface */
     {
@@ -291,11 +281,8 @@ int main(int argc, char **argv)
         if (fd >= 0)
             sys_call1(SYS_close, fd);
         stat_of(path, &sb);
-        if (alias)
-            report("empty-path", rc == 0 && rc2 == -2);
-        else
-            report("empty-path", rc == 0 && rc2 == -2 &&
-                   sb.atime == 555000111);
+        report("empty-path", rc == 0 && rc2 == -2 &&
+               sb.atime == 555000111);
     }
 
     sys_call1(SYS_unlink, (long)(uintptr_t)path);

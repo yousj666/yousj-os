@@ -1,20 +1,26 @@
 /* Yousj OS - yfs: the on-disk filesystem (M12).
  *
  * A deliberately small write-through filesystem on the ATA
- * driver. Fixed geometry (sector = 512 B):
+ * driver. Format version 4 (M29; the superblock carries
+ * the version, and older-version disks are refused, never
+ * silently reformatted). Fixed geometry (sector = 512 B):
  *
- *   sector 0        superblock ("YOUSJFS1")
- *   sectors 1..16   inode table: 128 inodes x 64 B
- *   sectors 17..24  data-block bitmap (32768 blocks max)
- *   sector 25..     data blocks of 4 KiB (8 sectors each)
+ *   sector 0        superblock ("YOUSJFS1", version 4)
+ *   sectors 1..32   inode table: 128 inodes x 128 B
+ *   sectors 33..40  data-block bitmap (32768 blocks max)
+ *   sector 41       journal header (M19)
+ *   sectors 42..89  journal payloads (48 full-sector images)
+ *   sector 90..     data blocks of 4 KiB (8 sectors each)
  *
- * Inodes carry 12 direct block pointers (48 KiB max file).
- * Directories are files whose content is 32-byte entries
- * {u32 ino; char name[28]}; an entry is empty iff name[0]==0.
- * Every mutation is written to the disk synchronously (no
- * cache): what the syscall returned from is what survives a
- * power cut. Paths here are relative to the mount root
- * ("" or "/" is the root directory).
+ * Inodes carry 11 direct block pointers plus one indirect
+ * block (about 4 MiB max file) and, since v4, independent
+ * atime/mtime/ctime fields. Directories are files whose
+ * content is 32-byte entries {u32 ino; char name[28]}; an
+ * entry is empty iff name[0]==0. Every mutation is written
+ * to the disk synchronously (no cache): what the syscall
+ * returned from is what survives a power cut. Paths here
+ * are relative to the mount root ("" or "/" is the root
+ * directory).
  */
 #ifndef YOUSJ_YFS_H
 #define YOUSJ_YFS_H
@@ -25,7 +31,9 @@
 
 /* Probe the ATA buses, mount an existing yfs or format a
  * blank disk. Returns: 1 mounted existing, 2 formatted new,
- * 0 no usable disk, negative on I/O error. */
+ * 3 a yfs disk of an unsupported (older) format version --
+ * refused and left untouched, 0 no usable disk, negative
+ * on I/O error. */
 int yfs_mount(void);
 bool yfs_mounted(void);
 uint32_t yfs_disk_sectors(void);
@@ -36,8 +44,11 @@ uint32_t yfs_disk_sectors(void);
 long yfs_lookup(const char *rel);          /* inode or -errno */
 bool yfs_is_dir(uint32_t ino);
 uint32_t yfs_size(uint32_t ino);
-uint32_t yfs_mtime(uint32_t ino); /* M23: inode rsvd[1] */
-void yfs_set_mtime(uint32_t ino, uint32_t sec); /* M26 */
+uint32_t yfs_mtime(uint32_t ino); /* M23 */
+/* M29: the v4 inode's real timestamp fields */
+void yfs_times(uint32_t ino, uint32_t *a, uint32_t *m,
+               uint32_t *c);
+void yfs_set_times(uint32_t ino, long asec, long msec);
 long yfs_mknod_t(const char *parent_rel, const char *name,
                  uint8_t type);
 long yfs_mknod(const char *parent_rel, const char *name,

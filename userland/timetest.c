@@ -150,9 +150,18 @@ int main(int argc, char **argv)
     sys_call2(SYS_stat, (long)(uintptr_t)path,
               (long)(uintptr_t)&sb);
     long m_created = (long)sb.mtime;
+    /* M29: with independent stamps (yfs v4, ramfs all
+     * along), creation sets all three and the first write
+     * re-stamps mtime/ctime -- the two operations can
+     * straddle a second boundary, so equality becomes a
+     * one-second tolerance. (Under the v3 single-stamp
+     * alias this check was exact by construction.) */
     int created_ok = fd >= 0 && m_created >= t0 - 1 &&
                      m_created <= t0 + 3 &&
-                     sb.atime == sb.mtime && sb.ctime == sb.mtime;
+                     sb.atime >= sb.mtime - 1 &&
+                     sb.atime <= sb.mtime &&
+                     sb.ctime >= sb.mtime &&
+                     sb.ctime <= sb.mtime + 1;
     sleep_ms(1200);
     fd = sys_call3(SYS_open, (long)(uintptr_t)path, 0x401,
                    0644); /* WRONLY|APPEND */
