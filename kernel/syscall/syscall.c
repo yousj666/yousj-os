@@ -311,8 +311,10 @@ void process_exit(long status, int sig)
 
         me->mm = NULL;
         me->mm_owned = false;
-        if (master != NULL)
+        if (master != NULL) {
             vmm_load_cr3(master->pml4_phys);
+            sched_note_cr3(master->pml4_phys);
+        }
         vmm_free_user_data(sp);
         vmm_destroy_space(sp);
         vmm_space_release(sp);
@@ -481,7 +483,16 @@ static long sys_clone(struct yousj_syscall_ctx *ctx, long flags,
         child->resume_rdi = frame[48 / 8];
         child->resume_rcx = frame[56 / 8];
         child->resume_r11 = frame[64 / 8];
-        child->resume_rsp = g_cpu_local.user_rsp_save;
+        /* The child's RSP is the parent's RSP at THIS
+         * syscall's entry, taken from the entry frame (slot
+         * YOUSJ_FR_RSP) -- NOT g_cpu_local.user_rsp_save:
+         * that per-CPU slot belongs to whichever task entered
+         * a syscall most recently and is not guaranteed to
+         * still name this caller by the time the long window
+         * clone above finishes. The entry shim saves the RSP
+         * on this task's own kernel stack for exactly this
+         * reason (see syscall_entry.S). */
+        child->resume_rsp = frame[YOUSJ_FR_RSP];
         /* Callee-saved set, captured by the entry shim (M7):
          * without it the child resumes with garbage in exactly
          * the registers compiled code keeps its locals in. */
@@ -712,6 +723,7 @@ static long sys_execve(uint64_t path_ptr, uint64_t argv_ptr,
      * write back against the old space before it dies). */
     vmas_release_all(me, old != NULL ? old : me->mm);
     vmm_load_cr3(space->pml4_phys);
+    sched_note_cr3(space->pml4_phys);
     if (old != NULL && old != space) {
         vmm_free_user_data(old);
         vmm_destroy_space(old);

@@ -13,6 +13,7 @@
 #include <yousj/time.h>
 #include <yousj/yfs.h>
 #include <yousj/pmm.h>
+#include <yousj/sched.h> /* M25: tick counters for /proc */
 #include <yousj/vmm.h> /* errno magnitudes + phys_to_virt */
 
 #define YOUSJ_EBADF   9
@@ -27,6 +28,8 @@
 #define YOUSJ_EXDEV_L 18
 #define YOUSJ_ENOTEMPTY_L 39
 #define YOUSJ_ELOOP_L 40
+#define YOUSJ_EACCES_L 13
+#define YOUSJ_ENOENT_L 2
 
 static uint64_t str_len(const char *s); /* defined below */
 
@@ -861,6 +864,154 @@ static long yfs_open_path_fs(const char *rel, long flags,
     return 0;
 }
 
+/* --- M25: /proc -- a generated, read-only filesystem -----
+ * Three flat files whose contents are formatted from live
+ * kernel counters. The content is snapshotted into the
+ * file object at open: a reader sees one consistent
+ * generation, and re-opening refreshes it (Linux readers
+ * like cat open per read anyway). Writes and mutations
+ * are refused with EACCES; the directory itself can be
+ * listed and chdir'd into like any other. */
+#define PROC_ID_UPTIME  1
+#define PROC_ID_MEMINFO 2
+#define PROC_ID_VERSION 3
+static const char *const g_proc_names[3] = {
+    "uptime", "meminfo", "version"
+};
+
+static bool is_proc_path(const char *path)
+{
+    return path[0] == '/' && path[1] == 'p' && path[2] == 'r' &&
+           path[3] == 'o' && path[4] == 'c' &&
+           (path[5] == '\0' || path[5] == '/');
+}
+
+/* "" -> 0 (the directory), a known name -> its id, else -1 */
+static int proc_find(const char *rel)
+{
+    int i;
+    if (rel[0] == '\0')
+        return 0;
+    for (i = 0; i < 3; i++) {
+        const char *n = g_proc_names[i];
+        uint64_t j = 0;
+        while (n[j] != '\0' && rel[j] == n[j])
+            j++;
+        if (n[j] == '\0' && rel[j] == '\0')
+            return i + 1;
+    }
+    return -1;
+}
+
+struct pbuf {
+    char *buf;
+    uint32_t cap;
+    uint32_t len;
+};
+static void pb_puts(struct pbuf *b, const char *s)
+{
+    while (*s != '\0' && b->len < b->cap) {
+        b->buf[b->len] = *s;
+        b->len++;
+        s++;
+    }
+}
+static void pb_putu(struct pbuf *b, uint64_t v)
+{
+    char tmp[20];
+    int n = 0;
+    if (v == 0) {
+        pb_puts(b, "0");
+        return;
+    }
+    while (v > 0) {
+        tmp[n] = (char)('0' + (v % 10));
+        n++;
+        v /= 10;
+    }
+    while (n > 0) {
+        n--;
+        if (b->len < b->cap) {
+            b->buf[b->len] = tmp[n];
+            b->len++;
+        }
+    }
+}
+/* "<seconds>.<centiseconds>" for a tick count */
+static void pb_put_ticks(struct pbuf *b, uint64_t ticks)
+{
+    uint64_t cs = ticks % 100; /* 100 Hz: one tick is 1 cs */
+    pb_putu(b, ticks / 100);
+    pb_puts(b, ".");
+    if (cs < 10)
+        pb_puts(b, "0");
+    pb_putu(b, cs);
+}
+
+static uint32_t proc_generate(int id, char *buf, uint32_t cap)
+{
+    struct pbuf b;
+    b.buf = buf;
+    b.cap = cap;
+    b.len = 0;
+    switch (id) {
+    case PROC_ID_UPTIME:
+        pb_put_ticks(&b, sched_uptime_ticks());
+        pb_puts(&b, " ");
+        pb_put_ticks(&b, sched_idle_ticks());
+        pb_puts(&b, "\n");
+        break;
+    case PROC_ID_MEMINFO:
+        pb_puts(&b, "MemTotal:       ");
+        pb_putu(&b, pmm_total_page_count() * 4);
+        pb_puts(&b, " kB\nMemFree:        ");
+        pb_putu(&b, pmm_free_page_count() * 4);
+        pb_puts(&b, " kB\nMemAvailable:   ");
+        pb_putu(&b, pmm_free_page_count() * 4);
+        pb_puts(&b, " kB\n");
+        break;
+    case PROC_ID_VERSION:
+        pb_puts(&b, "Yousj OS version 0.9 (M25) x86_64 #1\n");
+        break;
+    default:
+        break;
+    }
+    return b.len;
+}
+
+static long proc_open(const char *path, long flags,
+                      struct yousj_file **out)
+{
+    const char *rel = path + 5;
+    long acc = flags & YOUSJ_O_ACCMODE;
+    struct yousj_file *f;
+    int id;
+    if (rel[0] == '/')
+        rel++;
+    id = proc_find(rel);
+    if (id < 0)
+        return -YOUSJ_ENOENT_L;
+    if (id == 0) {
+        if (acc != YOUSJ_O_RDONLY)
+            return -YOUSJ_EISDIR;
+    } else {
+        if (acc != YOUSJ_O_RDONLY)
+            return -YOUSJ_EACCES_L;
+    }
+    f = file_alloc();
+    if (f == NULL)
+        return -YOUSJ_ENFILE;
+    f->backend = 2;
+    f->proc_id = id;
+    f->flags = flags;
+    f->offset = 0;
+    if (id != 0)
+        f->proc_len = proc_generate(id, f->proc_buf,
+                                    sizeof(f->proc_buf));
+    *out = f;
+    return 0;
+}
+
 long fs_open_path(const char *path, long flags,
                   struct yousj_file **out)
 {
@@ -871,6 +1022,8 @@ long fs_open_path(const char *path, long flags,
     path = resolved;
     if (is_data_path(path))
         return yfs_open_path_fs(data_rel(path), flags, out);
+    if (is_proc_path(path))
+        return proc_open(path, flags, out);
     return ramfs_open_path(path, flags, out);
 }
 
@@ -881,6 +1034,8 @@ long fs_mkdir_path(const char *path)
     if (rc != 0)
         return rc;
     path = resolved;
+    if (is_proc_path(path))
+        return -YOUSJ_EACCES_L;
     if (is_data_path(path)) {
         char parent[128], name[40];
         long ino;
@@ -898,6 +1053,8 @@ long fs_unlink_path(const char *path)
     if (rc != 0)
         return rc;
     path = resolved;
+    if (is_proc_path(path))
+        return -YOUSJ_EACCES_L;
     if (is_data_path(path)) {
         char parent[128], name[40];
         split_parent_name(data_rel(path), parent, name);
@@ -928,6 +1085,8 @@ long fs_rmdir_path(const char *path)
     if (rc != 0)
         return rc;
     path = resolved;
+    if (is_proc_path(path))
+        return -YOUSJ_EACCES_L;
     if (is_data_path(path)) {
         char parent[128], name[40];
         split_parent_name(data_rel(path), parent, name);
@@ -966,6 +1125,8 @@ long fs_rename_path(const char *old_path, const char *new_path)
         return rc;
     old_path = ro;
     new_path = rn;
+    if (is_proc_path(old_path) || is_proc_path(new_path))
+        return -YOUSJ_EACCES_L;
     bool od = is_data_path(old_path), nd = is_data_path(new_path);
     char obase[NAME_MAX_LEN + 1], nbase[NAME_MAX_LEN + 1];
     struct yousj_ramfs_node *oparent, *nparent, *src, *dst, *a;
@@ -1032,6 +1193,8 @@ long fs_symlink_path(const char *target, const char *linkpath)
         return rc;
     if (str_len(target) > PATH_MAX_LEN)
         return -YOUSJ_ENAMETOOLONG_L;
+    if (is_proc_path(resolved))
+        return -YOUSJ_EACCES_L;
     if (is_data_path(resolved)) {
         char parent[128], name[40];
         split_parent_name(data_rel(resolved), parent, name);
@@ -1175,6 +1338,27 @@ bool fs_path_stat2(const char *path, bool follow,
             return false;
         return stat_from_yfs_ino((uint32_t)ino, info);
     }
+    if (is_proc_path(path)) {
+        const char *rel = path + 5;
+        int id;
+        if (rel[0] == '/')
+            rel++;
+        id = proc_find(rel);
+        if (id < 0)
+            return false;
+        info->mtime = (uint32_t)yousj_now_unix();
+        info->ino = 9000 + (uint64_t)id;
+        if (id == 0) {
+            info->mode = S_IFDIR_K | 0555u;
+            info->size = 0;
+        } else {
+            char scratch[288];
+            info->mode = S_IFREG_K | 0444u;
+            info->size = proc_generate(id, scratch,
+                                       sizeof(scratch));
+        }
+        return true;
+    }
     {
         struct yousj_ramfs_node *n = fs_lookup(path);
         if (n == NULL)
@@ -1201,6 +1385,18 @@ bool fs_file_stat(struct yousj_file *f,
         info->mtime = 0;
         info->size = 0;
         info->ino = 0;
+        return true;
+    }
+    if (f->backend == 2) {
+        info->mtime = (uint32_t)yousj_now_unix();
+        info->ino = 9000 + (uint64_t)f->proc_id;
+        if (f->proc_id == 0) {
+            info->mode = S_IFDIR_K | 0555u;
+            info->size = 0;
+        } else {
+            info->mode = S_IFREG_K | 0444u;
+            info->size = f->proc_len;
+        }
         return true;
     }
     if (f->backend == 1)
@@ -1239,6 +1435,21 @@ int fs_mount_data(void)
 long file_read(struct yousj_file *f, uint8_t *dst, uint64_t count)
 {
     long n;
+    if (f != NULL && f->backend == 2) {
+        uint64_t avail;
+        if (f->proc_id == 0)
+            return -YOUSJ_EISDIR;
+        if ((f->flags & YOUSJ_O_ACCMODE) == YOUSJ_O_WRONLY)
+            return -YOUSJ_EBADF;
+        if (f->offset >= f->proc_len)
+            return 0;
+        avail = f->proc_len - f->offset;
+        n = (long)(count < avail ? count : avail);
+        mem_copy(dst, (const uint8_t *)f->proc_buf + f->offset,
+                 (uint64_t)n);
+        f->offset += (uint64_t)n;
+        return n;
+    }
     if (f != NULL && f->backend == 1) {
         if (yfs_is_dir(f->yfs_ino))
             return -YOUSJ_EISDIR;
@@ -1266,6 +1477,8 @@ long file_write(struct yousj_file *f, const uint8_t *src,
                 uint64_t count)
 {
     long n;
+    if (f != NULL && f->backend == 2)
+        return -YOUSJ_EBADF; /* read-only by construction */
     if (f != NULL && f->backend == 1) {
         if (yfs_is_dir(f->yfs_ino))
             return -YOUSJ_EISDIR;
@@ -1299,6 +1512,8 @@ bool fs_file_is_dir(struct yousj_file *f)
         return false;
     if (f->backend == 1)
         return yfs_is_dir(f->yfs_ino);
+    if (f->backend == 2)
+        return f->proc_id == 0;
     return f->node != NULL && f->node->is_dir;
 }
 
@@ -1308,6 +1523,16 @@ long fs_pread_file(struct yousj_file *f, uint64_t off,
     uint64_t done = 0;
     if (f == NULL || f->pipe != NULL)
         return -YOUSJ_EBADF;
+    if (f->backend == 2) {
+        uint64_t avail;
+        if (f->proc_id == 0 || off >= f->proc_len)
+            return 0;
+        avail = f->proc_len - off;
+        if (count > avail)
+            count = avail;
+        mem_copy(dst, (const uint8_t *)f->proc_buf + off, count);
+        return (long)count;
+    }
     if (f->backend == 0 && f->node == NULL)
         return -YOUSJ_EBADF; /* the console is not mappable */
     while (done < count) {
@@ -1359,6 +1584,20 @@ long fs_pwrite_file(struct yousj_file *f, uint64_t off,
 long file_seek(struct yousj_file *f, long off, long whence)
 {
     int64_t base, np;
+    if (f != NULL && f->backend == 2) {
+        switch (whence) {
+        case 0: base = 0; break;
+        case 1: base = (int64_t)f->offset; break;
+        case 2: base = f->proc_id == 0 ? 0 : (int64_t)f->proc_len;
+            break;
+        default: return -YOUSJ_EINVAL;
+        }
+        np = base + off;
+        if (np < 0)
+            return -YOUSJ_EINVAL;
+        f->offset = (uint64_t)np;
+        return np;
+    }
     if (f != NULL && f->backend == 1) {
         switch (whence) {
         case 0: base = 0; break;
@@ -1396,6 +1635,34 @@ long file_getdents(struct yousj_file *f, uint8_t *buf, uint64_t count)
 {
     struct yousj_ramfs_node *c;
     uint64_t used = 0, idx = 0;
+    if (f != NULL && f->backend == 2) {
+        /* entries: . .. uptime meminfo version */
+        static const char *const names[5] = {
+            ".", "..", "uptime", "meminfo", "version"
+        };
+        uint64_t i;
+        if (f->proc_id != 0)
+            return -YOUSJ_ENOTDIR;
+        for (i = f->offset; i < 5; i++) {
+            uint64_t namelen = str_len(names[i]), reclen;
+            uint8_t *rec;
+            reclen = (19 + namelen + 1 + 7) & ~7ULL;
+            if (used + reclen > count)
+                break;
+            rec = buf + used;
+            mem_zero(rec, reclen);
+            *(uint64_t *)(rec + 0) =
+                i <= 1 ? 9000 : 9000 + (i - 1);
+            *(uint64_t *)(rec + 8) = i + 1;
+            *(uint16_t *)(rec + 16) = (uint16_t)reclen;
+            rec[18] = i <= 1 ? YOUSJ_DT_DIR : YOUSJ_DT_REG;
+            mem_copy(rec + 19, (const uint8_t *)names[i],
+                     namelen);
+            used += reclen;
+            f->offset = i + 1;
+        }
+        return (long)used;
+    }
     if (f != NULL && f->backend == 1) {
         uint32_t slot = (uint32_t)f->offset;
         if (!yfs_is_dir(f->yfs_ino))
@@ -1468,6 +1735,11 @@ void fs_init(void)
     g_root->name[0] = '/';
     g_root->name[1] = '\0';
     g_root->parent = g_root;
+    /* M25: the /proc mountpoint shows in the root listing;
+     * every operation on it is intercepted by proc_open /
+     * the stat and getdents branches before the ramfs node
+     * is ever consulted. */
+    ramfs_mkdir_path("/proc");
 }
 
 static long install_file(const char *path, const uint8_t *data,

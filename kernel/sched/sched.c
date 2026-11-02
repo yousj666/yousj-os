@@ -30,7 +30,16 @@ void arch_on_task_switch(struct task *prev, struct task *next);
 void fpu_init_area(uint8_t *area);
 #pragma weak fpu_init_area
 
-static struct vmm_space *g_current_space;
+/* The PML4 phys currently loaded in CR3, as far as this cache
+ * knows. The cache key is the PHYS, never the struct vmm_space
+ * pointer: pool slots are recycled (exit/exec release, clone
+ * allocs first-free), so a fresh space can sit on the exact
+ * pointer a just-destroyed space had -- comparing pointers once
+ * let a clone child run in its parent's tables after execve had
+ * loaded CR3 directly without telling the scheduler (M25
+ * postmortem). Every direct vmm_load_cr3() outside the switch
+ * below must pair with sched_note_cr3() to keep this truthful. */
+static uint64_t g_current_cr3;
 
 /* The contract context_switch.S relies on: ctx.rsp is at offset 0. */
 _Static_assert(offsetof(struct task, ctx) == 0,
@@ -101,7 +110,7 @@ void sched_init(void)
     g_all_head = NULL;
     g_rq_head = g_rq_tail = NULL;
     g_next_tid = 0;
-    g_current_space = NULL;
+    g_current_cr3 = 0;
 
     idle = &g_tasks[0];
     mem_zero(idle, sizeof(*idle));
@@ -290,10 +299,10 @@ void sched_schedule(void)
     {
         struct vmm_space *target = next->mm != NULL ? next->mm
             : (vmm_kernel_master != NULL ? vmm_kernel_master() : NULL);
-        if (target != NULL && target != g_current_space &&
+        if (target != NULL && target->pml4_phys != g_current_cr3 &&
             vmm_load_cr3 != NULL) {
             vmm_load_cr3(target->pml4_phys);
-            g_current_space = target;
+            g_current_cr3 = target->pml4_phys;
         }
     }
     /* TSS.rsp0 + syscall kernel_rsp track the incoming task's
@@ -311,6 +320,15 @@ out:
     __asm__ volatile("push %0; popfq" : : "r"(flags) : "memory");
 #endif
     ;
+}
+
+/* Record a CR3 load performed outside sched_schedule() (the
+ * direct loads in process exit and execve commit). Without this
+ * the switch cache above goes stale and a later space whose
+ * PML4 phys matches the stale value would skip its load. */
+void sched_note_cr3(uint64_t pml4_phys)
+{
+    g_current_cr3 = pml4_phys;
 }
 
 void sched_yield(void)
@@ -614,6 +632,13 @@ uint64_t sched_uptime_ticks(void)
     return g_ticks;
 }
 
+static uint64_t g_idle_ticks;
+
+uint64_t sched_idle_ticks(void)
+{
+    return g_idle_ticks;
+}
+
 void sched_tick(void)
 {
     uint64_t i;
@@ -635,6 +660,7 @@ void sched_tick(void)
     g_current->total_ticks++;
 
     if (g_current == g_idle) {
+        g_idle_ticks++;
         /* Idle never burns a slice; just give queued work a chance. */
         sched_schedule();
         return;

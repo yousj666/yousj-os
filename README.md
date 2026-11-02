@@ -387,9 +387,36 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   只读页 read、往未映射窗口 read/stat/nanosleep/
   gettimeofday/子进程内野 rsp 的 sigreturn 全部
   -EFAULT、事后系统照常工作；其余十五链不回归。
+- ✅ 文件系统 M25（2026-11-02）：/proc 雏形。fs 层加
+  第三个后端：路径以 /proc 为前缀的 open/stat/
+  getdents 在解析层之前被截走，交给一组生成式只读
+  文件——uptime（开机秒数与 idle 秒数，厘秒精度）、
+  meminfo（MemTotal/MemFree/MemAvailable，按 PMM 页
+  数×4KiB）、version（版本横幅）。内容在 open 时一次
+  快照进文件对象，read/lseek 按偏移供给，stat 给
+  0444（目录 0555；根目录经 ramfs 挂载点让 ls / 能
+  看见 proc/）；write 与指向 /proc 的 mkdir/unlink/
+  rmdir/rename/symlink 一律拒绝。idle 数字是真的：
+  调度器新计 idle 节拍，M2 自测那两个永不退出的
+  spin 线程改为考后自退——此前机器从未真正 idle，
+  uptime 第二个数永远贴着 0。本轮还刨出一个潜伏多
+  时的大 bug：调度器的 CR3 缓存拿 struct vmm_space
+  指针作比较键，而 exit/execve 绕开调度器直接装
+  CR3、空间池槽位又按先空闲先用回收——一个任务
+  exec 之后，旧槽位被 clone 新空间占上时指针相等，
+  调度器误判「空间没变」跳过 CR3 装载，子进程便跑
+  进父进程的页表里（两边栈互踩、子进程 RIP=0 崩
+  死，fx 套件每轮漏 4 页且 PMM 不平衡）。修复：缓
+  存键改成 PML4 物理地址，exit/execve 的直接装载
+  补 sched_note_cr3() 回报缓存；clone 的子 RSP 也
+  改从入口帧槽位取（入口 shim 本为此而存），不再读
+  会被后入系统调用覆盖的 per-CPU 全局槽。验收：新
+  套件 proctest 九场景两轮全过，fx 套件 PMM 平衡项
+  恢复 PASS，其余十六链不回归。顺带记档：被收养
+  的孤儿僵尸要等 shell 退出才被 init 清扫（init 主
+  循环阻塞在对 shell 的 wait4 上），已列入下一步。
 - ⏳ 下一步候选：utimensat 与独立 atime/ctime 跟踪、
-  /proc 雏形（ps 的数据已有原生通道，可先做
-  /proc/uptime 与 /proc/meminfo）。
+  孤儿僵尸及时清扫（init 主循环改造）。
 
 ## 从零构建
 

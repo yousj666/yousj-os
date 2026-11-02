@@ -218,6 +218,9 @@ struct task *kthread_create_auto(const char *name, void (*entry)(void *arg),
  * around these calls (design sec. 4.2). */
 void sched_schedule(void);
 void sched_yield(void);
+/* Tell the scheduler's CR3 cache about a direct vmm_load_cr3()
+ * done outside sched_schedule() (exit / execve commit paths). */
+void sched_note_cr3(uint64_t pml4_phys);
 
 /* Block the current task and schedule another; returns when the
  * task has been woken and rescheduled. */
@@ -278,6 +281,7 @@ uint64_t sched_snapshot_tasks(char *buf, uint64_t cap);
  * idle task is on CPU and work is queued). */
 void     sched_tick(void);
 uint64_t sched_uptime_ticks(void);
+uint64_t sched_idle_ticks(void); /* M25: for /proc/uptime */
 
 /* Sleep for at least the given number of ticks (10 ms each at
  * 100 Hz), via the BLOCKED state plus wake_tick; nanosleep's kernel

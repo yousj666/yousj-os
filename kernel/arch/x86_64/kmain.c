@@ -48,10 +48,17 @@ struct spin_arg {
     volatile uint64_t *count;
 };
 
+static volatile int g_spin_stop;
+
 static void spin_thread(void *arg)
 {
     struct spin_arg *s = (struct spin_arg *)arg;
-    for (;;)
+    /* M25: once the monitor has its verdict it raises
+     * g_spin_stop and the spinners retire THEMSELVES via
+     * the ordinary exit path (honest zombies the launcher
+     * reaps, like every other boot thread) instead of
+     * burning timeslices forever. */
+    while (!g_spin_stop)
         (*s->count)++;
 }
 
@@ -106,6 +113,12 @@ static void monitor_thread(void *arg)
     } else {
         serial_puts("Yousj OS: sched M2 self-test FAILED\n");
     }
+    /* M25: the test is over -- tell the spinners to retire
+     * (see spin_thread) instead of burning timeslices
+     * forever; until now the machine was never actually
+     * idle at rest, which /proc/uptime's idle field made
+     * impossible to ignore. */
+    g_spin_stop = 1;
     /* Test over: just exit. The spinners would run forever, but
      * they only burn their own timeslices; the M3 launcher thread
      * (created alongside) notices this thread's zombie and carries

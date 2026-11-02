@@ -60,8 +60,14 @@ struct yousj_file {
     struct yousj_ramfs_node *node; /* NULL and pipe NULL: console */
     struct yousj_pipe *pipe;       /* non-NULL: a pipe end (M10) */
     struct yousj_epoll *epoll;     /* non-NULL: an epoll set (M18) */
-    int backend;                   /* 0 ramfs, 1 yfs (M12) */
+    int backend;                   /* 0 ramfs, 1 yfs (M12),
+                                      2 proc (M25) */
     uint32_t yfs_ino;              /* valid when backend == 1 */
+    int proc_id;                   /* backend 2: 0 = the /proc
+                                      directory, else PROC_ID_* */
+    uint32_t proc_len;             /* backend 2: snapshot size */
+    char proc_buf[288];            /* backend 2: content snapshot
+                                      taken at open (M25) */
     uint64_t offset;               /* shared across fork (the
                                       object is shared, not the
                                       fd number); unused for pipes */
