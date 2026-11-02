@@ -558,9 +558,20 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   默认值），列入候选。验收：dirfdtest 加
   chmod-family 场景，ramfs 与 yfs（disk 套件）
   各跑一遍。
+- ✅ umask 与创建 mode 贯通 M37（2026-11-03）：
+  umask(95) 转正——任务出生默认 0022（kthread
+  创建处统一赋值）、clone 继承、exec 保留；
+  open(O_CREAT) 与 mkdir/mkdirat 的 mode 参数
+  经调用者 umask 过滤后贯通 fs_open_path/
+  fs_mkdir_path 落到两后端。偏离明示：mode 传
+  0 仍取默认 0644/0755（自家程序普遍传 0，
+  不引入 Linux 的 000 文件陷阱）。验收：
+  dirfdtest 加 creat-modes（umask 0027 下 0666
+  →0640、umask 0 下 mkdir 0777 全保留、恢复
+  0022 后 0755），ramfs/yfs 各一遍。
 - ⏳ 下一步候选：getdents64 的 d_off 语义细
   化、硬链接（目录项重构）、/proc/<pid>/maps
-  示意、open(O_CREAT) 的 mode 贯通、umask。
+  示意、sendfile/splice 等零拷贝家族盘点。
 
 ## 从零构建
 

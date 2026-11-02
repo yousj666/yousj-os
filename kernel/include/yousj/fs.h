@@ -101,13 +101,16 @@ uint64_t fs_node_size(const struct yousj_ramfs_node *n);
 
 /* Create a directory at an absolute path (parents must exist).
  * 0 or a negative errno. */
-long fs_mkdir_path(const char *path);
+long fs_mkdir_path(const char *path,
+                   uint32_t mode_bits); /* M37: 0 = default */
 
 /* Open the file at an absolute path with Linux-ish flag
  * semantics (O_CREAT creates a regular file, O_TRUNC truncates
  * on a writing open, directories are read-only). On success
  * *out holds a referenced file object; release with file_put. */
 long fs_open_path(const char *path, long flags,
+                  uint32_t mode_bits, /* M37: O_CREAT mode,
+                                         0 = default */
                   struct yousj_file **out);
 
 /* The pinned console file object (never freed; file_put on it

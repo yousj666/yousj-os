@@ -532,6 +532,7 @@ static long sys_clone(struct yousj_syscall_ctx *ctx, long flags,
                 child->cmdline[i] = me->cmdline[i];
             child->cmdline_len = me->cmdline_len;
         }
+        child->umask = me->umask; /* M37 */
         /* M34: environ inherits the same way. */
         {
             uint32_t i;
@@ -1024,7 +1025,8 @@ static long fd_alloc(struct task *t, struct yousj_file *f)
     return -YOUSJ_EMFILE;
 }
 
-static long sys_openat(long dirfd, uint64_t path_ptr, long flags)
+static long sys_openat(long dirfd, uint64_t path_ptr, long flags,
+                       long mode)
 {
     struct task *me = sched_current();
     static char path_buf[256];
@@ -1037,7 +1039,17 @@ static long sys_openat(long dirfd, uint64_t path_ptr, long flags)
     rc = resolve_at(me, dirfd, path_buf, resolved);
     if (rc != 0)
         return rc;
-    rc = fs_open_path(resolved, flags, &f);
+    /* M37: the O_CREAT mode, through the caller's
+     * umask. A caller passing 0 gets the historical
+     * default (our own programs pass 0 casually; Linux
+     * would make a 000 file, a footgun not worth
+     * importing). */
+    {
+        uint32_t eff = 0;
+        if ((flags & YOUSJ_O_CREAT) && mode != 0)
+            eff = (uint32_t)mode & ~me->umask & 07777u;
+        rc = fs_open_path(resolved, flags, eff, &f);
+    }
     if (rc != 0)
         return rc;
     /* M30: remember the path for dirfd-relative calls
@@ -1098,7 +1110,7 @@ static long sys_getdents64(long fd, uint64_t buf, uint64_t count)
     return file_getdents(f, (uint8_t *)(uintptr_t)buf, count);
 }
 
-static long sys_mkdir_sys(uint64_t path_ptr)
+static long sys_mkdir_sys(uint64_t path_ptr, long mode)
 {
     struct task *me = sched_current();
     static char path_buf[256];
@@ -1107,7 +1119,10 @@ static long sys_mkdir_sys(uint64_t path_ptr)
     if (copy_user_string(path_ptr, path_buf, sizeof(path_buf)) != 0)
         return -YOUSJ_EFAULT;
     resolve_path(me, path_buf, resolved);
-    return fs_mkdir_path(resolved);
+    return fs_mkdir_path(resolved, mode != 0
+                                       ? ((uint32_t)mode &
+                                          ~me->umask & 07777u)
+                                       : 0);
 }
 
 static long sys_chdir_sys(uint64_t path_ptr)
@@ -1902,7 +1917,8 @@ static long sys_unlinkat(long dirfd, uint64_t path_ptr)
  * (one parent, one name), so hard links need a
  * directory-entry redesign, not a wrapper. */
 
-static long sys_mkdirat(long dirfd, uint64_t path_ptr)
+static long sys_mkdirat(long dirfd, uint64_t path_ptr,
+                        long mode)
 {
     struct task *me = sched_current();
     static char pb[256], rp[256];
@@ -1912,7 +1928,10 @@ static long sys_mkdirat(long dirfd, uint64_t path_ptr)
     rc = resolve_at(me, dirfd, pb, rp);
     if (rc != 0)
         return rc;
-    return fs_mkdir_path(rp);
+    return fs_mkdir_path(rp, mode != 0
+                                 ? ((uint32_t)mode &
+                                    ~me->umask & 07777u)
+                                 : 0);
 }
 
 static long sys_readlinkat(long dirfd, uint64_t path_ptr,
@@ -2931,9 +2950,11 @@ static long dispatch_inner(struct yousj_syscall_ctx *ctx)
     case YOUSJ_SYS_write:
         return sys_write((long)a1, a2, a3);
     case YOUSJ_SYS_open:
-        return sys_openat(YOUSJ_AT_FDCWD, a1, (long)a2);
+        return sys_openat(YOUSJ_AT_FDCWD, a1, (long)a2,
+                          (long)a3);
     case YOUSJ_SYS_openat:
-        return sys_openat((long)a1, a2, (long)a3);
+        return sys_openat((long)a1, a2, (long)a3,
+                          (long)a4);
     case YOUSJ_SYS_close:
         return sys_close((long)a1);
     case YOUSJ_SYS_lseek:
@@ -2941,7 +2962,7 @@ static long dispatch_inner(struct yousj_syscall_ctx *ctx)
     case YOUSJ_SYS_getdents64:
         return sys_getdents64((long)a1, a2, a3);
     case YOUSJ_SYS_mkdir:
-        return sys_mkdir_sys(a1);
+        return sys_mkdir_sys(a1, (long)a2);
     case YOUSJ_SYS_chdir:
         return sys_chdir_sys(a1);
     case YOUSJ_SYS_getcwd:
@@ -2985,7 +3006,7 @@ static long dispatch_inner(struct yousj_syscall_ctx *ctx)
     case YOUSJ_SYS_unlinkat:
         return sys_unlinkat((long)a1, a2);
     case YOUSJ_SYS_mkdirat:
-        return sys_mkdirat((long)a1, a2);
+        return sys_mkdirat((long)a1, a2, (long)a3);
     case YOUSJ_SYS_readlinkat:
         return sys_readlinkat((long)a1, a2, a3, a4);
     case YOUSJ_SYS_renameat:
@@ -3020,6 +3041,12 @@ static long dispatch_inner(struct yousj_syscall_ctx *ctx)
                    : -YOUSJ_EBADF;
     case YOUSJ_SYS_fchownat:
         return sys_fchownat((long)a1, a2, (long)a5);
+    case YOUSJ_SYS_umask: {
+        struct task *t = sched_current();
+        long old = (long)t->umask;
+        t->umask = (uint32_t)a1 & 0777u;
+        return old;
+    }
     case YOUSJ_SYS_rmdir:
         return sys_rmdir_sys(a1);
     case YOUSJ_SYS_rename:

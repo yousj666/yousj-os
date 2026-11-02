@@ -153,6 +153,9 @@ struct task {
     uint64_t        sig_alt_sp;   /* M32: alternate signal stack */
     uint64_t        sig_alt_size;
     uint32_t        sig_alt_flags; /* YOUSJ_SS_DISABLE when off */
+    uint32_t        umask;        /* M37: creation mask,
+                                     born 0022, clone keeps
+                                     the parent's, exec too */
     int             sig_killed;   /* when a signal ended this
                                      task: its number, else 0;
                                      wait4 builds the status

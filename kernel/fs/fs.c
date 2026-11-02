@@ -788,6 +788,7 @@ static long fs_resolve_links(const char *path, char *out,
 }
 
 static long ramfs_open_path(const char *path, long flags,
+                            uint32_t mode_bits,
                             struct yousj_file **out)
 {
     struct yousj_ramfs_node *n = fs_lookup(path);
@@ -807,6 +808,8 @@ static long ramfs_open_path(const char *path, long flags,
         n = node_create(parent, base, str_len(base), false);
         if (n == NULL)
             return -YOUSJ_ENOSPC;
+        if (mode_bits != 0)
+            n->mode = mode_bits; /* M37: O_CREAT mode */
     }
     if (n->is_link)
         return -YOUSJ_ELOOP_L; /* resolution missed one */
@@ -831,6 +834,7 @@ static long ramfs_open_path(const char *path, long flags,
 }
 
 static long yfs_open_path_fs(const char *rel, long flags,
+                             uint32_t mode_bits,
                              struct yousj_file **out)
 {
     long ino;
@@ -850,6 +854,8 @@ static long yfs_open_path_fs(const char *rel, long flags,
             ino = yfs_mknod(parent, name, false);
             if (ino < 0)
                 return ino;
+            if (mode_bits != 0)
+                yfs_set_mode((uint32_t)ino, mode_bits);
         }
     }
     if (yfs_type_of((uint32_t)ino) == 3)
@@ -1253,7 +1259,7 @@ static long proc_open(const char *path, long flags,
 }
 
 long fs_open_path(const char *path, long flags,
-                  struct yousj_file **out)
+                  uint32_t mode_bits, struct yousj_file **out)
 {
     char resolved[PATH_MAX_LEN + 1];
     long rc;
@@ -1270,7 +1276,8 @@ long fs_open_path(const char *path, long flags,
             if (proc_link_target(id, pid, target,
                                   sizeof(target)) < 0)
                 return -YOUSJ_ENOENT_L;
-            return fs_open_path(target, flags, out);
+            return fs_open_path(target, flags, mode_bits,
+                                out);
         }
     }
     rc = fs_resolve_links(path, resolved, true);
@@ -1278,13 +1285,14 @@ long fs_open_path(const char *path, long flags,
         return rc;
     path = resolved;
     if (is_data_path(path))
-        return yfs_open_path_fs(data_rel(path), flags, out);
+        return yfs_open_path_fs(data_rel(path), flags,
+                                mode_bits, out);
     if (is_proc_path(path))
         return proc_open(path, flags, out);
-    return ramfs_open_path(path, flags, out);
+    return ramfs_open_path(path, flags, mode_bits, out);
 }
 
-long fs_mkdir_path(const char *path)
+long fs_mkdir_path(const char *path, uint32_t mode_bits)
 {
     char resolved[PATH_MAX_LEN + 1];
     long rc = fs_resolve_links(path, resolved, false);
@@ -1298,9 +1306,17 @@ long fs_mkdir_path(const char *path)
         long ino;
         split_parent_name(data_rel(path), parent, name);
         ino = yfs_mknod(parent, name, true);
+        if (ino >= 0 && mode_bits != 0)
+            yfs_set_mode((uint32_t)ino, mode_bits);
         return ino >= 0 ? 0 : ino;
     }
-    return ramfs_mkdir_path(path);
+    rc = ramfs_mkdir_path(path);
+    if (rc == 0 && mode_bits != 0) {
+        struct yousj_ramfs_node *n = fs_lookup(path);
+        if (n != NULL)
+            n->mode = mode_bits;
+    }
+    return rc;
 }
 
 long fs_unlink_path(const char *path)
@@ -2344,11 +2360,11 @@ static void mkdir_p(const char *path)
     for (i = 1; i < n; i++) {
         if (buf[i] == '/') {
             buf[i] = '\0';
-            fs_mkdir_path(buf);
+            fs_mkdir_path(buf, 0);
             buf[i] = '/';
         }
     }
-    fs_mkdir_path(buf);
+    fs_mkdir_path(buf, 0);
 }
 
 static uint64_t align4(uint64_t v)

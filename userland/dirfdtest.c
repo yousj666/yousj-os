@@ -49,6 +49,7 @@
 #define SYS_chown 92
 #define SYS_fchownat 260
 #define SYS_fchmodat 268
+#define SYS_umask 95
 
 #define AT_FDCWD (-100)
 #define AT_SYMLINK_NOFOLLOW 0x100
@@ -199,10 +200,26 @@ int main(int argc, char **argv)
     sys_call1(SYS_unlink, (long)(uintptr_t)p);
     join(p, dir, "r2.txt");
     sys_call1(SYS_unlink, (long)(uintptr_t)p);
+    join(p, dir, "m.txt");
+    sys_call1(SYS_unlink, (long)(uintptr_t)p);
+    join(p, dir, "m2.txt");
+    sys_call1(SYS_unlink, (long)(uintptr_t)p);
+    join(p, dir, "mdir");
+    sys_call1(SYS_rmdir, (long)(uintptr_t)p);
+    join(p, dir, "mdir2");
+    sys_call1(SYS_rmdir, (long)(uintptr_t)p);
     join(p, dir, "r3.txt");
     sys_call1(SYS_unlink, (long)(uintptr_t)p);
     join(p, dir, "ln3");
     sys_call1(SYS_unlink, (long)(uintptr_t)p);
+    join(p, dir, "m.txt");
+    sys_call1(SYS_unlink, (long)(uintptr_t)p);
+    join(p, dir, "m2.txt");
+    sys_call1(SYS_unlink, (long)(uintptr_t)p);
+    join(p, dir, "mdir");
+    sys_call1(SYS_rmdir, (long)(uintptr_t)p);
+    join(p, dir, "mdir2");
+    sys_call1(SYS_rmdir, (long)(uintptr_t)p);
     join(p, dir, "sub2");
     sys_call1(SYS_rmdir, (long)(uintptr_t)p);
     join(p, dir, "sub");
@@ -476,15 +493,71 @@ int main(int argc, char **argv)
                e1 == -13 && e2 == -2);
     }
 
+    /* --- M37: umask + creation modes --- */
+    {
+        struct st sb2;
+        long u0 = sys_call3(SYS_umask, 0027, 0, 0);
+        fd = sys_call4(SYS_openat, dfd,
+                       (long)(uintptr_t)"m.txt", 0101, 0666);
+        if (fd >= 0)
+            sys_call1(SYS_close, fd);
+        sys_call4(SYS_newfstatat, dfd,
+                  (long)(uintptr_t)"m.txt",
+                  (long)(uintptr_t)&sb2, 0);
+        long mm1 = sb2.mode & 0777;
+        long u1 = sys_call3(SYS_umask, 0, 0, 0);
+        fd = sys_call4(SYS_openat, dfd,
+                       (long)(uintptr_t)"m2.txt", 0101,
+                       0600);
+        if (fd >= 0)
+            sys_call1(SYS_close, fd);
+        sys_call4(SYS_newfstatat, dfd,
+                  (long)(uintptr_t)"m2.txt",
+                  (long)(uintptr_t)&sb2, 0);
+        long mm2 = sb2.mode & 0777;
+        long d1 = sys_call3(SYS_mkdirat, dfd,
+                            (long)(uintptr_t)"mdir", 0777);
+        sys_call4(SYS_newfstatat, dfd,
+                  (long)(uintptr_t)"mdir",
+                  (long)(uintptr_t)&sb2, 0);
+        long mm3 = sb2.mode & 0777;
+        sys_call3(SYS_umask, 0022, 0, 0);
+        long d2 = sys_call3(SYS_mkdirat, dfd,
+                            (long)(uintptr_t)"mdir2", 0777);
+        sys_call4(SYS_newfstatat, dfd,
+                  (long)(uintptr_t)"mdir2",
+                  (long)(uintptr_t)&sb2, 0);
+        long mm4 = sb2.mode & 0777;
+        report("creat-modes", u0 == 0022 && mm1 == 0640 &&
+               u1 == 0027 && mm2 == 0600 && d1 == 0 &&
+               mm3 == 0777 && d2 == 0 && mm4 == 0755);
+    }
+
     sys_call1(SYS_close, dfd);
 
     /* teardown: remove the whole tree so a second run in
      * the same boot starts from the same state (and the
      * harness's free-page comparison stays meaningful) */
+    join(p, dir, "m.txt");
+    sys_call1(SYS_unlink, (long)(uintptr_t)p);
+    join(p, dir, "m2.txt");
+    sys_call1(SYS_unlink, (long)(uintptr_t)p);
+    join(p, dir, "mdir");
+    sys_call1(SYS_rmdir, (long)(uintptr_t)p);
+    join(p, dir, "mdir2");
+    sys_call1(SYS_rmdir, (long)(uintptr_t)p);
     join(p, dir, "r3.txt");
     sys_call1(SYS_unlink, (long)(uintptr_t)p);
     join(p, dir, "ln3");
     sys_call1(SYS_unlink, (long)(uintptr_t)p);
+    join(p, dir, "m.txt");
+    sys_call1(SYS_unlink, (long)(uintptr_t)p);
+    join(p, dir, "m2.txt");
+    sys_call1(SYS_unlink, (long)(uintptr_t)p);
+    join(p, dir, "mdir");
+    sys_call1(SYS_rmdir, (long)(uintptr_t)p);
+    join(p, dir, "mdir2");
+    sys_call1(SYS_rmdir, (long)(uintptr_t)p);
     join(p, dir, "sub2");
     sys_call1(SYS_rmdir, (long)(uintptr_t)p);
     join(p, dir, "f.txt");
