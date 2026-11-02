@@ -52,15 +52,6 @@ static uint64_t str_len(const char *s)
     return n;
 }
 
-static int str_eq(const char *a, const char *b)
-{
-    while (*a && *a == *b) {
-        a++;
-        b++;
-    }
-    return *a == *b;
-}
-
 static void mem_copy(uint8_t *dst, const uint8_t *src, uint64_t n)
 {
     uint64_t i;
@@ -544,40 +535,115 @@ static long install_file(const char *path, const uint8_t *data,
     return node_pwrite(n, 0, data, len) == (long)len ? 0 : -YOUSJ_ENOSPC;
 }
 
-extern const uint8_t _binary_yousj_init_elf_start[];
-extern const uint8_t _binary_yousj_init_elf_end[];
-extern const uint8_t _binary_hello_elf_start[];
-extern const uint8_t _binary_hello_elf_end[];
-extern const uint8_t _binary_sh_elf_start[];
-extern const uint8_t _binary_sh_elf_end[];
-extern const uint8_t _binary_sigtest_elf_start[];
-extern const uint8_t _binary_sigtest_elf_end[];
-extern const uint8_t _binary_fxtest_elf_start[];
-extern const uint8_t _binary_fxtest_elf_end[];
-extern const uint8_t _binary_fstest_elf_start[];
-extern const uint8_t _binary_fstest_elf_end[];
-extern const uint8_t _binary_cat_elf_start[];
-extern const uint8_t _binary_cat_elf_end[];
-extern const uint8_t _binary_pipetest_elf_start[];
-extern const uint8_t _binary_pipetest_elf_end[];
+extern const uint8_t _binary_initramfs_cpio_start[];
+extern const uint8_t _binary_initramfs_cpio_end[];
 
-void fs_populate_embedded(void)
+/* --- M11: newc cpio initramfs unpacking -------------------------
+ * The root filesystem arrives as one archive (built by
+ * tools/mkinitramfs.py, embedded in the kernel image). Entry
+ * header: 6-byte magic "070701" then thirteen 8-digit hex
+ * fields; the name follows (namesize includes its NUL), header
+ * + name padded to 4 bytes, then the data, also padded to 4.
+ * Directories are created mkdir -p style; regular files go
+ * through install_file; anything else (symlinks, devices) is
+ * skipped -- userland has no concept of them yet. */
+
+static uint32_t cpio_hex8(const uint8_t *p)
 {
-    fs_mkdir_path("/bin");
-    install_file("/init", _binary_yousj_init_elf_start,
-                 (uint64_t)(_binary_yousj_init_elf_end - _binary_yousj_init_elf_start));
-    install_file("/bin/hello", _binary_hello_elf_start,
-                 (uint64_t)(_binary_hello_elf_end - _binary_hello_elf_start));
-    install_file("/bin/sh", _binary_sh_elf_start,
-                 (uint64_t)(_binary_sh_elf_end - _binary_sh_elf_start));
-    install_file("/bin/sigtest", _binary_sigtest_elf_start,
-                 (uint64_t)(_binary_sigtest_elf_end - _binary_sigtest_elf_start));
-    install_file("/bin/fxtest", _binary_fxtest_elf_start,
-                 (uint64_t)(_binary_fxtest_elf_end - _binary_fxtest_elf_start));
-    install_file("/bin/fstest", _binary_fstest_elf_start,
-                 (uint64_t)(_binary_fstest_elf_end - _binary_fstest_elf_start));
-    install_file("/bin/cat", _binary_cat_elf_start,
-                 (uint64_t)(_binary_cat_elf_end - _binary_cat_elf_start));
-    install_file("/bin/pipetest", _binary_pipetest_elf_start,
-                 (uint64_t)(_binary_pipetest_elf_end - _binary_pipetest_elf_start));
+    uint32_t v = 0;
+    int i;
+    for (i = 0; i < 8; i++) {
+        uint8_t c = p[i];
+        v <<= 4;
+        if (c >= '0' && c <= '9')
+            v |= (uint32_t)(c - '0');
+        else if (c >= 'a' && c <= 'f')
+            v |= (uint32_t)(c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F')
+            v |= (uint32_t)(c - 'A' + 10);
+    }
+    return v;
+}
+
+static void mkdir_p(const char *path)
+{
+    char buf[160];
+    uint64_t i, n = str_len(path);
+
+    if (n >= sizeof(buf))
+        return;
+    for (i = 0; i <= n; i++)
+        buf[i] = path[i];
+    for (i = 1; i < n; i++) {
+        if (buf[i] == '/') {
+            buf[i] = '\0';
+            fs_mkdir_path(buf);
+            buf[i] = '/';
+        }
+    }
+    fs_mkdir_path(buf);
+}
+
+static uint64_t align4(uint64_t v)
+{
+    return (v + 3) & ~(uint64_t)3;
+}
+
+long fs_load_initramfs(void)
+{
+    const uint8_t *base = _binary_initramfs_cpio_start;
+    uint64_t len = (uint64_t)(_binary_initramfs_cpio_end -
+                              _binary_initramfs_cpio_start);
+    uint64_t off = 0, files = 0;
+
+    while (off + 110 <= len) {
+        uint32_t mode, fsize, namesize;
+        char name[128], path[160];
+        uint64_t i, dstart, nlen;
+
+        if (base[off] != '0' || base[off + 1] != '7' ||
+            base[off + 2] != '0' || base[off + 3] != '7' ||
+            base[off + 4] != '0' || base[off + 5] != '1')
+            return files > 0 ? (long)files : -1;
+        mode = cpio_hex8(base + off + 14);
+        fsize = cpio_hex8(base + off + 54);
+        namesize = cpio_hex8(base + off + 94);
+        if (namesize < 1 || namesize > sizeof(name))
+            return -1;
+        for (i = 0; i + 1 < namesize; i++)
+            name[i] = (char)base[off + 110 + i];
+        name[namesize - 1] = '\0';
+        if (name[0] == 'T' && str_len(name) == 10 &&
+            name[1] == 'R' && name[2] == 'A' && name[3] == 'I')
+            break; /* TRAILER!!! */
+        dstart = off + align4(110 + namesize);
+        if (dstart + fsize > len)
+            return -1;
+        /* build the absolute path "/" + name */
+        nlen = str_len(name);
+        if (nlen + 2 > sizeof(path))
+            return -1;
+        path[0] = '/';
+        for (i = 0; i <= nlen; i++)
+            path[1 + i] = name[i];
+        if ((mode & 0170000) == 0040000) {
+            mkdir_p(path);
+        } else if ((mode & 0170000) == 0100000) {
+            /* ensure the parent chain exists */
+            char parent[160];
+            uint64_t j = nlen + 1;
+            while (j > 0 && path[j] != '/')
+                j--;
+            if (j > 0) {
+                for (i = 0; i < j; i++)
+                    parent[i] = path[i];
+                parent[j] = '\0';
+                mkdir_p(parent);
+            }
+            if (install_file(path, base + dstart, fsize) == 0)
+                files++;
+        }
+        off = dstart + align4(fsize);
+    }
+    return (long)files;
 }

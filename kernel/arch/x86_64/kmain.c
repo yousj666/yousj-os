@@ -252,14 +252,10 @@ static void boot_launcher_thread(void *arg)
      * and started; init owns the console from there and this
      * thread retires. */
     {
-        extern const uint8_t _binary_yousj_init_elf_start[];
-        extern const uint8_t _binary_yousj_init_elf_end[];
         static struct vmm_space ispace;
         static struct user_start istart;
         struct task *itask;
         uint64_t entry = 0, img_brk = 0, heap_base;
-        uint64_t elf_size = (uint64_t)(_binary_yousj_init_elf_end -
-                                       _binary_yousj_init_elf_start);
         int ok = 1;
 
         /* The ps/kill acceptance target: a kernel thread that sleeps in long stretches, so it shows up as S in ps. */
@@ -269,10 +265,28 @@ static void boot_launcher_thread(void *arg)
         if (ok && vmm_create_space(&ispace) != 0)
             ok = 0;
         if (ok) {
-            if (elf_load_user_image(_binary_yousj_init_elf_start,
-                                    elf_size, &ispace,
-                                    &entry, &img_brk) != 0)
+            /* M11: /init comes out of the ramfs like any execve
+             * target (it arrived via the initramfs); stage it in
+             * a contiguous PMM run for the ELF loader. */
+            struct yousj_ramfs_node *inode = fs_lookup("/init");
+            uint64_t isize = inode != NULL ? fs_node_size(inode) : 0;
+            uint64_t ipages =
+                (isize + YOUSJ_PAGE_SIZE - 1) / YOUSJ_PAGE_SIZE;
+            uint64_t istage = ipages != 0 ? pmm_alloc_pages(ipages) : 0;
+
+            if (inode == NULL || istage == 0)
                 ok = 0;
+            if (ok) {
+                uint8_t *ibuf =
+                    (uint8_t *)yousj_phys_to_virt(istage);
+                if (fs_node_read_all(inode, ibuf, isize) !=
+                    (long)isize)
+                    ok = 0;
+                if (ok && elf_load_user_image(ibuf, isize, &ispace,
+                                              &entry, &img_brk) != 0)
+                    ok = 0;
+                pmm_free_pages(istage, ipages);
+            }
         }
         /* User stack: 4 pages below YOUSJ_INIT_STACK_TOP; the top
          * page carries the Linux initial-stack block (argc/argv/
@@ -482,8 +496,11 @@ void kmain(struct yousj_boot_info *boot_info)
         /* M9: the ramfs exists before any task does; the
          * embedded program images become its first files. */
         fs_init();
-        fs_populate_embedded();
-        serial_puts("Yousj OS: ramfs init PASS (/init and /bin populated)\n");
+        if (fs_load_initramfs() < 0) {
+            serial_puts("Yousj OS: initramfs FAILED (corrupt archive)\n");
+            halt_forever();
+        }
+        serial_puts("Yousj OS: ramfs init PASS (initramfs unpacked)\n");
 
         sched_init();
         ta = kthread_create_auto("thread-A", demo_thread, &arg_a);

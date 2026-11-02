@@ -535,6 +535,20 @@ int main(void)
 {
     static char line[256];
 
+    /* The message of the day, if the rootfs carries one. */
+    {
+        long fd = sys_call3(SYS_open,
+                            (long)(uintptr_t)"/etc/motd", O_RDONLY, 0);
+        if (fd >= 0) {
+            char mb[128];
+            long n;
+            while ((n = sys_call3(SYS_read, fd,
+                                  (long)(uintptr_t)mb,
+                                  (long)sizeof(mb))) > 0)
+                out_n(mb, (size_t)n);
+            sys_call3(SYS_close, fd, 0, 0);
+        }
+    }
     out("yousj-sh: shell ready (pid ");
     out_long(sys_call3(SYS_getpid, 0, 0, 0));
     out(")\n");

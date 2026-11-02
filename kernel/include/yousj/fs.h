@@ -70,7 +70,10 @@ struct yousj_file {
  * retiring the M5 execve registry. Order: fs_init() before
  * fs_populate_embedded(), both before the first user task. */
 void fs_init(void);
-void fs_populate_embedded(void);
+/* M11: unpack the embedded newc cpio initramfs into the
+ * ramfs. Returns the number of files installed, or negative
+ * on a corrupt archive. */
+long fs_load_initramfs(void);
 
 /* Absolute-path lookup; NULL when any component is missing. */
 struct yousj_ramfs_node *fs_lookup(const char *path);

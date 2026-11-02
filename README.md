@@ -153,8 +153,21 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   dup 共享偏移、cloexec 跨 exec 消失）连跑两遍全 PASS＋
   PMM 稳态；shell 级九项检查（重定向落盘、cat 读回、管
   道、stdin 重定向、echo 落盘与追加）全 PASS；七链不回归。
-- ⏳ 下一步候选：mmap 文件映射、持久化后端（initramfs/磁
-  盘，让 ramfs 重启不丢）、poll/select、符号链接。
+- ✅ 调度 M11（2026-11-02）：initramfs 根文件系统——根
+  文件系统改为标准的 newc 格式 cpio 归档（`tools/
+  mkinitramfs.py` 在构建时确定性生成：程序 ELF、rootfs/
+  目录树），整包嵌入内核镜像，启动时由内核解包进 ramfs
+  （目录 mkdir -p 式创建、普通文件落盘、其他类型跳过）。
+  M9/M10 的逐程序 objcopy 嵌入（8 个 *_elf_bin.o）整体退
+  役，kmain 启动 /init 也改走文件系统（PMM 暂存加载，与
+  execve 同路）。Shell 启动会打印 /etc/motd（数据文件首
+  次随根文件系统入驻）。两条启动链共用同一镜像、零引导
+  层改动。验收：fs 验收新增 motd 检查（启动打印＋cat 读
+  回），其余七链全绿不回归。诚实的边界：这是 initramfs
+  ——镜像即根文件系统的源头，运行时改动仍不跨重启；真
+  持久化需要块设备驱动＋磁盘文件系统（后续里程碑）。
+- ⏳ 下一步候选：块设备＋磁盘文件系统（真持久化）、mmap
+  文件映射、poll/select、符号链接。
 
 ## 从零构建
 

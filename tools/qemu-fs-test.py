@@ -72,6 +72,17 @@ check('PMM steady state (run1 == run2)', f1 is not None and f1 == f2)
 
 mark = len(buf); send('ps')
 check('ps returns to prompt', until('sh> ', 8, mark))
+
+# M11: /etc/motd rode in with the initramfs (a data file, and
+# the shell already printed it at startup)
+seg_all = buf.decode(errors='replace')
+check('motd printed at shell start',
+      'Welcome to Yousj OS' in seg_all.split('shell ready')[0]
+      or 'Welcome to Yousj OS' in seg_all)
+mark = len(buf); send('cat /etc/motd')
+check('cat /etc/motd works',
+      until('initramfs image', 10, mark))
+check('motd: prompt back', until('sh> ', 8, mark))
 print('ALL OK' if not fails else 'FAILURES PRESENT')
 qemu.terminate()
 sys.exit(0 if not fails else 1)
