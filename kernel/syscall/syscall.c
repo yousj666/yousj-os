@@ -26,15 +26,19 @@
 
 /* Per-CPU data reached via GS after swapgs (SYSCALL_DESIGN 3.3).
  * Field offsets are CONTRACT with syscall_entry.S:
- *   +0 kernel_rsp, +8 user_rsp_save, +16 current_task. */
+ *   +0 kernel_rsp, +8 user_rsp_save, +16 current_task,
+ *   +24 syscall_frame. */
 struct cpu_local {
     uint64_t kernel_rsp;
     uint64_t user_rsp_save;
     uint64_t current_task;
+    uint64_t syscall_frame; /* entry-pushed user frame (clone) */
 };
 
 static struct cpu_local g_cpu_local __attribute__((aligned(64)));
 static struct task *g_init_task;
+
+static void user_gs_normalize(void);
 
 void syscall_set_init_task(struct task *t)
 {
@@ -272,6 +276,97 @@ static long sys_wait4(long pid, uint64_t status_ptr, long options,
         me->wait_target = 0;
     }
 }
+
+/* clone(56), fork-style only (SCHED_DESIGN 6.2): flags may carry
+ * nothing but the exit signal (0 or SIGCHLD); a non-NULL child
+ * stack, CLONE_VM/VFORK/THREAD and friends are -EINVAL, never
+ * silently ignored. The child gets a deep copy of the user
+ * window and resumes at the parent's syscall return point with
+ * rax = 0, from the register frame the entry pushed. */
+#define YOUSJ_SIGCHLD 17
+
+extern void user_frame_resume(uint64_t *resume_fields);
+
+static void clone_child_start(void *arg)
+{
+    struct task *me = sched_current();
+
+    (void)arg;
+    user_gs_normalize();
+    user_frame_resume(&me->resume_rdi);
+    for (;;) {
+        /* unreachable */
+    }
+}
+
+static long sys_clone(long flags, uint64_t child_stack)
+{
+    struct task *me = sched_current();
+    const uint64_t *frame;
+    struct vmm_space *space;
+    struct task *child;
+    uint64_t flags_saved;
+
+    if (me->mm == NULL)
+        return -YOUSJ_EINVAL; /* kernel threads cannot fork */
+    if (child_stack != 0)
+        return -YOUSJ_EINVAL;
+    if ((flags & ~0xFFL) != 0 ||
+        ((flags & 0xFF) != 0 && (flags & 0xFF) != YOUSJ_SIGCHLD))
+        return -YOUSJ_EINVAL;
+    frame = (const uint64_t *)(uintptr_t)g_cpu_local.syscall_frame;
+    if (frame == NULL)
+        return -YOUSJ_EINVAL;
+
+    space = vmm_space_alloc();
+    if (space == NULL)
+        return -YOUSJ_ENOMEM;
+    if (vmm_create_space(space) != 0) {
+        vmm_space_release(space);
+        return -YOUSJ_ENOMEM;
+    }
+    vmm_share_kernel_identity(space);
+    if (vmm_clone_user_window(space, me->mm) != 0) {
+        vmm_free_user_data(space);
+        vmm_destroy_space(space);
+        vmm_space_release(space);
+        return -YOUSJ_ENOMEM;
+    }
+
+    /* Create + bind under cli, as in the M4 boot wiring: the
+     * child must not be scheduled before its space and resume
+     * frame are in place. */
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(flags_saved) : : "memory");
+    child = kthread_create_auto("clone", clone_child_start, NULL);
+    if (child != NULL) {
+        child->mm = space;
+        child->mm_owned = true;
+        child->brk_start = me->brk_start;
+        child->brk_end = me->brk_end;
+        child->fs_base = me->fs_base;
+        child->mmap_next = me->mmap_next;
+        child->resume_r9  = frame[0];
+        child->resume_r8  = frame[16 / 8];
+        child->resume_r10 = frame[24 / 8];
+        child->resume_rdx = frame[32 / 8];
+        child->resume_rsi = frame[40 / 8];
+        child->resume_rdi = frame[48 / 8];
+        child->resume_rcx = frame[56 / 8];
+        child->resume_r11 = frame[64 / 8];
+        child->resume_rsp = g_cpu_local.user_rsp_save;
+        child->has_resume = true;
+    }
+    __asm__ volatile("push %0; popfq" : : "r"(flags_saved) : "memory");
+
+    if (child == NULL) {
+        vmm_free_user_data(space);
+        vmm_destroy_space(space);
+        vmm_space_release(space);
+        return -YOUSJ_ENOMEM;
+    }
+    return (long)child->tid;
+}
+
 
 /* --- batch 1 ------------------------------------------------------------ */
 
@@ -516,6 +611,8 @@ long yousj_syscall_dispatch(long no, long a1, long a2, long a3,
         return sys_uname((uint64_t)a1);
     case YOUSJ_SYS_wait4:
         return sys_wait4(a1, (uint64_t)a2, a3, (uint64_t)a4);
+    case YOUSJ_SYS_clone:
+        return sys_clone(a1, (uint64_t)a2);
     case YOUSJ_SYS_exit:
     case YOUSJ_SYS_exit_group:
         sys_exit_common(a1);
@@ -532,6 +629,24 @@ long yousj_syscall_dispatch(long no, long a1, long a2, long a3,
 
 /* --- user task landing -------------------------------------------------- */
 
+/* Normalize the GS pair for a ring-3 landing. User tasks always
+ * run in ring 3 with GS base 0 (nothing can change it there: no
+ * WRGSBASE, no SET_GS), so the pair has exactly two states --
+ * ring 3: GS=0, KGSB=&g_cpu_local; kernel: GS=&g_cpu_local,
+ * KGSB=0 -- and swapgs toggles between them at syscall
+ * entry/exit. A syscall that never returns (exit/exit_group)
+ * leaves the pair in the kernel state, which once poisoned the
+ * next task's first swapgs (it installed 0 as the kernel GS
+ * base and gs:0 read physical address 0). Never rely on the
+ * inherited state. Safe in kernel context because no kernel
+ * code dereferences GS outside syscall entry (g_cpu_local is
+ * an ordinary C global). */
+static void user_gs_normalize(void)
+{
+    wrmsr(MSR_GS_BASE, 0);
+    wrmsr(MSR_KERNEL_GS_BASE, (uint64_t)(uintptr_t)&g_cpu_local);
+}
+
 void user_task_start(void *arg)
 {
     struct user_start *u = (struct user_start *)arg;
@@ -541,23 +656,8 @@ void user_task_start(void *arg)
     me->user_sp = u->sp;
     /* kernel_rsp / TSS.rsp0 were set by arch_on_task_switch when
      * this task was scheduled in. The address space switch also
-     * happened in sched_schedule().
-     *
-     * GS pairing: user tasks always run in ring 3 with GS base 0
-     * (nothing can change it there: no WRGSBASE, no SET_GS), so
-     * the pair has exactly two states -- ring 3: GS=0,
-     * KGSB=&g_cpu_local; kernel: GS=&g_cpu_local, KGSB=0 -- and
-     * swapgs toggles between them at syscall entry/exit. A
-     * syscall that never returns (exit/exit_group) leaves the
-     * pair in the kernel state; the previous user task's death
-     * therefore poisoned the next task's first swapgs (it
-     * installed 0 as the kernel GS base and gs:0 read physical
-     * address 0). Do not rely on the inherited state: normalize
-     * the pair explicitly before this drop. Safe here because
-     * no kernel code dereferences GS outside syscall entry
-     * (g_cpu_local is an ordinary C global). */
-    wrmsr(MSR_GS_BASE, 0);
-    wrmsr(MSR_KERNEL_GS_BASE, (uint64_t)(uintptr_t)&g_cpu_local);
+     * happened in sched_schedule(). */
+    user_gs_normalize();
     enter_user_mode(u->ip, u->sp);
     for (;;) {
         /* unreachable: leaving ring 3 happens via syscalls only */

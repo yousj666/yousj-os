@@ -112,6 +112,12 @@ void              vmm_space_release(struct vmm_space *space);
  * on the space. Assumes 4 KiB leaves, which is all the user
  * window ever gets in this layout. */
 void              vmm_free_user_data(struct vmm_space *space);
+/* Deep-copy the user window (all present 4 KiB leaves, with
+ * their permissions) from src into the fresh dst space -- the
+ * fork copy for clone (M5). Full copy; COW is a later
+ * optimisation. Returns 0 or -YOUSJ_ENOMEM. */
+int               vmm_clone_user_window(struct vmm_space *dst,
+                                        struct vmm_space *src);
 
 void               vmm_set_kernel_master(struct vmm_space *space);
 struct vmm_space  *vmm_kernel_master(void);

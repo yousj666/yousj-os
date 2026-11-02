@@ -73,6 +73,21 @@ struct task {
                                      kernel stack (auto-created
                                      tasks); 0 = not owned, never
                                      freed by the reaper. */
+    /* M5 clone: the ring-3 register snapshot a cloned child
+     * resumes with (rax is forced to 0 by the landing). Field
+     * order is the user_frame_resume() ABI in syscall_entry.S:
+     * rdi, rsi, rdx, rcx (user RIP), r10, r8, r9, r11 (user
+     * RFLAGS), rsp. */
+    uint64_t        resume_rdi;
+    uint64_t        resume_rsi;
+    uint64_t        resume_rdx;
+    uint64_t        resume_rcx;
+    uint64_t        resume_r10;
+    uint64_t        resume_r8;
+    uint64_t        resume_r9;
+    uint64_t        resume_r11;
+    uint64_t        resume_rsp;
+    bool            has_resume;
     bool            mm_owned;     /* mm points at a pool space from
                                      vmm_space_alloc(): the exit
                                      path destroys it (M5). */

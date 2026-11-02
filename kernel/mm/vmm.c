@@ -379,6 +379,70 @@ void vmm_free_user_data(struct vmm_space *space)
         free_data_tree(pml4[idx] & YOUSJ_PTE_ADDR_MASK, 0);
 }
 
+/* Enumerate the present leaves of the user window and deep-copy
+ * them into dst. The enumeration walks the tables directly; the
+ * per-page flags/phys come from vmm_translate so the PTE <->
+ * abstract-flag conversion lives in exactly one place. */
+static int clone_window_level(struct vmm_space *dst,
+                              struct vmm_space *src,
+                              uint64_t table_phys, int depth,
+                              uint64_t va_base)
+{
+    uint64_t *table = table_of(table_phys);
+    uint32_t i;
+    for (i = 0; i < YOUSJ_VMM_ENTRIES; i++) {
+        uint64_t e = table[i];
+        uint64_t va = va_base + ((uint64_t)i << (39 - 9 * depth));
+        if (!(e & YOUSJ_PTE_PRESENT))
+            continue;
+        if (depth < 3) {
+            int rc = clone_window_level(dst, src,
+                                        e & YOUSJ_PTE_ADDR_MASK,
+                                        depth + 1, va);
+            if (rc != 0)
+                return rc;
+        } else {
+            uint64_t phys = 0, new_phys;
+            uint32_t flags = 0;
+            if (vmm_translate(src, va, &phys, &flags) != 0)
+                return -YOUSJ_ENOMEM;
+            new_phys = g_backend.alloc_page();
+            if (new_phys == 0)
+                return -YOUSJ_ENOMEM;
+            /* Identity period: a physical frame is directly
+             * dereferenceable from the kernel. */
+            {
+                const uint8_t *sp = (const uint8_t *)(uintptr_t)phys;
+                uint8_t *dp = (uint8_t *)(uintptr_t)new_phys;
+                uint32_t b;
+                for (b = 0; b < YOUSJ_PAGE_SIZE; b++)
+                    dp[b] = sp[b];
+            }
+            if (vmm_map(dst, va, new_phys, YOUSJ_PAGE_SIZE, flags) != 0) {
+                g_backend.free_page(new_phys);
+                return -YOUSJ_ENOMEM;
+            }
+        }
+    }
+    return 0;
+}
+
+int vmm_clone_user_window(struct vmm_space *dst, struct vmm_space *src)
+{
+    uint64_t *pml4;
+    uint64_t idx;
+    if (!g_backend_ready || dst == NULL || src == NULL ||
+        dst->pml4_phys == 0 || src->pml4_phys == 0)
+        return -YOUSJ_ENOMEM;
+    pml4 = table_of(src->pml4_phys);
+    idx = (YOUSJ_USER_BASE >> 39) & 0x1FFULL;
+    if (!(pml4[idx] & YOUSJ_PTE_PRESENT))
+        return 0; /* empty window: nothing to copy */
+    return clone_window_level(dst, src,
+                              pml4[idx] & YOUSJ_PTE_ADDR_MASK, 1,
+                              idx << 39);
+}
+
 void vmm_set_kernel_master(struct vmm_space *space)
 {
     g_kernel_master = space;

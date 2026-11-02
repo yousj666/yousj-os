@@ -46,6 +46,11 @@ syscall_entry:
     push %r8
     push $0                 /* alignment pad (9th push, see header) */
     push %r9                /* a6: dispatcher's stack argument */
+    mov %rsp, %gs:24        /* cpu_local.syscall_frame: the pushed
+                             * user frame, clone's snapshot source.
+                             * Slots from here: +0 r9, +8 pad, +16 r8,
+                             * +24 r10, +32 rdx, +40 rsi, +48 rdi,
+                             * +56 rcx (user RIP), +64 r11 (RFLAGS) */
 
     mov %r8, %r9            /* a5 */
     mov %r10, %r8           /* a4 */
@@ -94,5 +99,30 @@ enter_user_mode:
     pushq $0x23             /* CS: user code selector | RPL 3 */
     push %rdi               /* RIP */
     iretq
+
+/* void user_frame_resume(uint64_t *resume_fields)
+ * Clone landing (M5): load a cloned child's saved ring-3
+ * registers (the resume_* fields of its task, in sched.h order)
+ * and sysret into it with rax = 0 -- the child returns from its
+ * clone call exactly where the parent called it. The caller has
+ * already normalized the GS pair (see user_gs_normalize()).
+ * Never returns. */
+    .globl user_frame_resume
+user_frame_resume:
+    mov $0x1B, %ax          /* user data segments, as in ring 3 */
+    mov %ax, %ds
+    mov %ax, %es
+    mov %rdi, %rbx
+    mov 0(%rbx), %rdi
+    mov 8(%rbx), %rsi
+    mov 16(%rbx), %rdx
+    mov 24(%rbx), %rcx      /* user RIP (sysret loads it) */
+    mov 32(%rbx), %r10
+    mov 40(%rbx), %r8
+    mov 48(%rbx), %r9
+    mov 56(%rbx), %r11      /* user RFLAGS (sysret loads it) */
+    mov 64(%rbx), %rsp      /* user stack pointer */
+    xor %eax, %eax          /* the child sees clone() == 0 */
+    sysretq
 
     .section .note.GNU-stack, "", @progbits
