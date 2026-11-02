@@ -122,7 +122,25 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   PASS（基础双精度位精确、双进程 xmm 跨切换隔离、MXCSR
   屏蔽下除零得 +inf 不触发 #XM、信号帧 fpstate 真实性与
   sigreturn 恢复、exec 重置），PMM 对账归零。
-- ⏳ 下一步：文件系统（execve 映像表退役）。
+- ✅ 调度 M9（2026-11-02）：文件系统落地——内存 ramfs
+  （目录/普通文件树、文件内容存 PMM 页、单文件上限 256KiB）
+  ＋每任务 16 项 fd 表＋open-file 对象层：open/openat/close/
+  lseek/getdents64/mkdir/chdir/getcwd 按 Linux 语义与错误码
+  实现，read/write 改为按 fd 路由（控制台仍是串口，含原有
+  阻塞/EINTR 语义）。fork 复制 fd 表并共享 open-file 对象
+  （偏移共享，与 Linux 一致）；进程退出关闭全部 fd；启动时
+  内嵌程序映像装入 ramfs（/init 与 /bin/{sh,hello,sigtest,
+  fxtest,fstest}），**execve 改为从文件系统加载**（经 PMM
+  连续页暂存——HHDM 让连续物理页天然连续虚拟），M5 的内嵌
+  映像注册表彻底退役。验收：`tools/qemu-fs-test.py` 连跑
+  两遍 /bin/fstest 十场景全 PASS（跨运行持久化、写读回、
+  append、截断、seek、getdents、错误码、fork 共享偏移、
+  mkdir+cwd、openat），两遍之间 PMM 计数稳态相等；冒烟/
+  进程/信号/FX/UEFI 五链不回归。已知边界：无持久化存储
+  （关机即失）、无 dup/fcntl、O_CLOEXEC 未实现（fd 跨 exec
+  保留）、路径上限 255、无符号/硬链接。
+- ⏳ 下一步候选：管道 pipe（进程间通信）、mmap 文件映射、
+  dup2＋Shell 重定向、持久化后端（initramfs/磁盘）。
 
 ## 从零构建
 

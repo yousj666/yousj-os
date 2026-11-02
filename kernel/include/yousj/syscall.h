@@ -45,6 +45,7 @@
 #define YOUSJ_SYS_chdir        80
 #define YOUSJ_SYS_mkdir        83
 #define YOUSJ_SYS_getdents64  217
+#define YOUSJ_SYS_openat      257  /* M9 */
 #define YOUSJ_SYS_arch_prctl  158
 #define YOUSJ_SYS_rt_sigpending 127 /* M7 */
 #define YOUSJ_SYS_sigaltstack  131  /* M7: -ENOSYS for now */

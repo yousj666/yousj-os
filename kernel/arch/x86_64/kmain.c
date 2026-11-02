@@ -13,6 +13,7 @@
 #include <yousj/interrupts.h>
 #include <yousj/gdt.h>
 #include <yousj/fpu.h>
+#include <yousj/fs.h>
 #include <yousj/user.h>
 #include <yousj/elf.h>
 #include <drivers/serial.h> /* kernel/drivers/serial.h; -I kernel in Makefile */
@@ -477,6 +478,12 @@ void kmain(struct yousj_boot_info *boot_info)
         arg_a.count = &count_a;
         arg_b.letter = 'B';
         arg_b.count = &count_b;
+
+        /* M9: the ramfs exists before any task does; the
+         * embedded program images become its first files. */
+        fs_init();
+        fs_populate_embedded();
+        serial_puts("Yousj OS: ramfs init PASS (/init and /bin populated)\n");
 
         sched_init();
         ta = kthread_create_auto("thread-A", demo_thread, &arg_a);

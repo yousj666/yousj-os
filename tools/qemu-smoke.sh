@@ -96,6 +96,7 @@ missing=0
 for pat in \
     "Yousj OS: kmain reached" \
     "Yousj OS: FPU init PASS" \
+    "Yousj OS: ramfs init PASS" \
     "Yousj OS: PMM self-test PASS" \
     "Yousj OS: VMM self-test PASS" \
     "Yousj OS: VMM hw-init PASS" \

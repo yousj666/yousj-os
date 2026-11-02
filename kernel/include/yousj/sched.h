@@ -23,6 +23,11 @@
 #include <yousj/signal.h> /* per-task signal state (M7) */
 #include <yousj/fpu.h>    /* per-task FXSAVE area size (M8) */
 
+struct yousj_file; /* M9: open-file objects (fs.h) */
+
+#define YOUSJ_NR_OPEN 16  /* fds per task (M9) */
+#define YOUSJ_CWD_MAX 64  /* cwd path buffer, incl. NUL (M9) */
+
 struct vmm_space; /* from <yousj/vmm.h>; tasks only hold the pointer */
 
 enum task_state {
@@ -136,6 +141,15 @@ struct task {
      * restored eagerly by arch_on_task_switch() -- but only
      * for user tasks; the kernel never touches the FPU. */
     _Alignas(16) uint8_t fx_area[YOUSJ_FX_SIZE];
+    /* M9: the fd table. Entries are shared open-file objects
+     * (fork copies the table and bumps each refcount, so the
+     * offset is shared exactly like Linux). NULL = free slot;
+     * for fds 0-2 a NULL slot means the implicit console unless
+     * the matching fd_console_closed bit is set (a task that
+     * never had console fds installed still gets stdio). */
+    struct yousj_file *fd_file[YOUSJ_NR_OPEN];
+    uint8_t         fd_console_closed; /* bits for fds 0,1,2 */
+    char            cwd_path[YOUSJ_CWD_MAX]; /* "" = "/" */
     bool            in_use;
 };
 

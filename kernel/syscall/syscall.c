@@ -19,6 +19,7 @@
 #include <yousj/syscall.h>
 #include <yousj/signal.h>
 #include <yousj/fpu.h>
+#include <yousj/fs.h>
 #include <yousj/sched.h>
 #include <yousj/user.h>
 #include <yousj/gdt.h>
@@ -51,6 +52,8 @@ void syscall_set_init_task(struct task *t)
 #define MSR_FS_BASE 0xC0000100u
 
 static void wrmsr(uint32_t msr, uint64_t value);
+static struct yousj_file *fd_file_of(struct task *t, long fd); /* M9, defined with sys_read */
+static void resolve_path(struct task *t, const char *path, char *out);
 
 /* Called from sched_schedule() on every switch (weak hook, see
  * sched.c): TSS.rsp0 and cpu_local.kernel_rsp must always name the
@@ -136,7 +139,14 @@ void syscall_init(void)
 #define YOUSJ_ENOMEM 12
 #define YOUSJ_EFAULT 14
 #define YOUSJ_ENODEV 19
+#define YOUSJ_EIO_L 5    /* M9 */
+#define YOUSJ_ENOEXEC_L 8 /* M9 */
+#define YOUSJ_ENOTDIR 20 /* M9 */
+#define YOUSJ_EISDIR 21  /* M9 */
 #define YOUSJ_EINVAL 22
+#define YOUSJ_EMFILE 24  /* M9 */
+#define YOUSJ_ESPIPE 29  /* M9 */
+#define YOUSJ_ERANGE 34  /* M9 */
 #define YOUSJ_ENOSYS 38
 #define YOUSJ_ERESTARTSYS 512 /* internal: interrupted blocking call;
                                  converted by the signal gate, never
@@ -193,12 +203,10 @@ static void unmap_free_page(struct vmm_space *space, uint64_t va)
 
 /* --- batch 0 ---------------------------------------------------------- */
 
-static long sys_write(long fd, uint64_t buf, uint64_t len)
+static long sys_write_console(uint64_t buf, uint64_t len)
 {
     uint64_t i;
 
-    if (fd != 1 && fd != 2)
-        return -YOUSJ_EBADF;
     if (len > 8192)
         len = 8192;
     if (!user_range_ok(buf, len))
@@ -206,6 +214,21 @@ static long sys_write(long fd, uint64_t buf, uint64_t len)
     for (i = 0; i < len; i++)
         serial_putc(((const char *)(uintptr_t)buf)[i]);
     return (long)len;
+}
+
+static long sys_write(long fd, uint64_t buf, uint64_t len)
+{
+    struct yousj_file *f = fd_file_of(sched_current(), fd);
+
+    if (f == NULL)
+        return -YOUSJ_EBADF;
+    if (f->node == NULL)
+        return sys_write_console(buf, len);
+    if (len == 0)
+        return 0;
+    if (!user_range_ok(buf, len))
+        return -YOUSJ_EFAULT;
+    return file_write(f, (const uint8_t *)(uintptr_t)buf, len);
 }
 
 /* The one process-exit path: exit/exit_group arrive with
@@ -235,6 +258,18 @@ void process_exit(long status, int sig)
             __asm__ volatile("cli; hlt");
     }
     me->sig_killed = sig;
+
+    /* M9: close every open file (shared objects are refcounted;
+     * the console singleton ignores the put). */
+    {
+        int i;
+        for (i = 0; i < YOUSJ_NR_OPEN; i++) {
+            if (me->fd_file[i] != NULL) {
+                file_put(me->fd_file[i]);
+                me->fd_file[i] = NULL;
+            }
+        }
+    }
 
     /* Process teardown (SCHED_DESIGN 6.1): an owned address
      * space is destroyed here, while this task is still the one
@@ -443,6 +478,19 @@ static long sys_clone(struct yousj_syscall_ctx *ctx, long flags,
                 child->fx_area[i] = me->fx_area[i];
         }
         signal_clone_inherit(child, me);
+        /* M9: the fd table is copied and every open-file object
+         * shared (refcount++), so offsets are shared with the
+         * parent exactly like Linux. cwd is a value copy. */
+        {
+            int i;
+            for (i = 0; i < YOUSJ_NR_OPEN; i++) {
+                child->fd_file[i] = me->fd_file[i];
+                file_get(child->fd_file[i]);
+            }
+            child->fd_console_closed = me->fd_console_closed;
+            for (i = 0; i < YOUSJ_CWD_MAX; i++)
+                child->cwd_path[i] = me->cwd_path[i];
+        }
     }
     __asm__ volatile("push %0; popfq" : : "r"(flags_saved) : "memory");
 
@@ -457,43 +505,6 @@ static long sys_clone(struct yousj_syscall_ctx *ctx, long flags,
 
 
 /* --- execve: the embedded image registry -------------------------------- */
-
-/* Until a filesystem exists, execve resolves paths against the
- * images embedded in the kernel (the same transition option (b)
- * the boot init uses, SCHED_DESIGN sec. 7.1). */
-extern const uint8_t _binary_yousj_init_elf_start[];
-extern const uint8_t _binary_yousj_init_elf_end[];
-extern const uint8_t _binary_hello_elf_start[];
-extern const uint8_t _binary_hello_elf_end[];
-extern const uint8_t _binary_sh_elf_start[];
-extern const uint8_t _binary_sh_elf_end[];
-extern const uint8_t _binary_sigtest_elf_start[];
-extern const uint8_t _binary_sigtest_elf_end[];
-extern const uint8_t _binary_fxtest_elf_start[];
-extern const uint8_t _binary_fxtest_elf_end[];
-
-struct exec_image {
-    const char   *path;
-    const uint8_t *start;
-    const uint8_t *end;
-};
-
-static const struct exec_image g_exec_images[] = {
-    { "/init",      _binary_yousj_init_elf_start, _binary_yousj_init_elf_end },
-    { "/bin/hello", _binary_hello_elf_start,      _binary_hello_elf_end },
-    { "/bin/sh",    _binary_sh_elf_start,         _binary_sh_elf_end },
-    { "/bin/sigtest", _binary_sigtest_elf_start,  _binary_sigtest_elf_end },
-    { "/bin/fxtest", _binary_fxtest_elf_start,    _binary_fxtest_elf_end },
-};
-
-static int kstreq(const char *a, const char *b)
-{
-    while (*a != '\0' && *a == *b) {
-        a++;
-        b++;
-    }
-    return *a == *b;
-}
 
 /* Bounded copies out of user memory (the caller's space is
  * active, so user pointers dereference directly after the
@@ -522,23 +533,45 @@ static long sys_execve(uint64_t path_ptr, uint64_t argv_ptr,
     static char env_store[4][128];
     static const char *argv_k[9];
     static const char *envp_k[5];
-    const struct exec_image *img = NULL;
+    uint64_t stage_phys = 0, stage_len = 0, stage_pages = 0;
     struct vmm_space *space, *old;
     uint64_t entry = 0, img_brk = 0, heap_base, new_sp = 0;
-    uint64_t i;
 
     if (me->mm == NULL)
         return -YOUSJ_EINVAL;
     if (copy_user_string(path_ptr, path_buf, sizeof(path_buf)) != 0)
         return -YOUSJ_EFAULT;
-    for (i = 0; i < sizeof(g_exec_images) / sizeof(g_exec_images[0]); i++) {
-        if (kstreq(path_buf, g_exec_images[i].path)) {
-            img = &g_exec_images[i];
-            break;
+    /* M9: the image comes from the ramfs. Resolve the path,
+     * stage the file into a contiguous PMM run (the HHDM makes
+     * contiguous physical pages contiguous virtually, which is
+     * what the ELF loader's pointer-based parser needs). */
+    {
+        static char resolved[256];
+        struct yousj_ramfs_node *node;
+        uint64_t len, pages;
+
+        resolve_path(me, path_buf, resolved);
+        node = fs_lookup(resolved);
+        if (node == NULL)
+            return -YOUSJ_ENOENT;
+        if (fs_node_is_dir(node))
+            return -YOUSJ_EISDIR;
+        len = fs_node_size(node);
+        if (len == 0)
+            return -YOUSJ_ENOEXEC_L;
+        pages = (len + YOUSJ_PAGE_SIZE - 1) / YOUSJ_PAGE_SIZE;
+        stage_phys = pmm_alloc_pages(pages);
+        if (stage_phys == 0)
+            return -YOUSJ_ENOMEM;
+        if (fs_node_read_all(node,
+                             (uint8_t *)yousj_phys_to_virt(stage_phys),
+                             len) != (long)len) {
+            pmm_free_pages(stage_phys, pages);
+            return -YOUSJ_EIO_L;
         }
+        stage_len = len;
+        stage_pages = pages;
     }
-    if (img == NULL)
-        return -YOUSJ_ENOENT;
 
     /* Copy argv/envp out of the old image BEFORE building the
      * new space; everything the new image needs must be in
@@ -587,10 +620,14 @@ static long sys_execve(uint64_t path_ptr, uint64_t argv_ptr,
         return -YOUSJ_ENOMEM;
     if (vmm_create_space(space) != 0)
         goto fail_release;
-    if (elf_load_user_image(img->start,
-                            (uint64_t)(img->end - img->start),
-                            space, &entry, &img_brk) != 0)
+    if (elf_load_user_image(
+            (const uint8_t *)yousj_phys_to_virt(stage_phys),
+            stage_len, space, &entry, &img_brk) != 0) {
+        pmm_free_pages(stage_phys, stage_pages);
         goto fail_destroy;
+    }
+    pmm_free_pages(stage_phys, stage_pages); /* the loader copied
+                                              * everything out */
     heap_base = (img_brk + YOUSJ_PAGE_SIZE - 1) & ~(YOUSJ_PAGE_SIZE - 1);
     if (elf_build_initial_stack(space, YOUSJ_INIT_STACK_TOP,
                                 argv_k, envp_k, &new_sp) != 0)
@@ -638,18 +675,54 @@ fail_destroy:
     vmm_free_user_data(space);
     vmm_destroy_space(space);
 fail_release:
+    if (stage_phys != 0)
+        pmm_free_pages(stage_phys, stage_pages);
     vmm_space_release(space);
     return -YOUSJ_ENOMEM;
 }
 
 /* --- batch 1 ------------------------------------------------------------ */
 
-static long sys_read(long fd, uint64_t buf, uint64_t count)
+/* --- M9: the fd layer -------------------------------------------------
+ * fd_file_of() resolves a descriptor to its open-file object.
+ * Slots 0-2 with no object mean the implicit console (tasks
+ * whose stdio was never explicitly opened) unless the task
+ * closed that slot.
+ */
+static struct yousj_file *fd_file_of(struct task *t, long fd)
+{
+    struct yousj_file *f;
+    if (t == NULL || fd < 0 || fd >= YOUSJ_NR_OPEN)
+        return NULL;
+    f = t->fd_file[fd];
+    if (f == NULL && fd < 3 && !(t->fd_console_closed & (uint8_t)(1u << fd)))
+        return fs_console_file();
+    return f;
+}
+
+/* Resolve `path` (kernel memory) against the task's cwd into
+ * `out` (at least 256 bytes). */
+static void resolve_path(struct task *t, const char *path, char *out)
+{
+    uint64_t i = 0, j;
+    if (path[0] != '/') {
+        const char *cwd = (t != NULL && t->cwd_path[0] != '\0')
+                              ? t->cwd_path
+                              : "/";
+        for (j = 0; cwd[j] != '\0' && i < 255; j++)
+            out[i++] = cwd[j];
+        if (i == 0 || out[i - 1] != '/')
+            out[i++] = '/';
+    }
+    for (j = 0; path[j] != '\0' && i < 255; j++)
+        out[i++] = path[j];
+    out[i] = '\0';
+}
+
+static long sys_read_console(uint64_t buf, uint64_t count)
 {
     uint64_t got = 0;
 
-    if (fd != 0)
-        return -YOUSJ_EBADF;
     if (count == 0)
         return 0;
     if (count > 65536)
@@ -657,9 +730,9 @@ static long sys_read(long fd, uint64_t buf, uint64_t count)
     if (!user_range_ok(buf, count))
         return -YOUSJ_EFAULT;
     /* Block for the first byte (poll the UART, sleeping between
-     * checks so other tasks keep the CPU), then drain whatever is
-     * already buffered, up to count. No line discipline yet: the
-     * caller (init) does its own line editing and echo. */
+     * checks so other tasks keep the CPU), then drain whatever
+     * is already buffered, up to count. No line discipline: the
+     * caller (the shell) does its own line editing and echo. */
     while (got == 0) {
         int c = serial_getc_nonblock();
         if (c >= 0) {
@@ -682,6 +755,150 @@ static long sys_read(long fd, uint64_t buf, uint64_t count)
         ((char *)(uintptr_t)buf)[got++] = (char)c;
     }
     return (long)got;
+}
+
+static long sys_read(long fd, uint64_t buf, uint64_t count)
+{
+    struct yousj_file *f = fd_file_of(sched_current(), fd);
+
+    if (f == NULL)
+        return -YOUSJ_EBADF;
+    if (f->node == NULL)
+        return sys_read_console(buf, count);
+    if (count == 0)
+        return 0;
+    if (!user_range_ok(buf, count))
+        return -YOUSJ_EFAULT;
+    return file_read(f, (uint8_t *)(uintptr_t)buf, count);
+}
+
+static long fd_alloc(struct task *t, struct yousj_file *f)
+{
+    long fd;
+    for (fd = 0; fd < YOUSJ_NR_OPEN; fd++) {
+        if (t->fd_file[fd] == NULL) {
+            t->fd_file[fd] = f;
+            if (fd < 3)
+                t->fd_console_closed &= (uint8_t)~(1u << fd);
+            return fd;
+        }
+    }
+    return -YOUSJ_EMFILE;
+}
+
+static long sys_openat(long dirfd, uint64_t path_ptr, long flags)
+{
+    struct task *me = sched_current();
+    static char path_buf[256];
+    static char resolved[256];
+    struct yousj_file *f;
+    long rc, fd;
+
+    if (dirfd != YOUSJ_AT_FDCWD)
+        return -YOUSJ_EBADF; /* no dirfd-relative opens yet */
+    if (copy_user_string(path_ptr, path_buf, sizeof(path_buf)) != 0)
+        return -YOUSJ_EFAULT;
+    resolve_path(me, path_buf, resolved);
+    rc = fs_open_path(resolved, flags, &f);
+    if (rc != 0)
+        return rc;
+    fd = fd_alloc(me, f);
+    if (fd < 0)
+        file_put(f);
+    return fd;
+}
+
+static long sys_close(long fd)
+{
+    struct task *me = sched_current();
+    struct yousj_file *f;
+
+    if (fd < 0 || fd >= YOUSJ_NR_OPEN)
+        return -YOUSJ_EBADF;
+    f = me->fd_file[fd];
+    if (f == NULL) {
+        /* Closing an implicit console slot is legal and final:
+         * the fd stops resolving to the console. */
+        if (fd < 3 && !(me->fd_console_closed & (uint8_t)(1u << fd))) {
+            me->fd_console_closed |= (uint8_t)(1u << fd);
+            return 0;
+        }
+        return -YOUSJ_EBADF;
+    }
+    me->fd_file[fd] = NULL;
+    file_put(f);
+    return 0;
+}
+
+static long sys_lseek(long fd, long off, long whence)
+{
+    struct yousj_file *f = fd_file_of(sched_current(), fd);
+    if (f == NULL)
+        return -YOUSJ_EBADF;
+    if (f->node == NULL)
+        return -YOUSJ_ESPIPE; /* the console is not seekable */
+    return file_seek(f, off, whence);
+}
+
+static long sys_getdents64(long fd, uint64_t buf, uint64_t count)
+{
+    struct yousj_file *f = fd_file_of(sched_current(), fd);
+    if (f == NULL)
+        return -YOUSJ_EBADF;
+    if (!user_range_ok(buf, count))
+        return -YOUSJ_EFAULT;
+    return file_getdents(f, (uint8_t *)(uintptr_t)buf, count);
+}
+
+static long sys_mkdir_sys(uint64_t path_ptr)
+{
+    struct task *me = sched_current();
+    static char path_buf[256];
+    static char resolved[256];
+
+    if (copy_user_string(path_ptr, path_buf, sizeof(path_buf)) != 0)
+        return -YOUSJ_EFAULT;
+    resolve_path(me, path_buf, resolved);
+    return fs_mkdir_path(resolved);
+}
+
+static long sys_chdir_sys(uint64_t path_ptr)
+{
+    struct task *me = sched_current();
+    static char path_buf[256];
+    static char resolved[256];
+    struct yousj_ramfs_node *n;
+    uint64_t i;
+
+    if (copy_user_string(path_ptr, path_buf, sizeof(path_buf)) != 0)
+        return -YOUSJ_EFAULT;
+    resolve_path(me, path_buf, resolved);
+    n = fs_lookup(resolved);
+    if (n == NULL)
+        return -YOUSJ_ENOENT;
+    if (!fs_node_is_dir(n))
+        return -YOUSJ_ENOTDIR;
+    for (i = 0; i < YOUSJ_CWD_MAX - 1 && resolved[i] != '\0'; i++)
+        me->cwd_path[i] = resolved[i];
+    me->cwd_path[i] = '\0';
+    return 0;
+}
+
+static long sys_getcwd_sys(uint64_t buf, uint64_t size)
+{
+    struct task *me = sched_current();
+    const char *cwd = me->cwd_path[0] != '\0' ? me->cwd_path : "/";
+    uint64_t len = 0, i;
+
+    while (cwd[len] != '\0')
+        len++;
+    if (size < len + 1)
+        return -YOUSJ_ERANGE;
+    if (!user_range_ok(buf, len + 1))
+        return -YOUSJ_EFAULT;
+    for (i = 0; i <= len; i++)
+        ((char *)(uintptr_t)buf)[i] = cwd[i];
+    return (long)len;
 }
 
 static long sys_nanosleep(uint64_t req_ptr)
@@ -899,6 +1116,22 @@ static long dispatch_inner(struct yousj_syscall_ctx *ctx)
         return sys_read((long)a1, a2, a3);
     case YOUSJ_SYS_write:
         return sys_write((long)a1, a2, a3);
+    case YOUSJ_SYS_open:
+        return sys_openat(YOUSJ_AT_FDCWD, a1, (long)a2);
+    case YOUSJ_SYS_openat:
+        return sys_openat((long)a1, a2, (long)a3);
+    case YOUSJ_SYS_close:
+        return sys_close((long)a1);
+    case YOUSJ_SYS_lseek:
+        return sys_lseek((long)a1, (long)a2, (long)a3);
+    case YOUSJ_SYS_getdents64:
+        return sys_getdents64((long)a1, a2, a3);
+    case YOUSJ_SYS_mkdir:
+        return sys_mkdir_sys(a1);
+    case YOUSJ_SYS_chdir:
+        return sys_chdir_sys(a1);
+    case YOUSJ_SYS_getcwd:
+        return sys_getcwd_sys(a1, a2);
     case YOUSJ_SYS_mmap:
         return sys_mmap(a1, a2, a3, a4, (long)a5);
     case YOUSJ_SYS_munmap:
@@ -981,6 +1214,14 @@ void user_task_start(void *arg)
 
     me->user_ip = u->ip;
     me->user_sp = u->sp;
+    /* M9: a boot-created user task starts life with the console
+     * on fds 0-2 (later tasks inherit stdio through clone). */
+    if (me->fd_file[0] == NULL && me->fd_file[1] == NULL &&
+        me->fd_file[2] == NULL) {
+        me->fd_file[0] = fs_console_file();
+        me->fd_file[1] = fs_console_file();
+        me->fd_file[2] = fs_console_file();
+    }
     /* kernel_rsp / TSS.rsp0 were set by arch_on_task_switch when
      * this task was scheduled in. The address space switch also
      * happened in sched_schedule(). */
