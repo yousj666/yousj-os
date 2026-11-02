@@ -2017,6 +2017,85 @@ static long sys_faccessat(long dirfd, uint64_t path_ptr,
     return 0;
 }
 
+/* --- M36: chmod / chown family -------------------------
+ * The fs layer stores real permission bits now; chown
+ * validates and succeeds (no uid model). *at forms ride
+ * resolve_at like the rest of the family. */
+static long sys_chmod_path(uint64_t path_ptr, long mode,
+                           bool follow)
+{
+    struct task *me = sched_current();
+    static char pb[256], rp[256];
+    if (copy_user_string(path_ptr, pb, sizeof pb) != 0)
+        return -YOUSJ_EFAULT;
+    resolve_path(me, pb, rp);
+    return fs_chmod_path(rp, (uint32_t)mode, follow);
+}
+
+static long sys_fchmodat(long dirfd, uint64_t path_ptr,
+                         long mode, long flags)
+{
+    struct task *me = sched_current();
+    static char pb[256], rp[256];
+    long rc;
+    if (flags & ~(0x100L | 0x1000L))
+        return -YOUSJ_EINVAL;
+    if (copy_user_string(path_ptr, pb, sizeof pb) != 0)
+        return -YOUSJ_EFAULT;
+    if (pb[0] == '\0' && (flags & 0x1000L)) {
+        struct yousj_file *f = fd_file_of(me, dirfd);
+        if (f == NULL)
+            return -YOUSJ_EBADF;
+        return fs_chmod_file(f, (uint32_t)mode);
+    }
+    rc = resolve_at(me, dirfd, pb, rp);
+    if (rc != 0)
+        return rc;
+    /* chmod follows links even with AT_SYMLINK_NOFOLLOW
+     * (the link itself has no changeable mode here). */
+    return fs_chmod_path(rp, (uint32_t)mode, true);
+}
+
+static long sys_fchmod(long fd, long mode)
+{
+    struct task *me = sched_current();
+    struct yousj_file *f = fd_file_of(me, fd);
+    if (f == NULL)
+        return -YOUSJ_EBADF;
+    return fs_chmod_file(f, (uint32_t)mode);
+}
+
+static long sys_chown_path(uint64_t path_ptr, bool follow)
+{
+    struct task *me = sched_current();
+    static char pb[256], rp[256];
+    if (copy_user_string(path_ptr, pb, sizeof pb) != 0)
+        return -YOUSJ_EFAULT;
+    resolve_path(me, pb, rp);
+    return fs_chown_path(rp, follow);
+}
+
+static long sys_fchownat(long dirfd, uint64_t path_ptr,
+                         long flags)
+{
+    struct task *me = sched_current();
+    static char pb[256], rp[256];
+    long rc;
+    if (flags & ~(0x100L | 0x1000L))
+        return -YOUSJ_EINVAL;
+    if (copy_user_string(path_ptr, pb, sizeof pb) != 0)
+        return -YOUSJ_EFAULT;
+    if (pb[0] == '\0' && (flags & 0x1000L)) {
+        if (fd_file_of(me, dirfd) == NULL)
+            return -YOUSJ_EBADF;
+        return 0;
+    }
+    rc = resolve_at(me, dirfd, pb, rp);
+    if (rc != 0)
+        return rc;
+    return fs_chown_path(rp, !(flags & 0x100L));
+}
+
 static long sys_rmdir_sys(uint64_t path_ptr)
 {
     struct task *me = sched_current();
@@ -2924,6 +3003,23 @@ static long dispatch_inner(struct yousj_syscall_ctx *ctx)
     case YOUSJ_SYS_link:
     case YOUSJ_SYS_linkat:
         return -YOUSJ_EPERM; /* M33: no hard links (see above) */
+    case YOUSJ_SYS_chmod:
+        return sys_chmod_path(a1, (long)a2, true);
+    case YOUSJ_SYS_fchmod:
+        return sys_fchmod((long)a1, (long)a2);
+    case YOUSJ_SYS_fchmodat:
+        return sys_fchmodat((long)a1, a2, (long)a3,
+                            (long)a4);
+    case YOUSJ_SYS_chown:
+        return sys_chown_path(a1, true);
+    case YOUSJ_SYS_lchown:
+        return sys_chown_path(a1, false);
+    case YOUSJ_SYS_fchown:
+        return fd_file_of(sched_current(), (long)a1) != NULL
+                   ? 0
+                   : -YOUSJ_EBADF;
+    case YOUSJ_SYS_fchownat:
+        return sys_fchownat((long)a1, a2, (long)a5);
     case YOUSJ_SYS_rmdir:
         return sys_rmdir_sys(a1);
     case YOUSJ_SYS_rename:

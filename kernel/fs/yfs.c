@@ -59,8 +59,12 @@ struct yfs_inode {
     uint32_t flags;      /* open-ref count (low 16 bits) +
                             0x10000 unlinked-pending-delete;
                             v3 kept this in rsvd[0] */
-    uint32_t future[14]; /* zeroed reserve for future
-                            fields (uid/gid, larger size) */
+    uint32_t mode;       /* M36: permission bits (07777
+                            mask), valid when flags carries
+                            0x20000 (MODE_SET); this was
+                            future[0] -- layout unchanged */
+    uint32_t future[13]; /* zeroed reserve (uid/gid,
+                            larger size) */
 };
 
 _Static_assert(sizeof(struct yfs_inode) == 128,
@@ -742,6 +746,30 @@ static void stamp_create(struct yfs_inode *n)
  * is set, ctime bumps to now like everywhere else. The
  * inode write-back goes through the same journaled path
  * as every other metadata write. */
+/* M36: the effective permission bits. Inodes written
+ * before M36 have no MODE_SET flag and report the
+ * historical per-type defaults. */
+uint32_t yfs_mode(uint32_t ino)
+{
+    struct yfs_inode n;
+    if (inode_read(ino, &n) != 0)
+        return 0644u;
+    if (n.flags & 0x20000u)
+        return n.mode & 07777u;
+    return n.type == 2 ? 0755u : n.type == 3 ? 0777u : 0644u;
+}
+
+void yfs_set_mode(uint32_t ino, uint32_t bits)
+{
+    struct yfs_inode n;
+    if (inode_read(ino, &n) != 0)
+        return;
+    n.mode = bits & 07777u;
+    n.flags |= 0x20000u;
+    n.ctime = (uint32_t)yousj_now_unix();
+    inode_write(ino, &n);
+}
+
 void yfs_set_times(uint32_t ino, long asec, long msec)
 {
     struct yfs_inode n;
@@ -1078,6 +1106,10 @@ static long yfs_mknod_t_impl(const char *parent_rel,
     mem_zero((uint8_t *)&fresh, sizeof(fresh));
     fresh.type = type;
     fresh.size = 0;
+    /* M36: creation modes, marked valid from birth. */
+    fresh.mode = type == 2 ? 0755u : type == 3 ? 0777u
+                                             : 0644u;
+    fresh.flags |= 0x20000u; /* MODE_SET */
     for (i = 0; i < 12; i++)
         fresh.blocks[i] = UNALLOC; /* all slots incl. indirect */
     stamp_create(&fresh);

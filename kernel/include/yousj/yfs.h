@@ -49,6 +49,9 @@ uint32_t yfs_mtime(uint32_t ino); /* M23 */
 void yfs_times(uint32_t ino, uint32_t *a, uint32_t *m,
                uint32_t *c);
 void yfs_set_times(uint32_t ino, long asec, long msec);
+/* M36: stored permission bits (with legacy defaults) */
+uint32_t yfs_mode(uint32_t ino);
+void yfs_set_mode(uint32_t ino, uint32_t bits);
 long yfs_mknod_t(const char *parent_rel, const char *name,
                  uint8_t type);
 long yfs_mknod(const char *parent_rel, const char *name,

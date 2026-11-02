@@ -90,6 +90,8 @@ struct yousj_ramfs_node {
     uint32_t mtime;                     /* M23: epoch seconds */
     uint32_t atime;                     /* M26: independent */
     uint32_t ctime;                     /* M26: independent */
+    uint32_t mode;                      /* M36: permission
+                                           bits (07777) */
     uint32_t pages[MAX_FILE_PAGES];     /* phys frames, 0 = hole */
     uint16_t open_refs;                 /* M13: live file objects */
     bool unlinked;                      /* M13: name removed; the
@@ -133,6 +135,7 @@ static struct yousj_ramfs_node *node_alloc(void)
         if (!g_nodes[i].in_use) {
             mem_zero((uint8_t *)&g_nodes[i], sizeof(g_nodes[i]));
             g_nodes[i].in_use = true;
+            g_nodes[i].mode = 0644; /* M36: file default */
             return &g_nodes[i];
         }
     }
@@ -172,6 +175,7 @@ static struct yousj_ramfs_node *node_create(
     mem_copy((uint8_t *)n->name, (const uint8_t *)name, len);
     n->name[len] = '\0';
     n->is_dir = is_dir;
+    n->mode = is_dir ? 0755u : 0644u; /* M36 */
     n->mtime = (uint32_t)yousj_now_unix();
     n->atime = n->mtime;
     n->ctime = n->mtime;
@@ -1468,6 +1472,7 @@ long fs_symlink_path(const char *target, const char *linkpath)
         if (n == NULL)
             return -YOUSJ_ENOSPC;
         n->is_link = true;
+        n->mode = 0777; /* M36 */
         if (node_pwrite(n, 0, (const uint8_t *)target,
                         str_len(target)) < 0)
             return -YOUSJ_ENOSPC;
@@ -1573,13 +1578,13 @@ static void stat_from_ramfs_node(struct yousj_ramfs_node *n,
     info->atime = n->atime;
     info->ctime = n->ctime;
     if (n->is_link) {
-        info->mode = S_IFLNK_K | 0777u;
+        info->mode = S_IFLNK_K | (n->mode & 07777u);
         info->size = n->size;
     } else if (n->is_dir) {
-        info->mode = S_IFDIR_K | 0755u;
+        info->mode = S_IFDIR_K | (n->mode & 07777u);
         info->size = 0;
     } else {
-        info->mode = S_IFREG_K | 0644u;
+        info->mode = S_IFREG_K | (n->mode & 07777u);
         info->size = n->size;
     }
     info->ino = (uint64_t)(n - g_nodes) + 2;
@@ -1604,13 +1609,13 @@ static bool stat_from_yfs_ino(uint32_t ino,
         info->ctime = c;
     }
     if (t == 3) {
-        info->mode = S_IFLNK_K | 0777u;
+        info->mode = S_IFLNK_K | yfs_mode(ino);
         info->size = yfs_size(ino);
     } else if (t == 2) {
-        info->mode = S_IFDIR_K | 0755u;
+        info->mode = S_IFDIR_K | yfs_mode(ino);
         info->size = 0;
     } else if (t == 1) {
-        info->mode = S_IFREG_K | 0644u;
+        info->mode = S_IFREG_K | yfs_mode(ino);
         info->size = yfs_size(ino);
     } else {
         return false;
@@ -1815,6 +1820,63 @@ long fs_utimens_file(struct yousj_file *f,
     if (f->node != NULL)
         return utimens_ramfs_node(f->node, aop, mop);
     return -YOUSJ_EINVAL; /* pipes, epoll, console: no stamps */
+}
+
+/* --- M36: chmod / chown --------------------------------
+ * Modes are stored per node/inode (see node_create and
+ * yfs mode). chown has no ownership model to change --
+ * every file is uid/gid 0 -- so it validates existence
+ * and succeeds, which is the honest subset. */
+long fs_chmod_path(const char *path, uint32_t bits,
+                   bool follow)
+{
+    char resolved[PATH_MAX_LEN + 1];
+    if (fs_resolve_links(path, resolved, follow) != 0)
+        return -YOUSJ_ENOENT_L;
+    path = resolved;
+    if (is_data_path(path)) {
+        long ino = yfs_lookup(data_rel(path));
+        if (ino < 0)
+            return -YOUSJ_ENOENT_L;
+        yfs_set_mode((uint32_t)ino, bits);
+        return 0;
+    }
+    if (is_proc_path(path))
+        return -YOUSJ_EACCES_L;
+    {
+        struct yousj_ramfs_node *n = fs_lookup(path);
+        if (n == NULL)
+            return -YOUSJ_ENOENT_L;
+        n->mode = bits & 07777u;
+        n->ctime = (uint32_t)yousj_now_unix();
+        return 0;
+    }
+}
+
+long fs_chmod_file(struct yousj_file *f, uint32_t bits)
+{
+    if (f == NULL)
+        return -YOUSJ_EBADF;
+    if (f->backend == 2)
+        return -YOUSJ_EACCES_L;
+    if (f->backend == 1) {
+        yfs_set_mode(f->yfs_ino, bits);
+        return 0;
+    }
+    if (f->node != NULL) {
+        f->node->mode = bits & 07777u;
+        f->node->ctime = (uint32_t)yousj_now_unix();
+        return 0;
+    }
+    return -YOUSJ_EINVAL; /* pipes, epoll, console */
+}
+
+long fs_chown_path(const char *path, bool follow)
+{
+    struct yousj_stat_info info;
+    if (!fs_path_stat2(path, follow, &info))
+        return -YOUSJ_ENOENT_L;
+    return 0;
 }
 
 bool fs_path_stat(const char *path, bool *is_dir_out,
@@ -2215,6 +2277,7 @@ void fs_init(void)
     g_console_file.flags = YOUSJ_O_RDWR;
     g_root = node_alloc();
     g_root->is_dir = true;
+    g_root->mode = 0755; /* M36 */
     g_root->name[0] = '/';
     g_root->name[1] = '\0';
     g_root->parent = g_root;

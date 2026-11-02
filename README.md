@@ -545,9 +545,22 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   验收：pidtest 加 cwd-exe 场景（exe/cwd 读
   链、lstat/stat 分工、open cwd 列目录、生成
   文件 readlink 应 EINVAL、dents 类型 DT_LNK）。
+- ✅ chmod/chown 家族 M36（2026-11-03）：此前
+  mode 全是按类型写死的常数，本轮落存储——
+  ramfs 节点加 mode 字段（创建时按类型设默认
+  值）；yfs 复用 inode 的 future[0] 存 mode、
+  flags 加 MODE_SET 位，旧盘无此位时按类型默
+  认值报告（格式不变、无需升版）。chmod/
+  fchmod/fchmodat 生效并刷 ctime，faccessat 的
+  校验随之真实；chown/fchown/lchown/fchownat
+  无 uid 模型——校验存在性后成功（明示占位）。
+  open(O_CREAT) 的 mode 参数仍未贯通（创建恒
+  默认值），列入候选。验收：dirfdtest 加
+  chmod-family 场景，ramfs 与 yfs（disk 套件）
+  各跑一遍。
 - ⏳ 下一步候选：getdents64 的 d_off 语义细
-  化、硬链接（目录项重构）、fchownat/chmod
-  家族、/proc/<pid>/maps 示意。
+  化、硬链接（目录项重构）、/proc/<pid>/maps
+  示意、open(O_CREAT) 的 mode 贯通、umask。
 
 ## 从零构建
 

@@ -44,6 +44,11 @@
 #define SYS_faccessat 269
 #define SYS_renameat2 316
 #define SYS_faccessat2 439
+#define SYS_chmod 90
+#define SYS_fchmod 91
+#define SYS_chown 92
+#define SYS_fchownat 260
+#define SYS_fchmodat 268
 
 #define AT_FDCWD (-100)
 #define AT_SYMLINK_NOFOLLOW 0x100
@@ -420,6 +425,55 @@ int main(int argc, char **argv)
                             (long)(uintptr_t)"f.txt", dfd,
                             (long)(uintptr_t)"hard", 0);
         report("linkat-eperm", rc == -1);
+    }
+
+    /* --- M36: chmod / chown --- */
+    {
+        struct st sb2;
+        long m0 = sys_call4(SYS_newfstatat, dfd,
+                            (long)(uintptr_t)"f.txt",
+                            (long)(uintptr_t)&sb2, 0) == 0
+                      ? (sb2.mode & 0777)
+                      : -1;
+        join(p, dir, "f.txt");
+        long c1 = sys_call3(SYS_chmod, (long)(uintptr_t)p,
+                            0600, 0);
+        sys_call4(SYS_newfstatat, dfd,
+                  (long)(uintptr_t)"f.txt",
+                  (long)(uintptr_t)&sb2, 0);
+        long m1 = sb2.mode & 0777;
+        long c2 = sys_call4(SYS_fchmodat, dfd,
+                            (long)(uintptr_t)"f.txt", 0640, 0);
+        sys_call4(SYS_newfstatat, dfd,
+                  (long)(uintptr_t)"f.txt",
+                  (long)(uintptr_t)&sb2, 0);
+        long m2 = sb2.mode & 0777;
+        fd = sys_call4(SYS_openat, dfd,
+                       (long)(uintptr_t)"f.txt", 0, 0);
+        long c3 = fd >= 0 ? sys_call3(SYS_fchmod, fd, 0755, 0)
+                          : -1;
+        if (fd >= 0)
+            sys_call1(SYS_close, fd);
+        sys_call4(SYS_newfstatat, dfd,
+                  (long)(uintptr_t)"f.txt",
+                  (long)(uintptr_t)&sb2, 0);
+        long m3 = sb2.mode & 0777;
+        long o1 = sys_call3(SYS_chown, (long)(uintptr_t)p,
+                            0, 0);
+        long o2 = sys_call5(SYS_fchownat, dfd,
+                            (long)(uintptr_t)"f.txt", -1, -1,
+                            0);
+        long e1 = sys_call3(SYS_chmod,
+                            (long)(uintptr_t)"/proc/self/status",
+                            0644, 0);
+        long e2 = sys_call3(SYS_chmod,
+                            (long)(uintptr_t)"/ghost", 0644,
+                            0);
+        sys_call3(SYS_chmod, (long)(uintptr_t)p, 0644, 0);
+        report("chmod-family", m0 == 0644 && c1 == 0 &&
+               m1 == 0600 && c2 == 0 && m2 == 0640 &&
+               c3 == 0 && m3 == 0755 && o1 == 0 && o2 == 0 &&
+               e1 == -13 && e2 == -2);
     }
 
     sys_call1(SYS_close, dfd);

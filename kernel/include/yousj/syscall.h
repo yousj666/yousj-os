@@ -79,6 +79,13 @@
 #define YOUSJ_SYS_faccessat   269   /* M33 */
 #define YOUSJ_SYS_renameat2   316   /* M33 */
 #define YOUSJ_SYS_faccessat2  439   /* M33 */
+#define YOUSJ_SYS_chmod        90   /* M36 */
+#define YOUSJ_SYS_fchmod       91   /* M36 */
+#define YOUSJ_SYS_chown        92   /* M36 */
+#define YOUSJ_SYS_fchown       93   /* M36 */
+#define YOUSJ_SYS_lchown       94   /* M36 */
+#define YOUSJ_SYS_fchownat    260   /* M36 */
+#define YOUSJ_SYS_fchmodat    268   /* M36 */
 #define YOUSJ_SYS_dup3        292  /* M10 */
 #define YOUSJ_SYS_pipe2       293  /* M10 */
 #define YOUSJ_SYS_time        201  /* M23 */

@@ -201,6 +201,12 @@ struct yousj_utime_op {
     int kind;
     int64_t sec;
 };
+/* M36: permission bits and ownership (chown validates
+ * existence only; there is no uid model). */
+long fs_chmod_path(const char *path, uint32_t bits,
+                   bool follow);
+long fs_chmod_file(struct yousj_file *f, uint32_t bits);
+long fs_chown_path(const char *path, bool follow);
 long fs_utimens_path(const char *path, bool follow,
                      const struct yousj_utime_op *aop,
                      const struct yousj_utime_op *mop);
