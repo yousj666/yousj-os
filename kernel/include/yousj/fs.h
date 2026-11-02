@@ -57,6 +57,8 @@ struct yousj_pipe {
 struct yousj_file {
     struct yousj_ramfs_node *node; /* NULL and pipe NULL: console */
     struct yousj_pipe *pipe;       /* non-NULL: a pipe end (M10) */
+    int backend;                   /* 0 ramfs, 1 yfs (M12) */
+    uint32_t yfs_ino;              /* valid when backend == 1 */
     uint64_t offset;               /* shared across fork (the
                                       object is shared, not the
                                       fd number); unused for pipes */
@@ -99,6 +101,21 @@ struct yousj_file *fs_console_file(void);
  * 0 or a negative errno. */
 long fs_pipe_create(struct yousj_file **rd_out,
                     struct yousj_file **wr_out);
+
+/* M12: mount the yfs data disk at /data when one is present.
+ * Returns yfs_mount's code (1 mounted, 2 formatted, 0 none,
+ * negative error). */
+int fs_mount_data(void);
+/* Read a whole file by path (either backend) into dst.
+ * Returns its length, -EISDIR for a directory, or another
+ * negative errno. Used by execve. */
+long fs_read_all_path(const char *path, uint8_t *dst,
+                      uint64_t cap);
+/* Whether path exists; when it does, also reports whether
+ * it is a directory and its size (either backend). For
+ * chdir's validation and execve's staging. */
+bool fs_path_stat(const char *path, bool *is_dir_out,
+                  uint64_t *size_out);
 
 void file_get(struct yousj_file *f);
 void file_put(struct yousj_file *f);

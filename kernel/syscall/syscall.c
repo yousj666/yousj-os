@@ -228,7 +228,7 @@ static long sys_write(long fd, uint64_t buf, uint64_t len)
         return -YOUSJ_EBADF;
     if (f->pipe != NULL)
         return sys_write_pipe(f, buf, len);
-    if (f->node == NULL)
+    if (f->backend == 0 && f->node == NULL)
         return sys_write_console(buf, len);
     if (len == 0)
         return 0;
@@ -554,27 +554,28 @@ static long sys_execve(uint64_t path_ptr, uint64_t argv_ptr,
      * what the ELF loader's pointer-based parser needs). */
     {
         static char resolved[256];
-        struct yousj_ramfs_node *node;
-        uint64_t len, pages;
+        bool is_dir = false;
+        uint64_t len = 0, pages;
+        long got;
 
         resolve_path(me, path_buf, resolved);
-        node = fs_lookup(resolved);
-        if (node == NULL)
+        /* Either backend: ramfs or the /data disk (M12). */
+        if (!fs_path_stat(resolved, &is_dir, &len))
             return -YOUSJ_ENOENT;
-        if (fs_node_is_dir(node))
+        if (is_dir)
             return -YOUSJ_EISDIR;
-        len = fs_node_size(node);
         if (len == 0)
             return -YOUSJ_ENOEXEC_L;
         pages = (len + YOUSJ_PAGE_SIZE - 1) / YOUSJ_PAGE_SIZE;
         stage_phys = pmm_alloc_pages(pages);
         if (stage_phys == 0)
             return -YOUSJ_ENOMEM;
-        if (fs_node_read_all(node,
-                             (uint8_t *)yousj_phys_to_virt(stage_phys),
-                             len) != (long)len) {
+        got = fs_read_all_path(
+            resolved, (uint8_t *)yousj_phys_to_virt(stage_phys),
+            len);
+        if (got != (long)len) {
             pmm_free_pages(stage_phys, pages);
-            return -YOUSJ_EIO_L;
+            return got < 0 ? got : -YOUSJ_EIO_L;
         }
         stage_len = len;
         stage_pages = pages;
@@ -784,7 +785,7 @@ static long sys_read(long fd, uint64_t buf, uint64_t count)
         return -YOUSJ_EBADF;
     if (f->pipe != NULL)
         return sys_read_pipe(f, buf, count);
-    if (f->node == NULL)
+    if (f->backend == 0 && f->node == NULL)
         return sys_read_console(buf, count);
     if (count == 0)
         return 0;
@@ -864,7 +865,7 @@ static long sys_lseek(long fd, long off, long whence)
     struct yousj_file *f = fd_file_of(sched_current(), fd);
     if (f == NULL)
         return -YOUSJ_EBADF;
-    if (f->node == NULL)
+    if (f->backend == 0 && f->node == NULL)
         return -YOUSJ_ESPIPE; /* console and pipes: not seekable */
     return file_seek(f, off, whence);
 }
@@ -896,17 +897,19 @@ static long sys_chdir_sys(uint64_t path_ptr)
     struct task *me = sched_current();
     static char path_buf[256];
     static char resolved[256];
-    struct yousj_ramfs_node *n;
     uint64_t i;
 
     if (copy_user_string(path_ptr, path_buf, sizeof(path_buf)) != 0)
         return -YOUSJ_EFAULT;
     resolve_path(me, path_buf, resolved);
-    n = fs_lookup(resolved);
-    if (n == NULL)
-        return -YOUSJ_ENOENT;
-    if (!fs_node_is_dir(n))
-        return -YOUSJ_ENOTDIR;
+    {
+        bool is_dir = false;
+        uint64_t sz = 0;
+        if (!fs_path_stat(resolved, &is_dir, &sz))
+            return -YOUSJ_ENOENT;
+        if (!is_dir)
+            return -YOUSJ_ENOTDIR;
+    }
     for (i = 0; i < YOUSJ_CWD_MAX - 1 && resolved[i] != '\0'; i++)
         me->cwd_path[i] = resolved[i];
     me->cwd_path[i] = '\0';

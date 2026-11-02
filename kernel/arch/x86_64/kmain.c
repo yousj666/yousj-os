@@ -501,6 +501,17 @@ void kmain(struct yousj_boot_info *boot_info)
             halt_forever();
         }
         serial_puts("Yousj OS: ramfs init PASS (initramfs unpacked)\n");
+        {
+            int mrc = fs_mount_data();
+            if (mrc == 1)
+                serial_puts("Yousj OS: yfs mounted on /data\n");
+            else if (mrc == 2)
+                serial_puts("Yousj OS: yfs formatted and mounted on /data\n");
+            else if (mrc == 0)
+                serial_puts("Yousj OS: no data disk (yfs not mounted)\n");
+            else
+                serial_puts("Yousj OS: yfs mount FAILED (I/O error)\n");
+        }
 
         sched_init();
         ta = kthread_create_auto("thread-A", demo_thread, &arg_a);

@@ -1,0 +1,52 @@
+/* Yousj OS - yfs: the on-disk filesystem (M12).
+ *
+ * A deliberately small write-through filesystem on the ATA
+ * driver. Fixed geometry (sector = 512 B):
+ *
+ *   sector 0        superblock ("YOUSJFS1")
+ *   sectors 1..16   inode table: 128 inodes x 64 B
+ *   sectors 17..24  data-block bitmap (32768 blocks max)
+ *   sector 25..     data blocks of 4 KiB (8 sectors each)
+ *
+ * Inodes carry 12 direct block pointers (48 KiB max file).
+ * Directories are files whose content is 32-byte entries
+ * {u32 ino; char name[28]}; an entry is empty iff name[0]==0.
+ * Every mutation is written to the disk synchronously (no
+ * cache): what the syscall returned from is what survives a
+ * power cut. Paths here are relative to the mount root
+ * ("" or "/" is the root directory).
+ */
+#ifndef YOUSJ_YFS_H
+#define YOUSJ_YFS_H
+
+#include <yousj/types.h>
+
+#define YFS_MAX_NAME 27
+
+/* Probe the ATA buses, mount an existing yfs or format a
+ * blank disk. Returns: 1 mounted existing, 2 formatted new,
+ * 0 no usable disk, negative on I/O error. */
+int yfs_mount(void);
+bool yfs_mounted(void);
+uint32_t yfs_disk_sectors(void);
+
+/* Path/inode operations. Inodes are small ints; -1 (with an
+ * errno-style negative from the long-returning ones) on
+ * failure. */
+long yfs_lookup(const char *rel);          /* inode or -errno */
+bool yfs_is_dir(uint32_t ino);
+uint32_t yfs_size(uint32_t ino);
+long yfs_mknod(const char *parent_rel, const char *name,
+               bool is_dir);               /* new inode or -errno */
+long yfs_pread(uint32_t ino, uint32_t off, void *dst,
+               uint32_t count);
+long yfs_pwrite(uint32_t ino, uint32_t off, const void *src,
+                uint32_t count);           /* extends the file */
+int yfs_truncate(uint32_t ino, uint32_t size);
+/* Directory scan: finds the entry at or after *slot (a raw
+ * entry index), fills name/ino/type, advances *slot past it.
+ * Returns 1 when an entry was found, 0 at the end. */
+int yfs_readdir(uint32_t ino, uint32_t *slot, char *name_out,
+                uint32_t *ino_out, int *is_dir_out);
+
+#endif /* YOUSJ_YFS_H */

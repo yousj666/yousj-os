@@ -10,6 +10,7 @@
  */
 #include <yousj/types.h>
 #include <yousj/fs.h>
+#include <yousj/yfs.h>
 #include <yousj/pmm.h>
 #include <yousj/vmm.h> /* errno magnitudes + phys_to_virt */
 
@@ -21,6 +22,48 @@
 #define YOUSJ_EMFILE_L 24
 #define YOUSJ_ENOMEM_L 12
 #define YOUSJ_ENFILE  23
+#define YOUSJ_ENAMETOOLONG_L 36
+
+static uint64_t str_len(const char *s); /* defined below */
+
+/* --- M12: /data dispatch to the yfs backend ------------------- */
+static bool is_data_path(const char *path)
+{
+    if (!yfs_mounted())
+        return false;
+    return path[0] == '/' && path[1] == 'd' && path[2] == 'a' &&
+           path[3] == 't' && path[4] == 'a' &&
+           (path[5] == '\0' || path[5] == '/');
+}
+
+/* "/data" -> "" ; "/data/a/b" -> "a/b" */
+static const char *data_rel(const char *path)
+{
+    const char *rel = path + 5;
+    return rel[0] == '/' ? rel + 1 : rel;
+}
+
+/* Split "a/b/c" into parent "a/b" and name "c" (buffers in the
+ * caller). No slash: parent is "" (the yfs root). */
+static void split_parent_name(const char *rel, char *parent,
+                              char *name)
+{
+    uint64_t i, last = 0xFFFFFFFFFFFFFFFFULL, n = str_len(rel);
+    for (i = 0; i < n; i++)
+        if (rel[i] == '/')
+            last = i;
+    if (last == 0xFFFFFFFFFFFFFFFFULL) {
+        parent[0] = '\0';
+        for (i = 0; i <= n; i++)
+            name[i] = rel[i];
+    } else {
+        for (i = 0; i < last; i++)
+            parent[i] = rel[i];
+        parent[last] = '\0';
+        for (i = last + 1; i <= n; i++)
+            name[i - last - 1] = rel[i];
+    }
+}
 
 #define MAX_NODES      128
 #define NAME_MAX_LEN   31
@@ -183,7 +226,7 @@ uint64_t fs_node_size(const struct yousj_ramfs_node *n)
     return n != NULL ? n->size : 0;
 }
 
-long fs_mkdir_path(const char *path)
+static long ramfs_mkdir_path(const char *path)
 {
     char base[NAME_MAX_LEN + 1];
     struct yousj_ramfs_node *parent = walk(path, true, base);
@@ -378,8 +421,8 @@ long fs_pipe_create(struct yousj_file **rd_out,
     return 0;
 }
 
-long fs_open_path(const char *path, long flags,
-                  struct yousj_file **out)
+static long ramfs_open_path(const char *path, long flags,
+                            struct yousj_file **out)
 {
     struct yousj_ramfs_node *n = fs_lookup(path);
     long acc = flags & YOUSJ_O_ACCMODE;
@@ -418,9 +461,139 @@ long fs_open_path(const char *path, long flags,
     return 0;
 }
 
+static long yfs_open_path_fs(const char *rel, long flags,
+                             struct yousj_file **out)
+{
+    long ino = yfs_lookup(rel);
+    long acc = flags & YOUSJ_O_ACCMODE;
+    struct yousj_file *f;
+    bool is_dir;
+
+    if (ino < 0) {
+        if (ino != -YOUSJ_ENOENT || !(flags & YOUSJ_O_CREAT))
+            return ino;
+        if (flags & YOUSJ_O_DIRECTORY)
+            return -YOUSJ_EINVAL;
+        {
+            char parent[128], name[40];
+            split_parent_name(rel, parent, name);
+            ino = yfs_mknod(parent, name, false);
+            if (ino < 0)
+                return ino;
+        }
+    }
+    is_dir = yfs_is_dir((uint32_t)ino);
+    if (is_dir) {
+        if (acc != YOUSJ_O_RDONLY)
+            return -YOUSJ_EISDIR;
+    } else {
+        if (flags & YOUSJ_O_DIRECTORY)
+            return -YOUSJ_ENOTDIR;
+        if ((flags & YOUSJ_O_TRUNC) && acc != YOUSJ_O_RDONLY)
+            yfs_truncate((uint32_t)ino, 0);
+    }
+    f = file_alloc();
+    if (f == NULL)
+        return -YOUSJ_ENFILE;
+    f->backend = 1;
+    f->yfs_ino = (uint32_t)ino;
+    f->flags = flags;
+    f->offset = 0;
+    *out = f;
+    return 0;
+}
+
+long fs_open_path(const char *path, long flags,
+                  struct yousj_file **out)
+{
+    if (is_data_path(path))
+        return yfs_open_path_fs(data_rel(path), flags, out);
+    return ramfs_open_path(path, flags, out);
+}
+
+long fs_mkdir_path(const char *path)
+{
+    if (is_data_path(path)) {
+        char parent[128], name[40];
+        long ino;
+        split_parent_name(data_rel(path), parent, name);
+        ino = yfs_mknod(parent, name, true);
+        return ino >= 0 ? 0 : ino;
+    }
+    return ramfs_mkdir_path(path);
+}
+
+long fs_read_all_path(const char *path, uint8_t *dst, uint64_t cap)
+{
+    if (is_data_path(path)) {
+        long ino = yfs_lookup(data_rel(path));
+        uint32_t size;
+        if (ino < 0)
+            return ino;
+        if (yfs_is_dir((uint32_t)ino))
+            return -YOUSJ_EISDIR;
+        size = yfs_size((uint32_t)ino);
+        if (size > cap)
+            return -YOUSJ_ENOMEM_L;
+        if (yfs_pread((uint32_t)ino, 0, dst, size) != (long)size)
+            return -1;
+        return (long)size;
+    }
+    {
+        struct yousj_ramfs_node *n = fs_lookup(path);
+        if (n == NULL)
+            return -YOUSJ_ENOENT;
+        if (n->is_dir)
+            return -YOUSJ_EISDIR;
+        if (n->size > cap)
+            return -YOUSJ_ENOMEM_L;
+        return fs_node_read_all(n, dst, n->size);
+    }
+}
+
+bool fs_path_stat(const char *path, bool *is_dir_out,
+                  uint64_t *size_out)
+{
+    if (is_data_path(path)) {
+        long ino = yfs_lookup(data_rel(path));
+        if (ino < 0)
+            return false;
+        *is_dir_out = yfs_is_dir((uint32_t)ino);
+        *size_out = yfs_size((uint32_t)ino);
+        return true;
+    }
+    {
+        struct yousj_ramfs_node *n = fs_lookup(path);
+        if (n == NULL)
+            return false;
+        *is_dir_out = n->is_dir;
+        *size_out = n->size;
+        return true;
+    }
+}
+
+int fs_mount_data(void)
+{
+    int rc = yfs_mount();
+    if (rc > 0)
+        ramfs_mkdir_path("/data"); /* the mountpoint (may exist) */
+    return rc;
+}
+
 long file_read(struct yousj_file *f, uint8_t *dst, uint64_t count)
 {
     long n;
+    if (f != NULL && f->backend == 1) {
+        if (yfs_is_dir(f->yfs_ino))
+            return -YOUSJ_EISDIR;
+        if ((f->flags & YOUSJ_O_ACCMODE) == YOUSJ_O_WRONLY)
+            return -YOUSJ_EBADF;
+        n = yfs_pread(f->yfs_ino, (uint32_t)f->offset, dst,
+                      (uint32_t)count);
+        if (n > 0)
+            f->offset += (uint64_t)n;
+        return n;
+    }
     if (f == NULL || f->node == NULL || f->pipe != NULL)
         return -YOUSJ_EBADF;
     if (f->node->is_dir)
@@ -437,6 +610,19 @@ long file_write(struct yousj_file *f, const uint8_t *src,
                 uint64_t count)
 {
     long n;
+    if (f != NULL && f->backend == 1) {
+        if (yfs_is_dir(f->yfs_ino))
+            return -YOUSJ_EISDIR;
+        if ((f->flags & YOUSJ_O_ACCMODE) == YOUSJ_O_RDONLY)
+            return -YOUSJ_EBADF;
+        if (f->flags & YOUSJ_O_APPEND)
+            f->offset = yfs_size(f->yfs_ino);
+        n = yfs_pwrite(f->yfs_ino, (uint32_t)f->offset, src,
+                       (uint32_t)count);
+        if (n > 0)
+            f->offset += (uint64_t)n;
+        return n;
+    }
     if (f == NULL || f->node == NULL || f->pipe != NULL)
         return -YOUSJ_EBADF;
     if (f->node->is_dir)
@@ -454,6 +640,19 @@ long file_write(struct yousj_file *f, const uint8_t *src,
 long file_seek(struct yousj_file *f, long off, long whence)
 {
     int64_t base, np;
+    if (f != NULL && f->backend == 1) {
+        switch (whence) {
+        case 0: base = 0; break;
+        case 1: base = (int64_t)f->offset; break;
+        case 2: base = (int64_t)yfs_size(f->yfs_ino); break;
+        default: return -YOUSJ_EINVAL;
+        }
+        np = base + off;
+        if (np < 0)
+            return -YOUSJ_EINVAL;
+        f->offset = (uint64_t)np;
+        return np;
+    }
     if (f == NULL || f->node == NULL)
         return -YOUSJ_EBADF;
     /* Directories may seek too: the offset is the getdents
@@ -478,6 +677,35 @@ long file_getdents(struct yousj_file *f, uint8_t *buf, uint64_t count)
 {
     struct yousj_ramfs_node *c;
     uint64_t used = 0, idx = 0;
+    if (f != NULL && f->backend == 1) {
+        uint32_t slot = (uint32_t)f->offset;
+        if (!yfs_is_dir(f->yfs_ino))
+            return -YOUSJ_ENOTDIR;
+        for (;;) {
+            char nm[YFS_MAX_NAME + 1];
+            uint32_t cino;
+            int isdir;
+            uint64_t namelen, reclen;
+            uint8_t *rec;
+            if (yfs_readdir(f->yfs_ino, &slot, nm, &cino,
+                            &isdir) != 1)
+                break;
+            namelen = str_len(nm);
+            reclen = (19 + namelen + 1 + 7) & ~7ULL;
+            if (used + reclen > count)
+                break;
+            rec = buf + used;
+            mem_zero(rec, reclen);
+            *(uint64_t *)(rec + 0) = cino + 2;
+            *(uint64_t *)(rec + 8) = slot;
+            *(uint16_t *)(rec + 16) = (uint16_t)reclen;
+            rec[18] = isdir ? YOUSJ_DT_DIR : YOUSJ_DT_REG;
+            mem_copy(rec + 19, (const uint8_t *)nm, namelen);
+            used += reclen;
+            f->offset = slot;
+        }
+        return (long)used;
+    }
     if (f == NULL || f->node == NULL)
         return -YOUSJ_EBADF;
     if (!f->node->is_dir)

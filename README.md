@@ -166,8 +166,25 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   回），其余七链全绿不回归。诚实的边界：这是 initramfs
   ——镜像即根文件系统的源头，运行时改动仍不跨重启；真
   持久化需要块设备驱动＋磁盘文件系统（后续里程碑）。
-- ⏳ 下一步候选：块设备＋磁盘文件系统（真持久化）、mmap
-  文件映射、poll/select、符号链接。
+- ✅ 调度 M12（2026-11-02）：真持久化——ATA PIO 块驱动
+  （kernel/drivers/ata.c：双总线探测、IDENTIFY、LBA28 轮
+  询读写、写后 FLUSH CACHE）＋磁盘文件系统 yfs（kernel/
+  fs/yfs.c：固定几何——超级块/128 个 inode/位图/4KiB 数
+  据块、12 个直接指针、目录即文件、**全写直通无缓存**，
+  系统调用返回即落盘）。启动时探测磁盘：有 yfs 魔数则挂
+  载、全零盘则格式化后挂载、都没有则 /data 不可用（其余
+  功能不受影响）；挂载到 /data，fs 层按路径前缀分发后端
+  （open/read/write/seek/getdents/mkdir/chdir/execve 全
+  通，程序也能直接从 /data 执行）。新增 /bin/mkdir、
+  /bin/ls。验收：`tools/qemu-disk-test.py` 两阶段——写文
+  件后**硬杀 QEMU（模拟断电）**，重启后文件完好、追加落
+  在原文之后、子目录与 ls 均正常；UEFI 链带数据盘（副总
+  线）启动并正确跳过 FAT 格式的 ESP 盘完成格式化挂载；
+  其余八链不回归。已知边界：单文件上限 48KiB、无删除/
+  改名、无日志（断电恰逢元数据写一半可能损坏该次操作
+  涉及的结构）、yfs 无并发锁、ATA 仅主盘 LBA28 PIO。
+- ⏳ 下一步候选：unlink/rename、mmap 文件映射、poll/
+  select、符号链接、yfs 间接块（突破 48KiB）。
 
 ## 从零构建
 
