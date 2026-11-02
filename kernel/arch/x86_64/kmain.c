@@ -13,6 +13,7 @@
 #include <yousj/interrupts.h>
 #include <yousj/gdt.h>
 #include <yousj/user.h>
+#include <yousj/elf.h>
 #include <drivers/serial.h> /* kernel/drivers/serial.h; -I kernel in Makefile */
 
 /* M1 demo threads (SCHED_DESIGN.md milestone M1): two cooperative
@@ -120,24 +121,88 @@ static void halt_forever(void)
 }
 
 
-struct m3_launcher_arg {
+struct boot_launcher_arg {
     struct task *m2_monitor;
 };
 
-/* Stage 1, step 5 (SCHED_DESIGN milestone M3): the first ring-3
- * program, orchestrated from a queued kernel thread (see the
- * monitor's comment for why idle cannot do this job). Waits for
- * the M2 monitor to finish, then gives one user task its own
- * address space (kernel identity subtree shared, image + stack at
- * YOUSJ_USER_BASE), lands it in ring 3 via iretq, and requires it
- * to print its pid through the write syscall and exit with status
- * 42. The two M2 spinners keep looping in the background --
- * background noise the scheduler just has to live with now. On the
- * verdict it stops the machine: this is the last boot milestone
- * for now. */
-static void m3_launcher_thread(void *arg)
+/* M4 demo victim: sleeps in 60-second stretches forever, so it is
+ * always in S state in ps and always killable. Exists purely so
+ * the M4 acceptance flow (ps -> kill -> ps) has a target. */
+static void demo_sleeper_thread(void *arg)
 {
-    struct m3_launcher_arg *larg = (struct m3_launcher_arg *)arg;
+    (void)arg;
+    for (;;)
+        sched_sleep_ticks(6000);
+}
+
+/* Build init's user stack in its space: 4 pages below
+ * YOUSJ_INIT_STACK_TOP, the top page preloaded with the Linux
+ * initial-stack block. Layout (offsets from the stack top):
+ *   -16        "/init" string (argv[0])
+ *   -80 .. -16 the qword block the crt0 reads:
+ *              argc=1, argv[0]=top-16, argv[1]=NULL, envp=NULL,
+ *              auxv AT_PAGESZ(6)=4096, auxv AT_NULL(0)=0
+ * The initial RSP is top-80 (16-byte aligned, as crt0 expects). */
+static int build_init_stack(struct vmm_space *space)
+{
+    uint64_t top_frame = pmm_alloc_page();
+    uint64_t *block;
+    uint8_t *bytes;
+    int i;
+
+    if (top_frame == 0)
+        return -1;
+    bytes = (uint8_t *)(uintptr_t)top_frame;
+    for (i = 0; i < (int)YOUSJ_PAGE_SIZE; i++)
+        bytes[i] = 0;
+    bytes[YOUSJ_PAGE_SIZE - 16] = '/';
+    bytes[YOUSJ_PAGE_SIZE - 15] = 'i';
+    bytes[YOUSJ_PAGE_SIZE - 14] = 'n';
+    bytes[YOUSJ_PAGE_SIZE - 13] = 'i';
+    bytes[YOUSJ_PAGE_SIZE - 12] = 't';
+    block = (uint64_t *)(uintptr_t)(top_frame + YOUSJ_PAGE_SIZE - 80);
+    block[0] = 1;                            /* argc */
+    block[1] = YOUSJ_INIT_STACK_TOP - 16;    /* argv[0] -> "/init" */
+    block[2] = 0;                            /* argv[1] = NULL */
+    block[3] = 0;                            /* envp = NULL */
+    block[4] = 6;                            /* AT_PAGESZ */
+    block[5] = YOUSJ_PAGE_SIZE;
+    block[6] = 0;                            /* AT_NULL */
+    block[7] = 0;
+    if (vmm_map(space, YOUSJ_INIT_STACK_TOP - YOUSJ_PAGE_SIZE,
+                top_frame, YOUSJ_PAGE_SIZE,
+                YOUSJ_VMM_READ | YOUSJ_VMM_WRITE | YOUSJ_VMM_USER) != 0)
+        return -1;
+    for (i = 1; i < 4; i++) {
+        uint64_t frame = pmm_alloc_page();
+        uint64_t j;
+        if (frame == 0)
+            return -1;
+        for (j = 0; j < YOUSJ_PAGE_SIZE; j++)
+            ((uint8_t *)(uintptr_t)frame)[j] = 0;
+        if (vmm_map(space,
+                    YOUSJ_INIT_STACK_TOP - (uint64_t)(i + 1) * YOUSJ_PAGE_SIZE,
+                    frame, YOUSJ_PAGE_SIZE,
+                    YOUSJ_VMM_READ | YOUSJ_VMM_WRITE |
+                    YOUSJ_VMM_USER) != 0)
+            return -1;
+    }
+    return 0;
+}
+
+/* Boot orchestrator for everything after M2 (a queued kernel
+ * thread -- see the monitor's comment for why idle cannot do this
+ * job). First the M3 smoke: one user task gets its own address
+ * space (kernel identity subtree shared, image + stack at
+ * YOUSJ_USER_BASE), lands in ring 3 via iretq, and must print its
+ * pid through the write syscall and exit with status 42. Then M4:
+ * the ELF init is loaded into its own space and started as the
+ * init task, and this thread retires. The two M2 spinners keep
+ * looping throughout -- background noise the scheduler just has
+ * to live with. */
+static void boot_launcher_thread(void *arg)
+{
+    struct boot_launcher_arg *larg = (struct boot_launcher_arg *)arg;
     extern const uint8_t _binary_m3_user_bin_start[];
     extern const uint8_t _binary_m3_user_bin_end[];
     static struct vmm_space uspace;
@@ -211,6 +276,7 @@ static void m3_launcher_thread(void *arg)
     }
     while (task_state_of(ut) != TASK_ZOMBIE)
         sched_sleep_ticks(5);
+    
     if (ut->exit_status == 42) {
         serial_puts("Yousj OS: sched M3 self-test PASS "
                     "(ring3 program ran, syscalls served, exit 42)\n");
@@ -225,11 +291,72 @@ static void m3_launcher_thread(void *arg)
      * image/stack frames have no owner-tracking yet. Stage-1
      * smoke leak; reaper arrives with real process teardown. */
 
-    /* All boot self-tests passed. What remains of stage 1, in
-     * order (owned by coordinator): M4 (ELF init as PID 1), M5
-     * (clone/exec split + standalone shell), console input. */
-    serial_puts("Yousj OS: all stage-1 boot self-tests done, halting for now\n");
-    halt_forever();
+    
+    /* Stage 1, step 6 (SCHED_DESIGN milestone M4): init formally
+     * takes office. A demo sleeper is parked first (so the M4
+     * acceptance scenario -- ps, kill the sleeper, ps again -- can
+     * be driven from init's console), then the embedded static ELF
+     * init is loaded into its own space per SCHED_DESIGN sec. 7
+     * and started; init owns the console from there and this
+     * thread retires. */
+    {
+        extern const uint8_t _binary_yousj_init_elf_start[];
+        extern const uint8_t _binary_yousj_init_elf_end[];
+        static struct vmm_space ispace;
+        static struct user_start istart;
+        struct task *itask;
+        uint64_t entry = 0, img_brk = 0, heap_base;
+        uint64_t elf_size = (uint64_t)(_binary_yousj_init_elf_end -
+                                       _binary_yousj_init_elf_start);
+        int ok = 1;
+
+        /* The ps/kill acceptance target: a kernel thread that sleeps in long stretches, so it shows up as S in ps. */
+        if (kthread_create_auto("demo-sleeper", demo_sleeper_thread,
+                                NULL) == NULL)
+            ok = 0;
+        if (ok && vmm_create_space(&ispace) != 0)
+            ok = 0;
+        if (ok) {
+            vmm_share_kernel_identity(&ispace);
+            if (elf_load_user_image(_binary_yousj_init_elf_start,
+                                    elf_size, &ispace,
+                                    &entry, &img_brk) != 0)
+                ok = 0;
+        }
+        /* User stack: 4 pages below YOUSJ_INIT_STACK_TOP; the top
+         * page carries the Linux initial-stack block (argc/argv/
+         * envp/auxv) built by build_init_stack(). */
+        if (ok && build_init_stack(&ispace) != 0)
+            ok = 0;
+        if (!ok) {
+            serial_puts("Yousj OS: sched M4 FAILED (init load)\n");
+            halt_forever();
+        }
+        heap_base = (img_brk + YOUSJ_PAGE_SIZE - 1) &
+                    ~(YOUSJ_PAGE_SIZE - 1);
+        istart.ip = entry;
+        istart.sp = YOUSJ_INIT_STACK_TOP - 80;
+
+        __asm__ volatile("cli");
+        itask = kthread_create_auto("init", user_task_start, &istart);
+        if (itask != NULL) {
+            itask->mm = &ispace;
+            itask->brk_start = heap_base;
+            itask->brk_end = heap_base;
+            syscall_set_init_task(itask);
+        }
+        __asm__ volatile("sti");
+        if (itask == NULL) {
+            serial_puts("Yousj OS: sched M4 FAILED (init create)\n");
+            halt_forever();
+        }
+    
+        serial_puts("Yousj OS: boot self-tests done, init started "
+                    "(ELF, milestone M4)\n");
+        /* Retire: init owns the machine now. Remaining stage-1
+         * work (owned by coordinator): M5 (clone/exec split +
+         * standalone shell). */
+    }
 }
 
 /* Kernel entry. boot_info may be NULL in the earliest bring-up builds,
@@ -417,7 +544,7 @@ void kmain(struct yousj_boot_info *boot_info)
         static volatile uint64_t spin_c, spin_d;
         static struct spin_arg carg, darg;
         static struct monitor_arg marg;
-        static struct m3_launcher_arg larg;
+        static struct boot_launcher_arg larg;
         struct task *tc, *td, *ts, *tm, *t3;
 
         carg.count = &spin_c;
@@ -430,7 +557,7 @@ void kmain(struct yousj_boot_info *boot_info)
         marg.spin_d = &spin_d;
         tm = kthread_create_auto("monitor-M", monitor_thread, &marg);
         larg.m2_monitor = tm;
-        t3 = kthread_create_auto("m3-launcher", m3_launcher_thread, &larg);
+        t3 = kthread_create_auto("boot-launcher", boot_launcher_thread, &larg);
         if (tc == NULL || td == NULL || ts == NULL || tm == NULL ||
             t3 == NULL) {
             serial_puts("Yousj OS: sched M2 FAILED (thread create)\n");
