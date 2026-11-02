@@ -34,6 +34,8 @@
 #define SYS_nanosleep 35
 #define SYS_getpid 39
 #define SYS_clone 56
+#define SYS_mmap 9
+#define SYS_munmap 11
 #define SYS_execve 59
 #define SYS_wait4 61
 #define SYS_exit_group 231
@@ -70,6 +72,21 @@ static long sys_call3(long n, long a, long b, long c)
 {
     long r;
     __asm__ volatile("syscall" : "=a"(r) : "a"(n), "D"(a), "S"(b), "d"(c)
+                     : "rcx", "r11", "memory");
+    return r;
+}
+
+static long sys_call6(long n, long a, long b, long c, long d,
+                      long e, long f)
+{
+    long r;
+    register long r10 __asm__("r10") = d;
+    register long r8 __asm__("r8") = e;
+    register long r9 __asm__("r9") = f;
+    __asm__ volatile("syscall"
+                     : "=a"(r)
+                     : "a"(n), "D"(a), "S"(b), "d"(c), "r"(r10),
+                       "r"(r8), "r"(r9)
                      : "rcx", "r11", "memory");
     return r;
 }
@@ -543,6 +560,34 @@ int main(int argc, char **argv)
                              sizeof(lb)) == -22;
         sys_call1(SYS_chdir, (long)(uintptr_t)"/");
         report("cwd-exe", ok);
+    }
+
+    /* M39: the maps file describes the address space. */
+    {
+        static char mb[2048];
+        long maddr = sys_call6(SYS_mmap, 0, 8192, 3, 0x22,
+                               -1, 0);
+        long fd = sys_call3(SYS_open,
+                            (long)(uintptr_t)"/proc/self/maps",
+                            0, 0);
+        long tot = 0, r;
+        if (fd >= 0) {
+            while (tot < (long)sizeof(mb) - 1 &&
+                   (r = sys_call3(SYS_read, fd,
+                                  (long)(uintptr_t)(mb + tot),
+                                  sizeof(mb) - 1 - tot)) > 0)
+                tot += r;
+            sys_call1(SYS_close, fd);
+        }
+        mb[tot] = '\0';
+        report("maps-self",
+               maddr == 0x8002000000L && tot > 0 &&
+               contains(mb, tot, "/bin/pidtest") &&
+               contains(mb, tot, "[stack]") &&
+               contains(mb, tot, "8002000000-") &&
+               contains(mb, tot, "rw-p"));
+        if (maddr > 0)
+            sys_call3(SYS_munmap, maddr, 8192, 0);
     }
 
     out("PIDTEST DONE\n");

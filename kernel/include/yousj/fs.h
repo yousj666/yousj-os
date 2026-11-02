@@ -68,7 +68,7 @@ struct yousj_file {
     uint32_t proc_pid;             /* backend 2, M28: the tid
                                       for PROC_ID_PID* entries */
     uint32_t proc_len;             /* backend 2: snapshot size */
-    char proc_buf[640];            /* backend 2: content snapshot
+    char proc_buf[2048]; /* M39: maps needs room */            /* backend 2: content snapshot
                                       taken at open (M25); 640
                                       since M34 (fits environ) */
     char open_path[256];           /* M30: the absolute path

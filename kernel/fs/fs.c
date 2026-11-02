@@ -15,6 +15,7 @@
 #include <yousj/pmm.h>
 #include <yousj/sched.h> /* M25: tick counters for /proc */
 #include <yousj/vmm.h> /* errno magnitudes + phys_to_virt */
+#include <yousj/user.h> /* M39: user window constants for maps */
 
 #define YOUSJ_EBADF   9
 #define YOUSJ_EEXIST_L 17
@@ -908,6 +909,7 @@ static long yfs_open_path_fs(const char *rel, long flags,
 #define PROC_ID_PENVIRON 8 /* M34 */
 #define PROC_ID_PCWD     9 /* M35 */
 #define PROC_ID_PEXE     10 /* M35 */
+#define PROC_ID_PMAPS    11 /* M39 */
 static const char *const g_proc_names[3] = {
     "uptime", "meminfo", "version"
 };
@@ -944,6 +946,8 @@ static uint64_t proc_ino_for(int id, uint32_t pid)
         return 10000 + (uint64_t)pid * 8 + 5;
     if (id == PROC_ID_PEXE)
         return 10000 + (uint64_t)pid * 8 + 6;
+    if (id == PROC_ID_PMAPS)
+        return 10000 + (uint64_t)pid * 8 + 7;
     return 9000 + (uint64_t)id;
 }
 
@@ -1010,6 +1014,10 @@ static int proc_find(const char *rel, uint32_t *pid_out)
             if (leaf[0] == 'e' && leaf[1] == 'x' &&
                 leaf[2] == 'e' && leaf[3] == '\0')
                 return PROC_ID_PEXE;
+            if (leaf[0] == 'm' && leaf[1] == 'a' &&
+                leaf[2] == 'p' && leaf[3] == 's' &&
+                leaf[4] == '\0')
+                return PROC_ID_PMAPS;
         }
         return -1;
     }
@@ -1077,6 +1085,44 @@ static void pb_putu(struct pbuf *b, uint64_t v)
         }
     }
 }
+
+/* M39: hex for maps (fixed-width, zero-padded). */
+static void pb_hex(struct pbuf *b, uint64_t v, int width)
+{
+    char tmp[16];
+    int i;
+    for (i = 0; i < width; i++) {
+        uint32_t d = (uint32_t)(v & 0xF);
+        tmp[width - 1 - i] = (char)(d < 10 ? '0' + d
+                                          : 'a' + (d - 10));
+        v >>= 4;
+    }
+    for (i = 0; i < width; i++) {
+        char one[2];
+        one[0] = tmp[i];
+        one[1] = '\0';
+        pb_puts(b, one);
+    }
+}
+
+static void pb_maps_line(struct pbuf *b, uint64_t lo,
+                         uint64_t hi, const char *perms,
+                         uint64_t off, const char *path)
+{
+    pb_hex(b, lo, 12);
+    pb_puts(b, "-");
+    pb_hex(b, hi, 12);
+    pb_puts(b, " ");
+    pb_puts(b, perms);
+    pb_puts(b, " ");
+    pb_hex(b, off, 8);
+    pb_puts(b, " 00:00 0");
+    if (path != NULL && path[0] != '\0') {
+        pb_puts(b, " ");
+        pb_puts(b, path);
+    }
+    pb_puts(b, "\n");
+}
 /* "<seconds>.<centiseconds>" for a tick count */
 static void pb_put_ticks(struct pbuf *b, uint64_t ticks)
 {
@@ -1140,7 +1186,7 @@ static uint32_t proc_generate(int id, uint32_t pid, char *buf,
         pb_puts(&b, " kB\n");
         break;
     case PROC_ID_VERSION:
-        pb_puts(&b, "Yousj OS version 0.9 (M35) x86_64 #1\n");
+        pb_puts(&b, "Yousj OS version 0.9 (M39) x86_64 #1\n");
         break;
     case PROC_ID_PCMDLINE: {
         /* Raw bytes, not text: the argv is NUL-joined, so
@@ -1167,6 +1213,47 @@ static uint32_t proc_generate(int id, uint32_t pid, char *buf,
             n = b.cap;
         for (i = 0; i < n; i++)
             b.buf[b.len++] = t->env[i];
+        break;
+    }
+    case PROC_ID_PMAPS: {
+        /* M39: the address space in Linux maps shape.
+         * The image is one line (its segments are not
+         * retained separately, so the writable tail
+         * rides in the r-xp range -- documented); heap
+         * only when the break has moved; the stack is
+         * the four pages exec committed; then the VMA
+         * list in slot order, with a file path when the
+         * mapping is file-backed. */
+        struct task *t = sched_find_task((int)pid);
+        int i;
+        if (t == NULL || t->mm == NULL ||
+            t->exe_path[0] == '\0')
+            break;
+        pb_maps_line(&b, YOUSJ_USER_BASE, t->brk_start,
+                     "r-xp", 0, t->exe_path);
+        if (t->brk_end > t->brk_start)
+            pb_maps_line(&b, t->brk_start, t->brk_end,
+                         "rw-p", 0, "[heap]");
+        pb_maps_line(&b,
+                     YOUSJ_INIT_STACK_TOP - 4 * 4096,
+                     YOUSJ_INIT_STACK_TOP, "rw-p", 0,
+                     "[stack]");
+        for (i = 0; i < YOUSJ_MAX_VMA; i++) {
+            struct yousj_vma *v = &t->vmas[i];
+            char perm[5];
+            if (!v->used)
+                continue;
+            perm[0] = (v->prot & 1) ? 'r' : '-';
+            perm[1] = (v->prot & 2) ? 'w' : '-';
+            perm[2] = (v->prot & 4) ? 'x' : '-';
+            perm[3] = v->shared ? 's' : 'p';
+            perm[4] = '\0';
+            pb_maps_line(&b, v->base, v->base + v->len,
+                         perm, v->file_off,
+                         v->file != NULL
+                             ? v->file->open_path
+                             : "");
+        }
         break;
     }
     case PROC_ID_PSTATUS: {
@@ -2137,9 +2224,9 @@ long file_getdents(struct yousj_file *f, uint8_t *buf, uint64_t count)
         static const char *const root_names[5] = {
             ".", "..", "uptime", "meminfo", "version"
         };
-        static const char *const pid_names[8] = {
+        static const char *const pid_names[9] = {
             ".", "..", "status", "stat", "cmdline",
-            "environ", "cwd", "exe"
+            "environ", "cwd", "exe", "maps"
         };
         uint64_t tids[YOUSJ_SCHED_MAX_TASKS];
         uint32_t ntids = 0;
@@ -2153,7 +2240,7 @@ long file_getdents(struct yousj_file *f, uint8_t *buf, uint64_t count)
                                     YOUSJ_SCHED_MAX_TASKS);
             total = 5 + ntids;
         } else {
-            total = 8;
+            total = 9;
         }
         for (i = f->offset; i < total; i++) {
             const char *nm;
@@ -2165,8 +2252,9 @@ long file_getdents(struct yousj_file *f, uint8_t *buf, uint64_t count)
             if (f->proc_id == PROC_ID_PIDDIR) {
                 nm = pid_names[i];
                 dtype = i <= 1 ? YOUSJ_DT_DIR
-                        : i >= 6 ? 10 /* DT_LNK: cwd/exe */
-                        : YOUSJ_DT_REG;
+                        : (i == 6 || i == 7)
+                              ? 10 /* DT_LNK: cwd/exe */
+                              : YOUSJ_DT_REG;
                 if (i == 0)
                     ino = proc_ino_for(PROC_ID_PIDDIR,
                                        f->proc_pid);
@@ -2187,8 +2275,11 @@ long file_getdents(struct yousj_file *f, uint8_t *buf, uint64_t count)
                 else if (i == 6)
                     ino = proc_ino_for(PROC_ID_PCWD,
                                        f->proc_pid);
-                else
+                else if (i == 7)
                     ino = proc_ino_for(PROC_ID_PEXE,
+                                       f->proc_pid);
+                else
+                    ino = proc_ino_for(PROC_ID_PMAPS,
                                        f->proc_pid);
             } else if (i < 5) {
                 nm = root_names[i];

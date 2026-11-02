@@ -583,9 +583,19 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   seek 后从下一条续读、16 字节小缓冲 EINVAL
   且位置不乱、SEEK_END 被拒，ramfs/yfs 各
   一遍。
+- ✅ /proc/<pid>/maps M39（2026-11-03）：
+  按地址序生成镜像区（单行 r-xp 带 exe 路
+  径；ELF 段级权限未单独留存，可写尾段也在
+  此行内——明示）、堆（brk 移动过才有）、栈
+  （exec 提交的 4 页）、VMA 列表（perms 按
+  prot/shared、文件映射带 open 路径与偏移）。
+  快照缓冲 640→2048。内核线程与未 exec 的
+  任务 maps 为空，与 Linux 一致。验收：
+  pidtest 加 maps-self（mmap 后映射行、镜像
+  路径、[stack] 都在）。
 - ⏳ 下一步候选：硬链接（目录项重构）、
-  /proc/<pid>/maps 示意、sendfile/splice
-  等零拷贝家族盘点。
+  sendfile/splice 等零拷贝家族盘点、/proc
+  其余项（fd/ 目录）。
 
 ## 从零构建
 
