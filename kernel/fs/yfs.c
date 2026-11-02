@@ -24,7 +24,13 @@
 #define INODE_SIZE      64
 #define BITMAP_SECTOR0  17
 #define BITMAP_SECTORS  8
-#define DATA_SECTOR0    25
+/* M19: the write-ahead journal lives between the bitmap
+ * and the data area: one header sector plus TXN_MAX
+ * payload sectors, each holding a full-sector redo image
+ * of one metadata operation. */
+#define JRNL_SECTOR0    25
+#define TXN_MAX         48
+#define DATA_SECTOR0    (JRNL_SECTOR0 + 1 + TXN_MAX)
 #define BLOCK_SIZE      4096
 #define BLOCK_SECTORS   8
 #define DIRECT          11
@@ -89,13 +95,238 @@ static bool str_eq_n(const char *a, const char *b, uint64_t n)
     return b[n] == '\0';
 }
 
+/* --- M19: write-ahead journal -----------------------------------
+ * Metadata operations (mknod/unlink/rename/truncate and
+ * the deferred free) run inside a transaction: while one
+ * is active, EVERY sector write in this file is staged in
+ * memory (reads see staged images -- read-your-writes) and
+ * nothing reaches the disk. On commit the staged images
+ * are written to the journal payload area, the journal
+ * header is written (the commit point), the images are
+ * written home, and the header is cleared. On failure the
+ * stage is simply dropped: a failed operation changes
+ * nothing on disk. At mount, a surviving committed header
+ * is replayed (full-sector redo is idempotent) and then
+ * cleared. File CONTENT writes through yfs_pwrite are not
+ * journaled (ordered-mode semantics: structure is atomic,
+ * content may reflect a partial write after a crash), and
+ * the open-count bumps in rsvd[0] are deliberately not
+ * journaled -- a journal cycle per open/close would cost
+ * more than the counter is worth. Like the rest of yfs,
+ * transactions are not locked against concurrent tasks. */
+
+static bool g_txn;
+static int g_txn_depth;
+static int g_txn_n;
+static bool g_txn_failed;
+static uint32_t g_txn_lba[TXN_MAX];
+static uint8_t g_txn_img[TXN_MAX][ATA_SECTOR_SIZE];
+static uint32_t g_jseq;
+
+static uint32_t fnv1a(const uint8_t *p, uint32_t n)
+{
+    uint32_t h = 2166136261u, i;
+    for (i = 0; i < n; i++) {
+        h ^= p[i];
+        h *= 16777619u;
+    }
+    return h;
+}
+
+static int txn_find(uint32_t lba)
+{
+    int i;
+    for (i = 0; i < g_txn_n; i++)
+        if (g_txn_lba[i] == lba)
+            return i;
+    return -1;
+}
+
+static int yfs_rd(uint32_t lba, uint32_t count, void *buf)
+{
+    uint8_t *p = (uint8_t *)buf;
+    uint32_t s;
+    if (!g_txn)
+        return ata_read(&g_drv, lba, count, buf);
+    for (s = 0; s < count; s++) {
+        int idx = txn_find(lba + s);
+        if (idx >= 0)
+            mem_copy(p + s * ATA_SECTOR_SIZE,
+                     g_txn_img[idx], ATA_SECTOR_SIZE);
+        else if (ata_read(&g_drv, lba + s, 1,
+                          p + s * ATA_SECTOR_SIZE) != 0)
+            return -1;
+    }
+    return 0;
+}
+
+static int yfs_wr(uint32_t lba, uint32_t count, const void *buf)
+{
+    const uint8_t *p = (const uint8_t *)buf;
+    uint32_t s;
+    if (!g_txn)
+        return ata_write(&g_drv, lba, count, buf);
+    for (s = 0; s < count; s++) {
+        int idx = txn_find(lba + s);
+        if (idx < 0) {
+            if (g_txn_n >= TXN_MAX) {
+                g_txn_failed = true;
+                return -1;
+            }
+            idx = g_txn_n++;
+            g_txn_lba[idx] = lba + s;
+        }
+        mem_copy(g_txn_img[idx], p + s * ATA_SECTOR_SIZE,
+                 ATA_SECTOR_SIZE);
+    }
+    return 0;
+}
+
+struct yfs_jhdr {
+    char magic[8]; /* "YOUSJJR1" */
+    uint32_t seq;
+    uint32_t count;
+    uint32_t targets[TXN_MAX];
+    uint32_t sums[TXN_MAX];
+    uint32_t hdr_sum;
+};
+
+static void journal_write_header(const struct yfs_jhdr *h)
+{
+    mem_zero(g_sec, ATA_SECTOR_SIZE);
+    mem_copy(g_sec, (const uint8_t *)h,
+             sizeof(struct yfs_jhdr));
+    ata_write(&g_drv, JRNL_SECTOR0, 1, g_sec);
+}
+
+static void journal_clear(void)
+{
+    struct yfs_jhdr h;
+    mem_zero((uint8_t *)&h, sizeof(h));
+    mem_copy((uint8_t *)h.magic, (const uint8_t *)"YOUSJJR1",
+             8);
+    h.seq = g_jseq;
+    h.count = 0;
+    h.hdr_sum = fnv1a((const uint8_t *)&h,
+                      sizeof(h) - sizeof(uint32_t));
+    journal_write_header(&h);
+}
+
+static void txn_begin(void)
+{
+    if (g_txn_depth++ == 0) {
+        g_txn = true;
+        g_txn_n = 0;
+        g_txn_failed = false;
+    }
+}
+
+static void txn_finish(bool commit)
+{
+    struct yfs_jhdr h;
+    int i;
+    if (--g_txn_depth > 0)
+        return;
+    g_txn = false;
+    if (!commit || g_txn_failed || g_txn_n == 0) {
+        g_txn_n = 0;
+        return;
+    }
+    /* Sort the stage by LBA (rows move with their keys):
+     * the payload area then holds the images in row order
+     * -- one contiguous write -- and the checkpoint can
+     * merge runs of consecutive home sectors. Without
+     * this, a commit costs one flushed write per sector;
+     * with it, roughly one per run. */
+    {
+        int a, b;
+        for (a = 1; a < g_txn_n; a++) {
+            uint32_t lba = g_txn_lba[a];
+            static uint8_t tmp[ATA_SECTOR_SIZE];
+            mem_copy(tmp, g_txn_img[a], ATA_SECTOR_SIZE);
+            for (b = a - 1; b >= 0 && g_txn_lba[b] > lba;
+                 b--) {
+                g_txn_lba[b + 1] = g_txn_lba[b];
+                mem_copy(g_txn_img[b + 1], g_txn_img[b],
+                         ATA_SECTOR_SIZE);
+            }
+            g_txn_lba[b + 1] = lba;
+            mem_copy(g_txn_img[b + 1], tmp, ATA_SECTOR_SIZE);
+        }
+    }
+    /* payload images first, then the header: the header
+     * write is the commit point */
+    ata_write(&g_drv, JRNL_SECTOR0 + 1, (uint32_t)g_txn_n,
+              g_txn_img);
+    mem_zero((uint8_t *)&h, sizeof(h));
+    mem_copy((uint8_t *)h.magic, (const uint8_t *)"YOUSJJR1",
+             8);
+    h.seq = ++g_jseq;
+    h.count = (uint32_t)g_txn_n;
+    for (i = 0; i < g_txn_n; i++) {
+        h.targets[i] = g_txn_lba[i];
+        h.sums[i] = fnv1a(g_txn_img[i], ATA_SECTOR_SIZE);
+    }
+    h.hdr_sum = fnv1a((const uint8_t *)&h,
+                      sizeof(h) - sizeof(uint32_t));
+    journal_write_header(&h);
+    /* checkpoint: write the images home in LBA runs,
+     * then clear */
+    {
+        int a = 0;
+        while (a < g_txn_n) {
+            int b = a;
+            while (b + 1 < g_txn_n &&
+                   g_txn_lba[b + 1] == g_txn_lba[b] + 1)
+                b++;
+            ata_write(&g_drv, g_txn_lba[a],
+                      (uint32_t)(b - a + 1), g_txn_img[a]);
+            a = b + 1;
+        }
+    }
+    journal_clear();
+    g_txn_n = 0;
+}
+
+static void journal_replay(void)
+{
+    struct yfs_jhdr h;
+    uint32_t i;
+    static uint8_t img[ATA_SECTOR_SIZE];
+    if (ata_read(&g_drv, JRNL_SECTOR0, 1, g_sec) != 0)
+        return;
+    mem_copy((uint8_t *)&h, g_sec, sizeof(h));
+    if (!str_eq_n(h.magic, "YOUSJJR1", 8) || h.count == 0 ||
+        h.count > TXN_MAX)
+        return;
+    if (h.hdr_sum != fnv1a((const uint8_t *)&h,
+                           sizeof(h) - sizeof(uint32_t))) {
+        journal_clear(); /* never committed: drop it */
+        return;
+    }
+    g_jseq = h.seq;
+    for (i = 0; i < h.count; i++) {
+        if (ata_read(&g_drv, JRNL_SECTOR0 + 1 + i, 1,
+                     img) != 0 ||
+            fnv1a(img, ATA_SECTOR_SIZE) != h.sums[i]) {
+            journal_clear(); /* corrupt payload: drop */
+            return;
+        }
+    }
+    for (i = 0; i < h.count; i++) {
+        ata_read(&g_drv, JRNL_SECTOR0 + 1 + i, 1, img);
+        ata_write(&g_drv, h.targets[i], 1, img);
+    }
+    journal_clear();
+}
+
 /* --- raw inode access ------------------------------------------- */
 
 static int inode_read(uint32_t ino, struct yfs_inode *out)
 {
     uint32_t sec = INODE_SECTOR0 + (ino * INODE_SIZE) / ATA_SECTOR_SIZE;
     uint32_t off = (ino * INODE_SIZE) % ATA_SECTOR_SIZE;
-    if (ata_read(&g_drv, sec, 1, g_sec) != 0)
+    if (yfs_rd(sec, 1, g_sec) != 0)
         return -E_IO_L;
     mem_copy((uint8_t *)out, g_sec + off, INODE_SIZE);
     return 0;
@@ -105,10 +336,10 @@ static int inode_write(uint32_t ino, const struct yfs_inode *in)
 {
     uint32_t sec = INODE_SECTOR0 + (ino * INODE_SIZE) / ATA_SECTOR_SIZE;
     uint32_t off = (ino * INODE_SIZE) % ATA_SECTOR_SIZE;
-    if (ata_read(&g_drv, sec, 1, g_sec) != 0)
+    if (yfs_rd(sec, 1, g_sec) != 0)
         return -E_IO_L;
     mem_copy(g_sec + off, (const uint8_t *)in, INODE_SIZE);
-    if (ata_write(&g_drv, sec, 1, g_sec) != 0)
+    if (yfs_wr(sec, 1, g_sec) != 0)
         return -E_IO_L;
     return 0;
 }
@@ -119,7 +350,7 @@ static long block_alloc(void)
 {
     uint32_t s, i;
     for (s = 0; s < BITMAP_SECTORS; s++) {
-        if (ata_read(&g_drv, BITMAP_SECTOR0 + s, 1, g_sec) != 0)
+        if (yfs_rd(BITMAP_SECTOR0 + s, 1, g_sec) != 0)
             return -E_IO_L;
         for (i = 0; i < ATA_SECTOR_SIZE * 8; i++) {
             uint32_t blk = s * ATA_SECTOR_SIZE * 8 + i;
@@ -127,7 +358,7 @@ static long block_alloc(void)
                 return -E_NOSPC_L;
             if (!(g_sec[i / 8] & (uint8_t)(1u << (i % 8)))) {
                 g_sec[i / 8] |= (uint8_t)(1u << (i % 8));
-                if (ata_write(&g_drv, BITMAP_SECTOR0 + s, 1,
+                if (yfs_wr(BITMAP_SECTOR0 + s, 1,
                               g_sec) != 0)
                     return -E_IO_L;
                 /* hand out a zeroed block */
@@ -147,21 +378,21 @@ static void block_free(uint32_t blk)
 {
     uint32_t s = blk / (ATA_SECTOR_SIZE * 8);
     uint32_t i = blk % (ATA_SECTOR_SIZE * 8);
-    if (ata_read(&g_drv, BITMAP_SECTOR0 + s, 1, g_sec) != 0)
+    if (yfs_rd(BITMAP_SECTOR0 + s, 1, g_sec) != 0)
         return;
     g_sec[i / 8] &= (uint8_t)~(1u << (i % 8));
-    ata_write(&g_drv, BITMAP_SECTOR0 + s, 1, g_sec);
+    yfs_wr(BITMAP_SECTOR0 + s, 1, g_sec);
 }
 
 static int block_read(uint32_t blk, uint8_t *dst)
 {
-    return ata_read(&g_drv, DATA_SECTOR0 + blk * BLOCK_SECTORS,
+    return yfs_rd(DATA_SECTOR0 + blk * BLOCK_SECTORS,
                     BLOCK_SECTORS, dst) == 0 ? 0 : -E_IO_L;
 }
 
 static int block_write(uint32_t blk, const uint8_t *src)
 {
-    return ata_write(&g_drv, DATA_SECTOR0 + blk * BLOCK_SECTORS,
+    return yfs_wr(DATA_SECTOR0 + blk * BLOCK_SECTORS,
                      BLOCK_SECTORS, src) == 0 ? 0 : -E_IO_L;
 }
 
@@ -339,7 +570,7 @@ long yfs_symlink(const char *parent_rel, const char *name,
     return ino;
 }
 
-int yfs_truncate(uint32_t ino, uint32_t size)
+static int yfs_truncate_impl(uint32_t ino, uint32_t size)
 {
     struct yfs_inode n;
     uint32_t i, keep;
@@ -525,7 +756,7 @@ static int dir_link(uint32_t pino, const char *name, uint32_t target)
 #define REFS_OF(n)   ((n)->rsvd[0] & 0xFFFFu)
 #define UNLINKED_OF(n) (((n)->rsvd[0] & 0x10000u) != 0)
 
-static int free_inode(uint32_t ino)
+static int free_inode_impl(uint32_t ino)
 {
     struct yfs_inode n;
     if (yfs_truncate(ino, 0) != 0)
@@ -535,6 +766,15 @@ static int free_inode(uint32_t ino)
     n.type = 0;
     n.rsvd[0] = 0;
     return inode_write(ino, &n);
+}
+
+static int free_inode(uint32_t ino)
+{
+    int rc;
+    txn_begin();
+    rc = free_inode_impl(ino);
+    txn_finish(rc == 0);
+    return rc;
 }
 
 static int remove_dirent(uint32_t pino, uint32_t slot,
@@ -575,8 +815,8 @@ static int dir_is_empty(uint32_t ino)
     return 1;
 }
 
-long yfs_unlink(const char *parent_rel, const char *name,
-                bool want_dir)
+static long yfs_unlink_impl(const char *parent_rel,
+                            const char *name, bool want_dir)
 {
     long pino = yfs_lookup(parent_rel);
     uint32_t slot;
@@ -628,7 +868,8 @@ static void split_rel(const char *rel, char *parent, char *name)
     }
 }
 
-long yfs_rename(const char *old_rel, const char *new_rel)
+static long yfs_rename_impl(const char *old_rel,
+                            const char *new_rel)
 {
     char oparent[128], oname[40], nparent[128], nname[40];
     long src, npino, existing;
@@ -721,8 +962,8 @@ void yfs_note_close(uint32_t ino)
         free_inode(ino);
 }
 
-long yfs_mknod_t(const char *parent_rel, const char *name,
-                 uint8_t type)
+static long yfs_mknod_t_impl(const char *parent_rel,
+                             const char *name, uint8_t type)
 {
     long pino;
     struct yfs_inode parent, fresh;
@@ -760,6 +1001,49 @@ long yfs_mknod_t(const char *parent_rel, const char *name,
     if (dir_link((uint32_t)pino, name, free_ino) != 0)
         return -E_IO_L;
     return (long)free_ino;
+}
+
+/* --- M19: transactional wrappers. The public metadata
+ * operations stage every sector write and commit through
+ * the journal; a negative result discards the stage, so a
+ * failed operation leaves the disk untouched. */
+
+int yfs_truncate(uint32_t ino, uint32_t size)
+{
+    int rc;
+    txn_begin();
+    rc = yfs_truncate_impl(ino, size);
+    txn_finish(rc == 0);
+    return rc;
+}
+
+long yfs_unlink(const char *parent_rel, const char *name,
+                bool want_dir)
+{
+    long rc;
+    txn_begin();
+    rc = yfs_unlink_impl(parent_rel, name, want_dir);
+    txn_finish(rc >= 0);
+    return rc;
+}
+
+long yfs_rename(const char *old_rel, const char *new_rel)
+{
+    long rc;
+    txn_begin();
+    rc = yfs_rename_impl(old_rel, new_rel);
+    txn_finish(rc >= 0);
+    return rc;
+}
+
+long yfs_mknod_t(const char *parent_rel, const char *name,
+                 uint8_t type)
+{
+    long rc;
+    txn_begin();
+    rc = yfs_mknod_t_impl(parent_rel, name, type);
+    txn_finish(rc >= 0);
+    return rc;
 }
 
 int yfs_readdir(uint32_t ino, uint32_t *slot, char *name_out,
@@ -824,7 +1108,7 @@ static int yfs_format(struct ata_drive *d)
     g_data_blocks = (d->sectors - DATA_SECTOR0) / BLOCK_SECTORS;
     mem_zero(g_sec, ATA_SECTOR_SIZE);
     mem_copy(g_sec, (const uint8_t *)"YOUSJFS1", 8);
-    *(uint32_t *)(g_sec + 8) = 2; /* version: M13 indirect */
+    *(uint32_t *)(g_sec + 8) = 3; /* version: M19 journal */
     *(uint32_t *)(g_sec + 12) = d->sectors;
     *(uint32_t *)(g_sec + 16) = g_data_blocks;
     if (ata_write(d, SB_SECTOR, 1, g_sec) != 0)
@@ -835,6 +1119,9 @@ static int yfs_format(struct ata_drive *d)
             return -E_IO_L;
     for (s = 0; s < BITMAP_SECTORS; s++)
         if (ata_write(d, BITMAP_SECTOR0 + s, 1, g_sec) != 0)
+            return -E_IO_L;
+    for (s = 0; s < 1 + TXN_MAX; s++)
+        if (ata_write(d, JRNL_SECTOR0 + s, 1, g_sec) != 0)
             return -E_IO_L;
     /* root inode: a directory */
     mem_zero((uint8_t *)&root, sizeof(root));
@@ -862,13 +1149,14 @@ int yfs_mount(void)
         if (ata_read(&d, SB_SECTOR, 1, g_sec) != 0)
             continue;
         if (sector_has_magic(g_sec) &&
-            *(const uint32_t *)(g_sec + 8) == 2) {
+            *(const uint32_t *)(g_sec + 8) == 3) {
             g_drv = d;
             g_data_blocks = *(const uint32_t *)(g_sec + 16);
             if (g_data_blocks == 0)
                 g_data_blocks =
                     (d.sectors - DATA_SECTOR0) / BLOCK_SECTORS;
             g_mounted = true;
+            journal_replay();
             return 1;
         }
         if (!have_cand && sector_is_zero(g_sec)) {

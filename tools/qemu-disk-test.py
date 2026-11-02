@@ -170,6 +170,77 @@ check('p3 readlink prints target',
 check('p3 subdir file still there',
       sess.run_expect('cat /data/sub/a.txt', 'nested'))
 qemu.terminate()
+qemu.wait()
+s.close()
+
+# ---------- M19: journal must be clear after clean ops ----
+with open(DISK, 'rb') as f:
+    f.seek(25 * 512)
+    jhdr = f.read(512)
+check('jrnl header present after p3',
+      jhdr[0:8] == b'YOUSJJR1')
+import struct as _st
+check('jrnl count is 0 after p3 (all txns checkpointed)',
+      _st.unpack_from('<I', jhdr, 12)[0] == 0)
+
+# ---------- phase 4: churn + hard kill mid-transaction ----
+qemu, s = boot()
+sess = Session(s)
+check('p4 shell prompt', sess.until('sh> ', 60))
+check('p4 yfs mounted existing',
+      b'yfs mounted on /data' in sess.buf)
+sess.buf = b''
+check('p4 sentinel write',
+      sess.run_expect('echo sentinel-ok > /data/sentinel.txt',
+                      'sh> '))
+sess.buf = b''
+check('p4 sentinel read',
+      sess.run_expect('cat /data/sentinel.txt', 'sentinel-ok'))
+sess.until('sh> ', 20)
+sess.buf = b''
+s.send(b'churn\n')
+cycles = 0
+end = time.time() + 90
+while time.time() < end:
+    cycles = sess.buf.count(b'churn cycle')
+    if cycles >= 3:
+        break
+    try:
+        d = s.recv(65536)
+        if d: sess.buf += d
+    except socket.timeout: pass
+check('p4 churn ran >=3 cycles', cycles >= 3)
+time.sleep(1.5)
+qemu.kill()  # power cut mid-transaction, hopefully
+qemu.wait()
+s.close()
+
+# ---------- phase 5: structure survives the churn kill ----
+qemu, s = boot()
+sess = Session(s)
+check('p5 shell prompt', sess.until('sh> ', 60))
+check('p5 yfs mounted existing',
+      b'yfs mounted on /data' in sess.buf and
+      b'formatted' not in sess.buf)
+sess.buf = b''
+check('p5 sentinel intact',
+      sess.run_expect('cat /data/sentinel.txt', 'sentinel-ok'))
+sess.buf = b''
+check('p5 ls /data works',
+      sess.run_expect('ls /data', 'sentinel.txt'))
+sess.buf = b''
+check('p5 probe write',
+      sess.run_expect('echo probe > /data/probe.txt', 'sh> '))
+sess.buf = b''
+check('p5 probe read',
+      sess.run_expect('cat /data/probe.txt', 'probe'))
+check('p5 probe rm', sess.run_expect('rm /data/probe.txt',
+                                     'sh> '))
+sess.buf = b''
+check('p5 bigfile still verifies',
+      sess.run_expect('bigfile /data/big.bin 102400 check',
+                      'sh> '))
+qemu.terminate()
 s.close()
 os.unlink(DISK)
 print('ALL OK' if not fails else 'FAILURES PRESENT')
