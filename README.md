@@ -60,8 +60,17 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   Multiboot 冒烟、串口交互实测（`tools/qemu-init-test.py`：
   help→ps→kill 演示线程→ps 验消失→exit 验 panic）与 UEFI 链
   全部 PASS。
-- ⏳ 下一步：M5 进程模型（clone/execve/wait4、独立 Shell、
-  监管型 init 接管）、高半区＋HHDM 布局。
+- ✅ 调度 M5（2026-11-02）：进程模型打通——clone（fork 式，
+  子空间全页拷贝、rax=0 复活）、execve（内嵌映像表 /init、
+  /bin/sh、/bin/hello；先建新空间、成功才切换）、wait4
+  （阻塞/WNOHANG、回收内核栈与地址空间、孤儿由 init 收养）。
+  init 改任监管者：循环拉起独立 Shell 进程、回收、1 秒后
+  重启；Shell（yousj-sh）有 help/ps/free/uname/echo/exit 内建
+  命令与外部命令执行。验收：`tools/qemu-proc-test.py` 全项
+  PASS，含多轮命令后 PMM 空闲页数对账归零（无泄漏），UEFI
+  链到 Shell 提示符。
+- ⏳ 下一步：高半区＋HHDM 布局（退役内核恒等共享子树）、
+  信号机制与 FPU/SSE 状态、文件系统（execve 映像表退役）。
 
 ## 从零构建
 
