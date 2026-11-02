@@ -89,7 +89,7 @@ SCEN = ['openat-rel', 'openat-sub', 'fdcwd', 'statat-rel',
         'unlinkat-rel', 'symlinkat-rel', 'mkdirat-rel',
         'renameat-rel', 'renameat2-noreplace',
         'readlinkat-rel', 'faccessat-rel', 'linkat-eperm',
-        'chmod-family', 'creat-modes']
+        'chmod-family', 'creat-modes', 'seekdir']
 
 check('shell prompt', until('sh> ', 60))
 free_counts = []

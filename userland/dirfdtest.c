@@ -50,6 +50,8 @@
 #define SYS_fchownat 260
 #define SYS_fchmodat 268
 #define SYS_umask 95
+#define SYS_lseek 8
+#define SYS_getdents64 217
 
 #define AT_FDCWD (-100)
 #define AT_SYMLINK_NOFOLLOW 0x100
@@ -171,6 +173,50 @@ static int streq(const char *a, const char *b, long n)
         if (a[i] != b[i])
             return 0;
     return 1;
+}
+
+/* M38: find an entry's d_off cookie in a getdents
+ * buffer, or -1. */
+static long dent_off(const char *db, long got,
+                     const char *name)
+{
+    long off = 0;
+    while (off + 19 <= got) {
+        uint16_t reclen = *(const uint16_t *)(db + off + 16);
+        const char *nm = db + off + 19;
+        uint64_t j = 0;
+        if (reclen < 19)
+            break;
+        while (name[j] != '\0' && nm[j] == name[j])
+            j++;
+        if (name[j] == '\0' && nm[j] == '\0')
+            return *(const int64_t *)(db + off + 8);
+        off += reclen;
+    }
+    return -1;
+}
+static long dent_name_at(const char *db, long got, long idx,
+                         char *outnm)
+{
+    long off = 0, k = 0;
+    while (off + 19 <= got) {
+        uint16_t reclen = *(const uint16_t *)(db + off + 16);
+        if (reclen < 19)
+            break;
+        if (k == idx) {
+            uint64_t j = 0;
+            const char *nm = db + off + 19;
+            while (nm[j] != '\0' && j < 39) {
+                outnm[j] = nm[j];
+                j++;
+            }
+            outnm[j] = '\0';
+            return 0;
+        }
+        off += reclen;
+        k++;
+    }
+    return -1;
 }
 
 int main(int argc, char **argv)
@@ -531,6 +577,74 @@ int main(int argc, char **argv)
         report("creat-modes", u0 == 0022 && mm1 == 0640 &&
                u1 == 0027 && mm2 == 0600 && d1 == 0 &&
                mm3 == 0777 && d2 == 0 && mm4 == 0755);
+    }
+
+    /* --- M38: getdents cookies --- */
+    {
+        static char names[24][40];
+        char db2[2048], one[64], nm[40];
+        long totaln = 0, got, cookie = -1, ok = 1;
+        fd = sys_call3(SYS_open, (long)(uintptr_t)dir,
+                       0, 0);
+        got = fd >= 0 ? sys_call3(SYS_getdents64, fd,
+                                  (long)(uintptr_t)db2,
+                                  sizeof(db2))
+                      : -1;
+        while (totaln < 24 &&
+               dent_name_at(db2, got, totaln,
+                            names[totaln]) == 0)
+            totaln++;
+        /* locate f.txt and its cookie */
+        {
+            long i, fi = -1;
+            for (i = 0; i < totaln; i++) {
+                uint64_t j = 0;
+                while (names[i][j] == "f.txt"[j] &&
+                       names[i][j] != '\0')
+                    j++;
+                if (names[i][j] == '\0' && j == 5)
+                    fi = i;
+            }
+            ok = ok && fi >= 0 && fi + 1 < totaln;
+            cookie = dent_off(db2, got, "f.txt");
+            ok = ok && cookie > 0;
+            /* seek to the cookie: next read starts at
+             * the entry after f.txt */
+            ok = ok &&
+                 sys_call3(SYS_lseek, fd, cookie, 0) ==
+                     cookie;
+            got = sys_call3(SYS_getdents64, fd,
+                            (long)(uintptr_t)db2,
+                            sizeof(db2));
+            ok = ok && got > 0 &&
+                 dent_name_at(db2, got, 0, nm) == 0;
+            {
+                uint64_t j = 0;
+                const char *want = names[fi + 1];
+                while (nm[j] == want[j] && nm[j] != '\0')
+                    j++;
+                ok = ok && nm[j] == '\0' &&
+                     want[j] == '\0';
+            }
+            /* tiny buffer: EINVAL, not a fake EOF */
+            sys_call3(SYS_lseek, fd, 0, 0);
+            ok = ok && sys_call3(SYS_getdents64, fd,
+                                 (long)(uintptr_t)one,
+                                 16) == -22;
+            /* rewind still works afterwards */
+            got = sys_call3(SYS_getdents64, fd,
+                            (long)(uintptr_t)db2,
+                            sizeof(db2));
+            ok = ok && got > 0 &&
+                 dent_name_at(db2, got, 0, nm) == 0 &&
+                 nm[0] == names[0][0];
+            /* SEEK_END on a directory: EINVAL */
+            ok = ok && sys_call3(SYS_lseek, fd, 0, 2) ==
+                           -22;
+        }
+        if (fd >= 0)
+            sys_call1(SYS_close, fd);
+        report("seekdir", ok);
     }
 
     sys_call1(SYS_close, dfd);

@@ -569,9 +569,23 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   dirfdtest 加 creat-modes（umask 0027 下 0666
   →0640、umask 0 下 mkdir 0777 全保留、恢复
   0022 后 0755），ramfs/yfs 各一遍。
-- ⏳ 下一步候选：getdents64 的 d_off 语义细
-  化、硬链接（目录项重构）、/proc/<pid>/maps
-  示意、sendfile/splice 等零拷贝家族盘点。
+- ✅ getdents 语义收口 M38（2026-11-03）：
+  d_off 本就是「下一条目」cookie（三后端一
+  致、与目录 lseek 同一坐标系），本轮修三个
+  边界：①缓冲装不下一条记录时返回 EINVAL
+  而非 0——此前会被调用方误读成 EOF、静默
+  截断目录清单；②目录 SEEK_END 统一 EINVAL
+  （ramfs 版此前落在 size=0 上等于静默
+  rewind、yfs 版落在字节尺寸上无意义）；
+  ③getdents 作用于管道/控制台等非目录对象
+  改回 ENOTDIR（原 EBADF）。验收：dirfdtest
+  加 seekdir——全量清单、按 f.txt 的 cookie
+  seek 后从下一条续读、16 字节小缓冲 EINVAL
+  且位置不乱、SEEK_END 被拒，ramfs/yfs 各
+  一遍。
+- ⏳ 下一步候选：硬链接（目录项重构）、
+  /proc/<pid>/maps 示意、sendfile/splice
+  等零拷贝家族盘点。
 
 ## 从零构建
 

@@ -2071,10 +2071,12 @@ long file_seek(struct yousj_file *f, long off, long whence)
 {
     int64_t base, np;
     if (f != NULL && f->backend == 2) {
+        if (whence == 2 && proc_is_dir_id(f->proc_id))
+            return -YOUSJ_EINVAL; /* M38: no SEEK_END on dirs */
         switch (whence) {
         case 0: base = 0; break;
         case 1: base = (int64_t)f->offset; break;
-        case 2: base = proc_is_dir_id(f->proc_id) ? 0 : (int64_t)f->proc_len;
+        case 2: base = (int64_t)f->proc_len;
             break;
         default: return -YOUSJ_EINVAL;
         }
@@ -2085,6 +2087,8 @@ long file_seek(struct yousj_file *f, long off, long whence)
         return np;
     }
     if (f != NULL && f->backend == 1) {
+        if (whence == 2 && yfs_is_dir(f->yfs_ino))
+            return -YOUSJ_EINVAL; /* M38 */
         switch (whence) {
         case 0: base = 0; break;
         case 1: base = (int64_t)f->offset; break;
@@ -2100,9 +2104,12 @@ long file_seek(struct yousj_file *f, long off, long whence)
     if (f == NULL || f->node == NULL)
         return -YOUSJ_EBADF;
     /* Directories may seek too: the offset is the getdents
-     * entry index, and SEEK_SET 0 is the rewind. (SEEK_END on a
-     * directory uses a zero base -- nothing saner exists without
-     * a child count, and nothing uses it.) */
+     * entry index (== the d_off cookie space), and SEEK_SET 0
+     * is the rewind. SEEK_END on a directory is EINVAL since
+     * M38 -- it used to land on node->size, which is 0 for
+     * directories and silently rewound. */
+    if (f->node->is_dir && whence == 2)
+        return -YOUSJ_EINVAL;
     switch (whence) {
     case 0: base = 0; break;                    /* SEEK_SET */
     case 1: base = (int64_t)f->offset; break;   /* SEEK_CUR */
@@ -2137,6 +2144,8 @@ long file_getdents(struct yousj_file *f, uint8_t *buf, uint64_t count)
         uint64_t tids[YOUSJ_SCHED_MAX_TASKS];
         uint32_t ntids = 0;
         uint64_t total, i;
+        long blocked = 0; /* M38: an entry existed but
+                             did not fit an empty buffer */
         if (!proc_is_dir_id(f->proc_id))
             return -YOUSJ_ENOTDIR;
         if (f->proc_id == 0) {
@@ -2208,8 +2217,11 @@ long file_getdents(struct yousj_file *f, uint8_t *buf, uint64_t count)
             }
             namelen = str_len(nm);
             reclen = (19 + namelen + 1 + 7) & ~7ULL;
-            if (used + reclen > count)
+            if (used + reclen > count) {
+                if (used == 0)
+                    blocked = 1;
                 break;
+            }
             rec = buf + used;
             mem_zero(rec, reclen);
             *(uint64_t *)(rec + 0) = ino;
@@ -2220,10 +2232,13 @@ long file_getdents(struct yousj_file *f, uint8_t *buf, uint64_t count)
             used += reclen;
             f->offset = i + 1;
         }
+        if (used == 0 && blocked)
+            return -YOUSJ_EINVAL; /* M38: not EOF */
         return (long)used;
     }
     if (f != NULL && f->backend == 1) {
         uint32_t slot = (uint32_t)f->offset;
+        long blocked = 0; /* M38 */
         if (!yfs_is_dir(f->yfs_ino))
             return -YOUSJ_ENOTDIR;
         for (;;) {
@@ -2237,8 +2252,11 @@ long file_getdents(struct yousj_file *f, uint8_t *buf, uint64_t count)
                 break;
             namelen = str_len(nm);
             reclen = (19 + namelen + 1 + 7) & ~7ULL;
-            if (used + reclen > count)
+            if (used + reclen > count) {
+                if (used == 0)
+                    blocked = 1;
                 break;
+            }
             rec = buf + used;
             mem_zero(rec, reclen);
             *(uint64_t *)(rec + 0) = cino + 2;
@@ -2251,30 +2269,44 @@ long file_getdents(struct yousj_file *f, uint8_t *buf, uint64_t count)
             used += reclen;
             f->offset = slot;
         }
+        if (used == 0 && blocked)
+            return -YOUSJ_EINVAL; /* M38 */
         return (long)used;
     }
     if (f == NULL || f->node == NULL)
-        return -YOUSJ_EBADF;
+        return -YOUSJ_ENOTDIR; /* M38: valid fd, wrong kind
+                                   (pipes, console, files) */
     if (!f->node->is_dir)
         return -YOUSJ_ENOTDIR;
-    for (c = f->node->child_head; c != NULL; c = c->sibling, idx++) {
-        uint64_t namelen, reclen;
-        uint8_t *rec;
-        if (idx < f->offset)
-            continue;
-        namelen = str_len(c->name);
-        reclen = (19 + namelen + 1 + 7) & ~7ULL;
-        if (used + reclen > count)
-            break;
-        rec = buf + used;
-        mem_zero(rec, reclen);
-        *(uint64_t *)(rec + 0) = 1; /* ino: no stable ids yet */
-        *(uint64_t *)(rec + 8) = (uint64_t)(idx + 1);
-        *(uint16_t *)(rec + 16) = (uint16_t)reclen;
-        rec[18] = c->is_dir ? YOUSJ_DT_DIR : c->is_link ? 10 : YOUSJ_DT_REG;
-        mem_copy(rec + 19, (const uint8_t *)c->name, namelen);
-        used += reclen;
-        f->offset = idx + 1;
+    {
+        long blocked = 0; /* M38 */
+        for (c = f->node->child_head; c != NULL;
+             c = c->sibling, idx++) {
+            uint64_t namelen, reclen;
+            uint8_t *rec;
+            if (idx < f->offset)
+                continue;
+            namelen = str_len(c->name);
+            reclen = (19 + namelen + 1 + 7) & ~7ULL;
+            if (used + reclen > count) {
+                if (used == 0)
+                    blocked = 1;
+                break;
+            }
+            rec = buf + used;
+            mem_zero(rec, reclen);
+            *(uint64_t *)(rec + 0) = 1; /* ino: no stable ids yet */
+            *(uint64_t *)(rec + 8) = (uint64_t)(idx + 1);
+            *(uint16_t *)(rec + 16) = (uint16_t)reclen;
+            rec[18] = c->is_dir ? YOUSJ_DT_DIR : c->is_link ? 10
+                          : YOUSJ_DT_REG;
+            mem_copy(rec + 19, (const uint8_t *)c->name,
+                     namelen);
+            used += reclen;
+            f->offset = idx + 1;
+        }
+        if (used == 0 && blocked)
+            return -YOUSJ_EINVAL; /* M38 */
     }
     if (used > 0)
         f->node->atime = (uint32_t)yousj_now_unix(); /* M26 */
