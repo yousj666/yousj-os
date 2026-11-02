@@ -18,6 +18,7 @@
 #include <yousj/types.h>
 #include <yousj/syscall.h>
 #include <yousj/signal.h>
+#include <yousj/fpu.h>
 #include <yousj/sched.h>
 #include <yousj/user.h>
 #include <yousj/gdt.h>
@@ -56,9 +57,22 @@ static void wrmsr(uint32_t msr, uint64_t value);
  * CURRENT task's kernel stack, with one value from one place --
  * the task's kernel_stack_top -- per the design's update rule.
  * The FS base follows the incoming task (TLS for user tasks, 0
- * for kernel threads, whose structs are zero-initialised). */
-void arch_on_task_switch(struct task *next)
+ * for kernel threads, whose structs are zero-initialised).
+ *
+ * M8 FPU switching lives here too: the outgoing user task's
+ * x87/SSE state is saved to its fx_area and the incoming user
+ * task's restored. Kernel threads never touch the FPU, so a
+ * kernel interlude leaves the hardware state alone -- the
+ * owning user task's area was saved before any other user task
+ * could be restored over it. This hook runs on the outgoing
+ * task's context with the incoming address space loaded; both
+ * areas are kernel BSS, mapped in every space. */
+void arch_on_task_switch(struct task *prev, struct task *next)
 {
+    if (prev != NULL && prev != next && prev->mm != NULL)
+        fpu_save(prev->fx_area);
+    if (next != prev && next->mm != NULL)
+        fpu_restore(next->fx_area);
     tss_set_rsp0(next->kernel_stack_top);
     g_cpu_local.kernel_rsp = next->kernel_stack_top;
     g_cpu_local.current_task = (uint64_t)(uintptr_t)next;
@@ -417,6 +431,17 @@ static long sys_clone(struct yousj_syscall_ctx *ctx, long flags,
         child->resume_r14 = ctx->callee[4];
         child->resume_r15 = ctx->callee[5];
         child->has_resume = true;
+        /* FPU state is inherited across clone (M8): the child's
+         * area (pristine since creation) becomes a copy of the
+         * parent's LIVE state. The parent is the running task,
+         * so its live registers -- not its possibly stale saved
+         * area -- are the truth: save first, then copy. */
+        fpu_save(me->fx_area);
+        {
+            uint64_t i;
+            for (i = 0; i < YOUSJ_FX_SIZE; i++)
+                child->fx_area[i] = me->fx_area[i];
+        }
         signal_clone_inherit(child, me);
     }
     __asm__ volatile("push %0; popfq" : : "r"(flags_saved) : "memory");
@@ -444,6 +469,8 @@ extern const uint8_t _binary_sh_elf_start[];
 extern const uint8_t _binary_sh_elf_end[];
 extern const uint8_t _binary_sigtest_elf_start[];
 extern const uint8_t _binary_sigtest_elf_end[];
+extern const uint8_t _binary_fxtest_elf_start[];
+extern const uint8_t _binary_fxtest_elf_end[];
 
 struct exec_image {
     const char   *path;
@@ -456,6 +483,7 @@ static const struct exec_image g_exec_images[] = {
     { "/bin/hello", _binary_hello_elf_start,      _binary_hello_elf_end },
     { "/bin/sh",    _binary_sh_elf_start,         _binary_sh_elf_end },
     { "/bin/sigtest", _binary_sigtest_elf_start,  _binary_sigtest_elf_end },
+    { "/bin/fxtest", _binary_fxtest_elf_start,    _binary_fxtest_elf_end },
 };
 
 static int kstreq(const char *a, const char *b)
@@ -577,6 +605,8 @@ static long sys_execve(uint64_t path_ptr, uint64_t argv_ptr,
     me->mm = space;
     me->mm_owned = true;
     signal_exec_reset(me);
+    fpu_init_area(me->fx_area); /* FPU state resets on exec (M8) */
+    fpu_restore(me->fx_area);   /* the new image starts pristine */
     me->brk_start = heap_base;
     me->brk_end = heap_base;
     me->mmap_next = YOUSJ_MMAP_BASE;

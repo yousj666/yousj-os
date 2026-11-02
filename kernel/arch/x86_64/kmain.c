@@ -12,6 +12,7 @@
 #include <yousj/sched.h>
 #include <yousj/interrupts.h>
 #include <yousj/gdt.h>
+#include <yousj/fpu.h>
 #include <yousj/user.h>
 #include <yousj/elf.h>
 #include <drivers/serial.h> /* kernel/drivers/serial.h; -I kernel in Makefile */
@@ -329,6 +330,12 @@ void kmain(struct yousj_boot_info *boot_info)
      * yet). */
     gdt_init();
     interrupts_init();
+
+    /* M8: enable x87/SSE and capture the pristine per-task FPU
+     * image. Must precede the first task creation: sched.c seeds
+     * every new task's fx_area from this image. */
+    fpu_init_cpu();
+    serial_puts("Yousj OS: FPU init PASS (SSE on, per-task FXSAVE state)\n");
 
     if (boot_info == NULL) {
         serial_puts("Yousj OS: no boot_info, halting\n");

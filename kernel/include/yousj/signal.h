@@ -19,6 +19,7 @@
 #define YOUSJ_SIGNAL_H
 
 #include <yousj/types.h>
+#include <yousj/fpu.h> /* YOUSJ_FX_SIZE (M8) */
 
 /* Signal numbers (Linux x86-64). */
 #define YOUSJ_SIGHUP  1
@@ -99,7 +100,8 @@ struct yousj_sigcontext {
     uint16_t cs, gs, fs, ss;
     uint32_t reserved_seg;
     uint64_t err, trapno, oldmask, cr2;
-    uint64_t fpstate; /* always 0: no FPU state in frames yet */
+    uint64_t fpstate;         /* user VA of the FXSAVE image in
+                                 the rt_sigframe (M8); 0 = none */
     uint64_t reserved1[8];
 };
 
@@ -146,6 +148,11 @@ struct yousj_rt_sigframe {
     struct yousj_ucontext uc;
     struct yousj_siginfo info;
     uint64_t restart_nr;
+    /* M8: the task's x87/SSE state at delivery time. The
+     * handler inherits the live state; rt_sigreturn restores
+     * THIS image, so a handler may clobber FP registers freely
+     * (and could even edit them, debugger-style). */
+    _Alignas(16) uint8_t fx_save[YOUSJ_FX_SIZE];
 };
 
 /* The syscall context the entry shim (syscall_entry.S) hands to

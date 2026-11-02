@@ -21,6 +21,7 @@
 
 #include <yousj/types.h>
 #include <yousj/signal.h> /* per-task signal state (M7) */
+#include <yousj/fpu.h>    /* per-task FXSAVE area size (M8) */
 
 struct vmm_space; /* from <yousj/vmm.h>; tasks only hold the pointer */
 
@@ -129,6 +130,12 @@ struct task {
                                      the interrupted syscall can
                                      tell a signal wake from a
                                      normal completion */
+    /* M8: this task's x87/SSE state (FXSAVE image). Pristine
+     * at creation (fpu_init_area via a weak hook in sched.c),
+     * inherited across clone, reset across execve, saved and
+     * restored eagerly by arch_on_task_switch() -- but only
+     * for user tasks; the kernel never touches the FPU. */
+    _Alignas(16) uint8_t fx_area[YOUSJ_FX_SIZE];
     bool            in_use;
 };
 

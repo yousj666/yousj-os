@@ -95,6 +95,7 @@ missing=0
 # Required lines, taken from kernel/arch/x86_64/kmain.c serial output.
 for pat in \
     "Yousj OS: kmain reached" \
+    "Yousj OS: FPU init PASS" \
     "Yousj OS: PMM self-test PASS" \
     "Yousj OS: VMM self-test PASS" \
     "Yousj OS: VMM hw-init PASS" \

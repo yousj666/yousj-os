@@ -108,7 +108,21 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   阻塞在 syscall 里的任务时，其出口路径会踩到被遗落的用户
   GS 基址而 #PF，现 irq0_stub 对 Ring 3 帧进出各 swapgs
   一次，GS 纪律与调度顺序彻底解耦。
-- ⏳ 下一步：FPU/SSE 状态、文件系统（execve 映像表退役）。
+- ✅ 调度 M8（2026-11-02）：FPU/SSE 状态落地——启动时开启
+  CR4.OSFXSR/OSXMMEXCPT 并由 CPU 自身状态捕获 pristine 镜像
+  （x87 复位态＋MXCSR 0x1F80，异常全屏蔽）；每任务内嵌 512B
+  FXSAVE 区，创建即 pristine（调度层弱钩子播种，杜绝首调
+  度装入全零镜像）、clone 继承父进程实时状态、execve 重置；
+  任务切换在 arch_on_task_switch 里对用户任务急切 save/
+  restore（内核自身 -mno-sse 从不碰 FPU，内核线程不参与）。
+  信号帧带真 fpstate：投递时 fxsave 入帧，sigreturn 时
+  fxrstor 恢复——处理函数可以任意踩 FP 寄存器。用户态自
+  此可自由使用 SSE（fxtest 专门以启用 SSE 的构建验证）。
+  验收：`tools/qemu-fx-test.py` 驱动 /bin/fxtest 五场景全
+  PASS（基础双精度位精确、双进程 xmm 跨切换隔离、MXCSR
+  屏蔽下除零得 +inf 不触发 #XM、信号帧 fpstate 真实性与
+  sigreturn 恢复、exec 重置），PMM 对账归零。
+- ⏳ 下一步：文件系统（execve 映像表退役）。
 
 ## 从零构建
 

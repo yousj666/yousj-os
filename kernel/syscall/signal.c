@@ -26,6 +26,7 @@
 #include <yousj/signal.h>
 #include <yousj/sched.h>
 #include <yousj/user.h>
+#include <yousj/fpu.h>
 #include <stddef.h> /* offsetof */
 
 #define YOUSJ_EINTR  4
@@ -240,6 +241,11 @@ static int build_frame(struct task *me, int sig,
     mc->rip = snap->rip; mc->eflags = snap->eflags;
     mc->cs = 0x23; /* canonical user selectors (GDT final layout) */
     mc->ss = 0x1B;
+    /* M8: snapshot the live FP state into the frame and point
+     * the sigcontext at it. The gate runs in the target task's
+     * own context, so the live registers ARE its state. */
+    fpu_save(fr->fx_save);
+    mc->fpstate = f + offsetof(struct yousj_rt_sigframe, fx_save);
     fr->info.si_signo = sig;
     fr->info.si_code = -1; /* SI_USER */
     fr->info.si_pid = me->sig_sender[sig];
@@ -585,6 +591,22 @@ long sys_rt_sigreturn(struct yousj_syscall_ctx *ctx)
     ctx->callee[3] = mc->r13;
     ctx->callee[4] = mc->r14;
     ctx->callee[5] = mc->r15;
+
+    /* M8: restore the FP state captured at delivery, if the
+     * frame carries one. The restored state becomes the live
+     * state; the next switch-out saves it into the task's area
+     * as usual, and a nested gate would snapshot it afresh, so
+     * no extra bookkeeping is needed here. */
+    if (mc->fpstate != 0) {
+        static _Alignas(16) uint8_t fxbuf[YOUSJ_FX_SIZE];
+        const uint8_t *src = (const uint8_t *)(uintptr_t)mc->fpstate;
+        uint64_t i;
+        if (!yousj_user_range_ok(mc->fpstate, YOUSJ_FX_SIZE))
+            return -YOUSJ_EFAULT;
+        for (i = 0; i < YOUSJ_FX_SIZE; i++)
+            fxbuf[i] = src[i];
+        fpu_restore(fxbuf);
+    }
 
     if (fr->uc.uc_flags & YOUSJ_UC_RESTART) {
         /* Re-execute the interrupted syscall: RIP back onto the

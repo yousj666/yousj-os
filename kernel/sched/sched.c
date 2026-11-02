@@ -23,8 +23,12 @@
  * and in docs/SYSCALL_DESIGN.md sec. 3.3. */
 #pragma weak vmm_kernel_master
 #pragma weak vmm_load_cr3
-void arch_on_task_switch(struct task *next);
+void arch_on_task_switch(struct task *prev, struct task *next);
 #pragma weak arch_on_task_switch
+/* M8: pristine FPU image for new tasks; weak for the host test,
+ * which links sched.c without the FPU layer. */
+void fpu_init_area(uint8_t *area);
+#pragma weak fpu_init_area
 
 static struct vmm_space *g_current_space;
 
@@ -144,6 +148,13 @@ struct task *kthread_create(const char *name, void (*entry)(void *arg),
     t->entry = entry;
     t->arg = arg;
     t->mm = NULL;
+    /* Every task starts life with the pristine FPU image (M8);
+     * clone overwrites it with the parent's state, execve
+     * resets it. Doing it here, at creation, means the eager
+     * fxrstor on the task's first schedule-in can never load an
+     * uninitialised (all-zero, exceptions-unmasked) image. */
+    if (fpu_init_area != NULL)
+        fpu_init_area(t->fx_area);
 
     /* Fabricate the first-run stack frame (design sec. 5.4), in the
      * exact layout context_switch() will pop on its first switch to
@@ -286,9 +297,11 @@ void sched_schedule(void)
         }
     }
     /* TSS.rsp0 + syscall kernel_rsp track the incoming task's
-     * kernel stack (single update point, SYSCALL_DESIGN 3.3). */
+     * kernel stack (single update point, SYSCALL_DESIGN 3.3).
+     * The hook also moves the FPU state (M8) and so needs the
+     * outgoing task as well. */
     if (arch_on_task_switch != NULL)
-        arch_on_task_switch(next);
+        arch_on_task_switch(prev, next);
 
     context_switch(prev, next);
     /* When prev runs again, it resumes here. */
