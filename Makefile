@@ -131,7 +131,7 @@ $(BUILD)/ata.o: kernel/drivers/ata.c kernel/include/yousj/*.h
 	mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(BUILD)/initramfs.cpio: $(BUILD)/yousj-init.elf $(BUILD)/hello.elf $(BUILD)/sh.elf $(BUILD)/sigtest.elf $(BUILD)/fxtest.elf $(BUILD)/fstest.elf $(BUILD)/cat.elf $(BUILD)/pipetest.elf $(BUILD)/mkdir.elf $(BUILD)/ls.elf $(BUILD)/rm.elf $(BUILD)/rmdir.elf $(BUILD)/mv.elf $(BUILD)/bigfile.elf $(BUILD)/mmtest.elf $(BUILD)/polltest.elf $(BUILD)/ln.elf $(BUILD)/readlink.elf $(BUILD)/epolltest.elf $(BUILD)/churn.elf $(BUILD)/stattest.elf $(BUILD)/brktest.elf $(BUILD)/timetest.elf $(BUILD)/faulttest.elf $(BUILD)/proctest.elf $(BUILD)/utimetest.elf $(BUILD)/orphantest.elf $(BUILD)/pidtest.elf tools/mkinitramfs.py $(wildcard rootfs/etc/*)
+$(BUILD)/initramfs.cpio: $(BUILD)/yousj-init.elf $(BUILD)/hello.elf $(BUILD)/sh.elf $(BUILD)/sigtest.elf $(BUILD)/fxtest.elf $(BUILD)/fstest.elf $(BUILD)/cat.elf $(BUILD)/pipetest.elf $(BUILD)/mkdir.elf $(BUILD)/ls.elf $(BUILD)/rm.elf $(BUILD)/rmdir.elf $(BUILD)/mv.elf $(BUILD)/bigfile.elf $(BUILD)/mmtest.elf $(BUILD)/polltest.elf $(BUILD)/ln.elf $(BUILD)/readlink.elf $(BUILD)/epolltest.elf $(BUILD)/churn.elf $(BUILD)/stattest.elf $(BUILD)/brktest.elf $(BUILD)/timetest.elf $(BUILD)/faulttest.elf $(BUILD)/proctest.elf $(BUILD)/utimetest.elf $(BUILD)/orphantest.elf $(BUILD)/pidtest.elf $(BUILD)/dirfdtest.elf tools/mkinitramfs.py $(wildcard rootfs/etc/*)
 	python3 tools/mkinitramfs.py $(BUILD)
 
 $(BUILD)/initramfs_bin.o: $(BUILD)/initramfs.cpio
@@ -220,6 +220,10 @@ $(BUILD)/proctest.elf: userland/proctest.c userland/crt0.S userland/init.ld
 $(BUILD)/utimetest.elf: userland/utimetest.c userland/crt0.S userland/init.ld
 	mkdir -p $(BUILD)
 	gcc -ffreestanding -fno-stack-protector -fno-pie -static -nostdlib -mno-sse -mno-sse2 -mno-mmx -mcmodel=large -O2 -Wall -Wextra -Wl,-T,userland/init.ld -Wl,--build-id=none -o $@ userland/crt0.S userland/utimetest.c
+
+$(BUILD)/dirfdtest.elf: userland/dirfdtest.c userland/crt0.S userland/init.ld
+	mkdir -p $(BUILD)
+	gcc -ffreestanding -fno-stack-protector -fno-pie -static -nostdlib -mno-sse -mno-sse2 -mno-mmx -mcmodel=large -O2 -Wall -Wextra -Wl,-T,userland/init.ld -Wl,--build-id=none -o $@ userland/crt0.S userland/dirfdtest.c
 
 $(BUILD)/pidtest.elf: userland/pidtest.c userland/crt0.S userland/init.ld
 	mkdir -p $(BUILD)

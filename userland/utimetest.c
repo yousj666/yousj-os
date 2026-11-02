@@ -261,10 +261,12 @@ int main(int argc, char **argv)
         long e5 = sys_call2(SYS_futimens, 999,
                             (long)(uintptr_t)NULL);
         long e6 = utimens("/proc/version", NULL, 0); /* ro fs */
-        long e7 = sys_call4(SYS_utimensat, 5,
-                            (long)(uintptr_t)"rel", 0, 0); /* dirfd */
+        /* M30: dirfd is real now; a bogus fd is EBADF,
+         * not the ENOSYS of the pre-dirfd era */
+        long e7 = sys_call4(SYS_utimensat, 9999,
+                            (long)(uintptr_t)"rel", 0, 0);
         report("errors", e1 == -2 && e2 == -22 && e3 == -22 &&
-               e4 == -22 && e5 == -9 && e6 == -13 && e7 == -38);
+               e4 == -22 && e5 == -9 && e6 == -13 && e7 == -9);
     }
 
     /* 9: AT_EMPTY_PATH acts on the dirfd itself */

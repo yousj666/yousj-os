@@ -155,6 +155,13 @@ check('p2 utimetest on yfs (v4 mode, no FAIL)',
       ok and 'utimetest: set-explicit PASS' in seg and
       'utimetest: errors PASS' in seg and
       'FAIL' not in seg)
+sess.buf = b''
+ok = sess.run_expect('dirfdtest /data', 'DIRFDTEST DONE', 60)
+seg = sess.buf.decode(errors='replace')
+check('p2 dirfdtest on yfs (all ten, no FAIL)',
+      ok and 'dirfdtest: openat-rel PASS' in seg and
+      'dirfdtest: symlinkat-rel PASS' in seg and
+      'FAIL' not in seg)
 qemu.kill()  # power cut again
 qemu.wait()
 s.close()

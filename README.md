@@ -480,8 +480,20 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   断言也改为一秒容差（独立戳下跨秒边界本就合
   法）。disk 五段（含 v4 模式 utimetest 九场景）
   全绿，其余二十链不回归。
-- ⏳ 下一步候选：相对 dirfd 支持、/proc/self 与
-  cmdline 等更多生成项、sigaltstack。
+- ✅ 相对 dirfd M30（2026-11-03）：openat /
+  newfstatat / utimensat / unlinkat / symlinkat
+  的 dirfd 全部生效（此前分别回 EBADF/ENOSYS）。
+  做法：打开文件时把其绝对路径记进 file 对象，
+  dirfd 解析以该路径为基准拼接——三后端统一受
+  益；绝对路径忽略 dirfd、坏 fd EBADF、非目录
+  ENOTDIR 与 Linux 一致。明示的偏离：目录在打开
+  后被改名时按名字而非 inode 解析（fs 层是路径
+  制的）。utimens 的旧 ENOSYS 期望改 EBADF。验
+  收：新套件 dirfdtest 十场景 ramfs 两轮＋disk
+  p2 在 yfs 上同跑；其余二十一链不回归。
+- ⏳ 下一步候选：/proc/self 与 cmdline 等更多生
+  成项、sigaltstack、renameat 与 faccessat 等其
+  余 *at 补齐。
 
 ## 从零构建
 

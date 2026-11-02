@@ -790,6 +790,49 @@ static void resolve_path(struct task *t, const char *path, char *out)
     out[i] = '\0';
 }
 
+/* M30: resolve a possibly dirfd-relative path to an
+ * absolute path in out[256]. Absolute paths pass through
+ * (the dirfd is ignored, as on Linux); AT_FDCWD means the
+ * caller's cwd; any other dirfd must name an open
+ * directory, whose recorded open path becomes the base.
+ * The base is the path the directory was OPENED by: if
+ * the directory is renamed afterwards, resolution follows
+ * the name, not the inode -- a documented divergence from
+ * Linux at this stage (the fs layer is path-based). */
+static long resolve_at(struct task *me, long dirfd,
+                       const char *path, char *out)
+{
+    uint64_t i = 0, j;
+    struct yousj_file *f;
+    const char *base;
+    if (path[0] == '/') {
+        for (j = 0; path[j] != '\0' && i < 255; j++)
+            out[i++] = path[j];
+        out[i] = '\0';
+        return 0;
+    }
+    if (dirfd == YOUSJ_AT_FDCWD) {
+        resolve_path(me, path, out);
+        return 0;
+    }
+    f = fd_file_of(me, dirfd);
+    if (f == NULL)
+        return -YOUSJ_EBADF;
+    if (!fs_file_is_dir(f))
+        return -YOUSJ_ENOTDIR;
+    base = f->open_path;
+    if (base[0] == '\0')
+        return -YOUSJ_ENOTDIR; /* not opened by path */
+    for (j = 0; base[j] != '\0' && i < 255; j++)
+        out[i++] = base[j];
+    if (i == 0 || out[i - 1] != '/')
+        out[i++] = '/';
+    for (j = 0; path[j] != '\0' && i < 255; j++)
+        out[i++] = path[j];
+    out[i] = '\0';
+    return 0;
+}
+
 static long sys_read_console(uint64_t buf, uint64_t count)
 {
     uint64_t got = 0;
@@ -873,14 +916,22 @@ static long sys_openat(long dirfd, uint64_t path_ptr, long flags)
     struct yousj_file *f;
     long rc, fd;
 
-    if (dirfd != YOUSJ_AT_FDCWD)
-        return -YOUSJ_EBADF; /* no dirfd-relative opens yet */
     if (copy_user_string(path_ptr, path_buf, sizeof(path_buf)) != 0)
         return -YOUSJ_EFAULT;
-    resolve_path(me, path_buf, resolved);
+    rc = resolve_at(me, dirfd, path_buf, resolved);
+    if (rc != 0)
+        return rc;
     rc = fs_open_path(resolved, flags, &f);
     if (rc != 0)
         return rc;
+    /* M30: remember the path for dirfd-relative calls
+     * against this object (directories especially). */
+    {
+        uint64_t i;
+        for (i = 0; resolved[i] != '\0' && i < 255; i++)
+            f->open_path[i] = resolved[i];
+        f->open_path[i] = '\0';
+    }
     fd = fd_alloc(me, f);
     if (fd < 0)
         file_put(f);
@@ -1034,22 +1085,28 @@ static long fill_stat(uint64_t stat_ptr,
     return 0;
 }
 
+static long stat_abs_path(const char *abs, uint64_t stat_ptr,
+                          bool follow)
+{
+    struct yousj_stat_info info;
+    if (!fs_path_stat2(abs, follow, &info))
+        return -YOUSJ_ENOENT;
+    return fill_stat(stat_ptr, &info);
+}
+
 static long sys_stat_path(uint64_t path_ptr, uint64_t stat_ptr,
                           bool follow)
 {
     struct task *me = sched_current();
     char path_buf[256];
     static char resolved[256];
-    struct yousj_stat_info info;
     if (copy_user_string(path_ptr, path_buf,
                          sizeof(path_buf)) != 0)
         return -YOUSJ_EFAULT;
     if (path_buf[0] == '\0')
         return -YOUSJ_ENOENT;
     resolve_path(me, path_buf, resolved);
-    if (!fs_path_stat2(resolved, follow, &info))
-        return -YOUSJ_ENOENT;
-    return fill_stat(stat_ptr, &info);
+    return stat_abs_path(resolved, stat_ptr, follow);
 }
 
 static long sys_fstat(long fd, uint64_t stat_ptr)
@@ -1092,8 +1149,21 @@ static long sys_newfstatat(long dirfd, uint64_t path_ptr,
             return -YOUSJ_ENOENT;
         return sys_fstat(dirfd, stat_ptr);
     }
-    if (dirfd != AT_FDCWD_K)
-        return -YOUSJ_ENOSYS; /* no per-directory base yet */
+    if (dirfd != AT_FDCWD_K) {
+        /* M30: a real dirfd base */
+        struct task *me = sched_current();
+        char path_buf[256];
+        static char resolved[256];
+        long rc;
+        if (copy_user_string(path_ptr, path_buf,
+                             sizeof(path_buf)) != 0)
+            return -YOUSJ_EFAULT;
+        rc = resolve_at(me, dirfd, path_buf, resolved);
+        if (rc != 0)
+            return rc;
+        return stat_abs_path(resolved, stat_ptr,
+                             !(flags & AT_SYMLINK_NOFOLLOW_K));
+    }
     return sys_stat_path(path_ptr, stat_ptr,
                          !(flags & AT_SYMLINK_NOFOLLOW_K));
 }
@@ -1183,15 +1253,20 @@ static long sys_utimensat(long dirfd, uint64_t path_ptr,
             return -YOUSJ_ENOENT;
         return sys_futimens(dirfd, times_ptr);
     }
-    if (dirfd != AT_FDCWD_K)
-        return -YOUSJ_ENOSYS; /* no per-directory base yet */
     rc = utime_ops_decode(times_ptr, &aop, &mop);
     if (rc != 0)
         return rc;
     if (copy_user_string(path_ptr, path_buf,
                          sizeof(path_buf)) != 0)
         return -YOUSJ_EFAULT;
-    resolve_path(me, path_buf, resolved);
+    if (dirfd == AT_FDCWD_K) {
+        resolve_path(me, path_buf, resolved);
+    } else {
+        /* M30: a real dirfd base */
+        rc = resolve_at(me, dirfd, path_buf, resolved);
+        if (rc != 0)
+            return rc;
+    }
     return fs_utimens_path(resolved,
                            !(flags & AT_SYMLINK_NOFOLLOW_K),
                            &aop, &mop);
@@ -1317,9 +1392,23 @@ static long sys_symlink(uint64_t target_ptr, uint64_t link_ptr)
 static long sys_symlinkat(uint64_t target_ptr, long dirfd,
                           uint64_t link_ptr)
 {
-    if (dirfd != YOUSJ_AT_FDCWD)
-        return -YOUSJ_EBADF;
-    return sys_symlink(target_ptr, link_ptr);
+    char target[264], linkpath[264], resolved[264];
+    struct task *me = sched_current();
+    long n;
+    if (dirfd == YOUSJ_AT_FDCWD)
+        return sys_symlink(target_ptr, link_ptr);
+    /* M30: the dirfd bases the LINK path; the target is
+     * stored verbatim, as always. */
+    n = copy_user_string(target_ptr, target, sizeof target);
+    if (n != 0)
+        return n;
+    n = copy_user_string(link_ptr, linkpath, sizeof linkpath);
+    if (n != 0)
+        return n;
+    n = resolve_at(me, dirfd, linkpath, resolved);
+    if (n != 0)
+        return n;
+    return fs_symlink_path(target, resolved);
 }
 
 static long sys_readlink(uint64_t path_ptr, uint64_t buf_ptr,
@@ -1667,6 +1756,23 @@ static long sys_unlink_sys(uint64_t path_ptr)
     if (copy_user_string(path_ptr, path_buf, sizeof(path_buf)) != 0)
         return -YOUSJ_EFAULT;
     resolve_path(me, path_buf, resolved);
+    return fs_unlink_path(resolved);
+}
+
+/* M30: unlinkat with a real dirfd (flags keep the historic
+ * behaviour of being ignored: no AT_REMOVEDIR yet). */
+static long sys_unlinkat(long dirfd, uint64_t path_ptr)
+{
+    struct task *me = sched_current();
+    static char path_buf[256];
+    static char resolved[256];
+    long rc;
+
+    if (copy_user_string(path_ptr, path_buf, sizeof(path_buf)) != 0)
+        return -YOUSJ_EFAULT;
+    rc = resolve_at(me, dirfd, path_buf, resolved);
+    if (rc != 0)
+        return rc;
     return fs_unlink_path(resolved);
 }
 
@@ -2557,9 +2663,7 @@ static long dispatch_inner(struct yousj_syscall_ctx *ctx)
     case YOUSJ_SYS_symlinkat:
         return sys_symlinkat(a1, (long)a2, a3);
     case YOUSJ_SYS_unlinkat:
-        return (long)a1 == YOUSJ_AT_FDCWD
-                   ? sys_unlink_sys(a2)
-                   : -YOUSJ_EBADF; /* real dirfds unsupported */
+        return sys_unlinkat((long)a1, a2);
     case YOUSJ_SYS_rmdir:
         return sys_rmdir_sys(a1);
     case YOUSJ_SYS_rename:

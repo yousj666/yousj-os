@@ -70,6 +70,11 @@ struct yousj_file {
     uint32_t proc_len;             /* backend 2: snapshot size */
     char proc_buf[288];            /* backend 2: content snapshot
                                       taken at open (M25) */
+    char open_path[256];           /* M30: the absolute path
+                                      this object was opened
+                                      by ("" when not opened
+                                      by path); the base for
+                                      dirfd-relative calls */
     uint64_t offset;               /* shared across fork (the
                                       object is shared, not the
                                       fd number); unused for pipes */
