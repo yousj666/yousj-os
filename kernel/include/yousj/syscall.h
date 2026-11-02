@@ -44,9 +44,13 @@
 #define YOUSJ_SYS_uname        63
 #define YOUSJ_SYS_getcwd      79
 #define YOUSJ_SYS_chdir        80
+#define YOUSJ_SYS_rename       82   /* M13 */
 #define YOUSJ_SYS_mkdir        83
+#define YOUSJ_SYS_rmdir        84   /* M13 */
+#define YOUSJ_SYS_unlink       87   /* M13 */
 #define YOUSJ_SYS_getdents64  217
 #define YOUSJ_SYS_openat      257  /* M9 */
+#define YOUSJ_SYS_unlinkat    263  /* M13 */
 #define YOUSJ_SYS_dup3        292  /* M10 */
 #define YOUSJ_SYS_pipe2       293  /* M10 */
 #define YOUSJ_SYS_arch_prctl  158

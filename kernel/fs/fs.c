@@ -23,6 +23,8 @@
 #define YOUSJ_ENOMEM_L 12
 #define YOUSJ_ENFILE  23
 #define YOUSJ_ENAMETOOLONG_L 36
+#define YOUSJ_EXDEV_L 18
+#define YOUSJ_ENOTEMPTY_L 39
 
 static uint64_t str_len(const char *s); /* defined below */
 
@@ -80,6 +82,10 @@ struct yousj_ramfs_node {
     struct yousj_ramfs_node *sibling;
     uint32_t size;                      /* regular files */
     uint32_t pages[MAX_FILE_PAGES];     /* phys frames, 0 = hole */
+    uint16_t open_refs;                 /* M13: live file objects */
+    bool unlinked;                      /* M13: name removed; the
+                                           storage dies with the
+                                           last close */
 };
 
 static struct yousj_ramfs_node g_nodes[MAX_NODES];
@@ -320,6 +326,39 @@ static void node_truncate(struct yousj_ramfs_node *n)
     n->size = 0;
 }
 
+/* --- M13: detach / deferred free -------------------------------- */
+
+static void node_detach(struct yousj_ramfs_node *n)
+{
+    struct yousj_ramfs_node *p = n->parent;
+    struct yousj_ramfs_node **link;
+
+    if (p == NULL)
+        return;
+    link = &p->child_head;
+    while (*link != NULL && *link != n)
+        link = &(*link)->sibling;
+    if (*link == n) {
+        *link = n->sibling;
+        n->sibling = NULL;
+    }
+}
+
+static void node_maybe_free(struct yousj_ramfs_node *n)
+{
+    if (n->unlinked && n->open_refs == 0) {
+        node_truncate(n);
+        n->in_use = false;
+    }
+}
+
+static void node_ref_dec(struct yousj_ramfs_node *n)
+{
+    if (n->open_refs > 0)
+        n->open_refs--;
+    node_maybe_free(n);
+}
+
 long fs_node_read_all(struct yousj_ramfs_node *n, uint8_t *dst,
                       uint64_t cap)
 {
@@ -376,6 +415,12 @@ void file_put(struct yousj_file *f)
                 p->in_use = false;
             f->pipe = NULL;
         }
+        if (f->node != NULL) {
+            node_ref_dec(f->node);
+            f->node = NULL;
+        }
+        if (f->backend == 1)
+            yfs_note_close(f->yfs_ino);
         f->in_use = false;
     }
 }
@@ -455,6 +500,7 @@ static long ramfs_open_path(const char *path, long flags,
     if (f == NULL)
         return -YOUSJ_ENFILE;
     f->node = n;
+    n->open_refs++;
     f->flags = flags;
     f->offset = 0;
     *out = f;
@@ -464,10 +510,11 @@ static long ramfs_open_path(const char *path, long flags,
 static long yfs_open_path_fs(const char *rel, long flags,
                              struct yousj_file **out)
 {
-    long ino = yfs_lookup(rel);
+    long ino;
     long acc = flags & YOUSJ_O_ACCMODE;
     struct yousj_file *f;
     bool is_dir;
+    ino = yfs_lookup(rel);
 
     if (ino < 0) {
         if (ino != -YOUSJ_ENOENT || !(flags & YOUSJ_O_CREAT))
@@ -497,6 +544,7 @@ static long yfs_open_path_fs(const char *rel, long flags,
         return -YOUSJ_ENFILE;
     f->backend = 1;
     f->yfs_ino = (uint32_t)ino;
+    yfs_note_open((uint32_t)ino);
     f->flags = flags;
     f->offset = 0;
     *out = f;
@@ -521,6 +569,120 @@ long fs_mkdir_path(const char *path)
         return ino >= 0 ? 0 : ino;
     }
     return ramfs_mkdir_path(path);
+}
+
+long fs_unlink_path(const char *path)
+{
+    if (is_data_path(path)) {
+        char parent[128], name[40];
+        split_parent_name(data_rel(path), parent, name);
+        return yfs_unlink(parent, name, false);
+    }
+    {
+        char base[NAME_MAX_LEN + 1];
+        struct yousj_ramfs_node *parent = walk(path, true, base);
+        struct yousj_ramfs_node *child;
+        if (parent == NULL)
+            return -YOUSJ_ENOENT;
+        child = node_find_child(parent, base, str_len(base));
+        if (child == NULL)
+            return -YOUSJ_ENOENT;
+        if (child->is_dir)
+            return -YOUSJ_EISDIR;
+        node_detach(child);
+        child->unlinked = true;
+        node_maybe_free(child);
+        return 0;
+    }
+}
+
+long fs_rmdir_path(const char *path)
+{
+    if (is_data_path(path)) {
+        char parent[128], name[40];
+        split_parent_name(data_rel(path), parent, name);
+        return yfs_unlink(parent, name, true);
+    }
+    {
+        char base[NAME_MAX_LEN + 1];
+        struct yousj_ramfs_node *parent = walk(path, true, base);
+        struct yousj_ramfs_node *child;
+        if (parent == NULL)
+            return -YOUSJ_ENOENT;
+        child = node_find_child(parent, base, str_len(base));
+        if (child == NULL)
+            return -YOUSJ_ENOENT;
+        if (!child->is_dir)
+            return -YOUSJ_ENOTDIR;
+        if (child == g_root)
+            return -YOUSJ_EINVAL;
+        if (child->child_head != NULL)
+            return -YOUSJ_ENOTEMPTY_L;
+        node_detach(child);
+        child->unlinked = true;
+        node_maybe_free(child);
+        return 0;
+    }
+}
+
+long fs_rename_path(const char *old_path, const char *new_path)
+{
+    bool od = is_data_path(old_path), nd = is_data_path(new_path);
+    char obase[NAME_MAX_LEN + 1], nbase[NAME_MAX_LEN + 1];
+    struct yousj_ramfs_node *oparent, *nparent, *src, *dst, *a;
+    uint64_t nlen;
+
+    if (od != nd)
+        return -YOUSJ_EXDEV_L;
+    if (od)
+        return yfs_rename(data_rel(old_path), data_rel(new_path));
+    oparent = walk(old_path, true, obase);
+    if (oparent == NULL)
+        return -YOUSJ_ENOENT;
+    src = node_find_child(oparent, obase, str_len(obase));
+    if (src == NULL)
+        return -YOUSJ_ENOENT;
+    if (src == g_root)
+        return -YOUSJ_EINVAL;
+    nlen = str_len(new_path);
+    (void)nlen;
+    nparent = walk(new_path, true, nbase);
+    if (nparent == NULL)
+        return -YOUSJ_ENOENT;
+    if (str_len(nbase) > NAME_MAX_LEN)
+        return -YOUSJ_ENAMETOOLONG_L;
+    if (src->is_dir) {
+        /* the new parent may not be src or inside src */
+        for (a = nparent; a != NULL; a = a->parent) {
+            if (a == src)
+                return -YOUSJ_EINVAL;
+            if (a->parent == a)
+                break;
+        }
+    }
+    dst = node_find_child(nparent, nbase, str_len(nbase));
+    if (dst == src)
+        return 0;
+    if (dst != NULL) {
+        if (dst->is_dir) {
+            if (!src->is_dir)
+                return -YOUSJ_EISDIR;
+            if (dst->child_head != NULL)
+                return -YOUSJ_ENOTEMPTY_L;
+        } else if (src->is_dir) {
+            return -YOUSJ_ENOTDIR;
+        }
+        node_detach(dst);
+        dst->unlinked = true;
+        node_maybe_free(dst);
+    }
+    node_detach(src);
+    mem_copy((uint8_t *)src->name, (const uint8_t *)nbase,
+             str_len(nbase) + 1);
+    src->parent = nparent;
+    src->sibling = nparent->child_head;
+    nparent->child_head = src;
+    return 0;
 }
 
 long fs_read_all_path(const char *path, uint8_t *dst, uint64_t cap)

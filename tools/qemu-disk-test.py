@@ -120,6 +120,48 @@ seg = sess.buf.decode(errors='replace')
 check('p2 append after original',
       ok and seg.find('persist-me') >= 0 and
       seg.find('persist-me') < seg.find('second-boot'))
+sess.buf = b''
+check('p2 bigfile write 100KiB',
+      sess.run_expect('bigfile /data/big.bin 102400', 'sh> '))
+sess.buf = b''
+check('p2 bigfile verify',
+      sess.run_expect('bigfile /data/big.bin 102400 check',
+                      'sh> '))
+sess.buf = b''
+check('p2 rename keep->renamed',
+      sess.run_expect('mv /data/keep.txt /data/renamed.txt',
+                      'sh> '))
+sess.buf = b''
+check('p2 rm h.txt', sess.run_expect('rm /data/h.txt', 'sh> '))
+qemu.kill()  # power cut again
+qemu.wait()
+s.close()
+
+# ---------- phase 3: rename/delete/big file persisted ----------
+qemu, s = boot()
+sess = Session(s)
+check('p3 shell prompt', sess.until('sh> ', 60))
+check('p3 yfs mounted existing',
+      b'yfs mounted on /data' in sess.buf and
+      b'formatted' not in sess.buf)
+sess.buf = b''
+ok = sess.run_expect('cat /data/renamed.txt', 'persist-me')
+seg = sess.buf.decode(errors='replace')
+check('p3 renamed.txt has both lines',
+      ok and 'second-boot' in seg)
+sess.buf = b''
+check('p3 ls runs', sess.run_expect('ls /data', 'renamed.txt'))
+seg = sess.buf.decode(errors='replace')
+check('p3 ls: renamed+big+sub, no h.txt',
+      'renamed.txt' in seg and 'big.bin' in seg and
+      'sub/' in seg and 'h.txt' not in seg)
+sess.buf = b''
+check('p3 bigfile verify after power cut',
+      sess.run_expect('bigfile /data/big.bin 102400 check',
+                      'sh> '))
+sess.buf = b''
+check('p3 subdir file still there',
+      sess.run_expect('cat /data/sub/a.txt', 'nested'))
 qemu.terminate()
 s.close()
 os.unlink(DISK)

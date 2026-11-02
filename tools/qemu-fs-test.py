@@ -46,7 +46,8 @@ def check(name, cond):
     if not cond: fails.append(name)
 
 SCENARIOS = ['persist', 'write-read', 'append', 'trunc', 'seek',
-             'dents', 'errors', 'fork-share', 'mkdir-cwd', 'openat']
+             'dents', 'errors', 'fork-share', 'mkdir-cwd', 'openat',
+             'unlink', 'unlink-open', 'rename', 'rmdir']
 
 check('shell prompt', until('sh> ', 45))
 

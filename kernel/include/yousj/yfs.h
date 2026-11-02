@@ -48,5 +48,11 @@ int yfs_truncate(uint32_t ino, uint32_t size);
  * Returns 1 when an entry was found, 0 at the end. */
 int yfs_readdir(uint32_t ino, uint32_t *slot, char *name_out,
                 uint32_t *ino_out, int *is_dir_out);
+/* M13: want_dir=false is unlink, true is rmdir. */
+long yfs_unlink(const char *parent_rel, const char *name,
+                bool want_dir);
+long yfs_rename(const char *old_rel, const char *new_rel);
+void yfs_note_open(uint32_t ino);
+void yfs_note_close(uint32_t ino);
 
 #endif /* YOUSJ_YFS_H */

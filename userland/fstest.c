@@ -33,6 +33,9 @@
 #define SYS_getcwd     79
 #define SYS_chdir      80
 #define SYS_mkdir      83
+#define SYS_rename     82
+#define SYS_rmdir      84
+#define SYS_unlink     87
 #define SYS_getdents64 217
 #define SYS_openat     257
 
@@ -379,6 +382,89 @@ static void t_mkdir_cwd(void)
     report2("mkdir-cwd", ok, m);
 }
 
+static void t_unlink(void)
+{
+    long fd = open_("/u.txt", O_CREAT | O_RDWR | O_TRUNC);
+    long r1, r2;
+    if (fd < 0) {
+        report("unlink", 0);
+        return;
+    }
+    sys_call3(SYS_write, fd, (long)(uintptr_t)"data", 4);
+    sys_call3(SYS_close, fd, 0, 0);
+    r1 = sys_call3(SYS_unlink, (long)(uintptr_t)"/u.txt", 0, 0);
+    r2 = open_("/u.txt", O_RDONLY);
+    report("unlink", r1 == 0 && r2 == -2);
+    if (r2 >= 0)
+        sys_call3(SYS_close, r2, 0, 0);
+}
+
+static void t_unlink_open(void)
+{
+    long fd = open_("/u2.txt", O_CREAT | O_RDWR | O_TRUNC);
+    char buf[4];
+    long n, r;
+    if (fd < 0) {
+        report("unlink-open", 0);
+        return;
+    }
+    sys_call3(SYS_write, fd, (long)(uintptr_t)"zz", 2);
+    r = sys_call3(SYS_unlink, (long)(uintptr_t)"/u2.txt", 0, 0);
+    sys_call3(SYS_lseek, fd, 0, SEEK_SET);
+    n = sys_call3(SYS_read, fd, (long)(uintptr_t)buf, 2);
+    sys_call3(SYS_close, fd, 0, 0);
+    report("unlink-open", r == 0 && n == 2 && buf[0] == 'z' &&
+           buf[1] == 'z');
+}
+
+static void t_rename(void)
+{
+    long fd = open_("/r1.txt", O_CREAT | O_RDWR | O_TRUNC);
+    long r1, r2, gone;
+    char buf[4];
+    long n;
+    if (fd < 0) {
+        report("rename", 0);
+        return;
+    }
+    sys_call3(SYS_write, fd, (long)(uintptr_t)"R", 1);
+    sys_call3(SYS_close, fd, 0, 0);
+    r1 = sys_call3(SYS_rename, (long)(uintptr_t)"/r1.txt",
+                   (long)(uintptr_t)"/r2.txt", 0);
+    gone = open_("/r1.txt", O_RDONLY);
+    if (gone >= 0)
+        sys_call3(SYS_close, gone, 0, 0);
+    sys_call3(SYS_mkdir, (long)(uintptr_t)"/rd", 0755, 0);
+    r2 = sys_call3(SYS_rename, (long)(uintptr_t)"/r2.txt",
+                   (long)(uintptr_t)"/rd/r3.txt", 0);
+    fd = open_("/rd/r3.txt", O_RDONLY);
+    n = fd >= 0 ? sys_call3(SYS_read, fd, (long)(uintptr_t)buf, 1)
+                : -1;
+    if (fd >= 0)
+        sys_call3(SYS_close, fd, 0, 0);
+    sys_call3(SYS_unlink, (long)(uintptr_t)"/rd/r3.txt", 0, 0);
+    sys_call3(SYS_rmdir, (long)(uintptr_t)"/rd", 0, 0);
+    report("rename", r1 == 0 && gone == -2 && r2 == 0 && n == 1 &&
+           buf[0] == 'R');
+}
+
+static void t_rmdir(void)
+{
+    long r1, r2, r3;
+    long fd;
+    sys_call3(SYS_mkdir, (long)(uintptr_t)"/empty1", 0755, 0);
+    r1 = sys_call3(SYS_rmdir, (long)(uintptr_t)"/empty1", 0, 0);
+    sys_call3(SYS_mkdir, (long)(uintptr_t)"/ne", 0755, 0);
+    fd = open_("/ne/f.txt", O_CREAT | O_RDWR);
+    if (fd >= 0)
+        sys_call3(SYS_close, fd, 0, 0);
+    r2 = sys_call3(SYS_rmdir, (long)(uintptr_t)"/ne", 0, 0);
+    r3 = sys_call3(SYS_rmdir, (long)(uintptr_t)"/ne/f.txt", 0, 0);
+    sys_call3(SYS_unlink, (long)(uintptr_t)"/ne/f.txt", 0, 0);
+    sys_call3(SYS_rmdir, (long)(uintptr_t)"/ne", 0, 0);
+    report("rmdir", r1 == 0 && r2 == -39 && r3 == -20);
+}
+
 int main(void)
 {
     long fd;
@@ -396,6 +482,11 @@ int main(void)
     fd = sys_call4(SYS_openat, AT_FDCWD, (long)(uintptr_t)"/t2.txt",
                    O_RDONLY, 0);
     report2("openat", fd >= 0, fd);
+    t_unlink();
+    t_unlink_open();
+    t_rename();
+    t_rmdir();
+
     if (fd >= 0)
         sys_call3(SYS_close, fd, 0, 0);
     out("FSTEST DONE\n");

@@ -183,8 +183,28 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   其余八链不回归。已知边界：单文件上限 48KiB、无删除/
   改名、无日志（断电恰逢元数据写一半可能损坏该次操作
   涉及的结构）、yfs 无并发锁、ATA 仅主盘 LBA28 PIO。
-- ⏳ 下一步候选：unlink/rename、mmap 文件映射、poll/
-  select、符号链接、yfs 间接块（突破 48KiB）。
+- ✅ 调度 M13（2026-11-02）：删除与改名＋yfs 大文件。
+  unlink(87)/unlinkat(263)/rmdir(84)/rename(82) 两后端
+  齐全；带 POSIX 语义的延迟释放——文件被删后，已打开的
+  描述符仍可读到原内容，存储在最后一个 close 时才真正
+  回收（ramfs 节点引用计数／yfs inode 的 rsvd 计数双路
+  实现）；rename 同后端内任意目录间移动，跨后端 -EXDEV，
+  覆盖目标按常规规则处理。yfs 升级为 11 个直接块＋1 个
+  单级间接块（1024 项），单文件上限从 48KiB 提到约
+  4MiB，格式版本升到 2（旧版磁盘会被当作异种盘跳过，
+  不误挂）。新增 /bin/rm、/bin/rmdir、/bin/mv、
+  /bin/bigfile（图案写/验工具）。验收：fstest 新增
+  unlink/unlink-open/rename/rmdir 四场景全过；磁盘套件
+  扩到三阶段——第二阶段写 100KiB 图案文件（跨直接/间接
+  边界）、改名、删文件，硬杀后第三阶段逐字节验大文件、
+  改名与删除结果均已落盘；其余八链＋UEFI 带盘链不回归。
+  施工事故：yfs 的 inode 结构体数组维度写的是语义常量
+  DIRECT，DIRECT 从 12 改 11 时结构体从 64 字节缩到
+  60，而磁盘格式是 64——每次 inode 读都溢出 4 字节砸穿
+  调用者栈帧（ls 打开 /data 必崩）。已写死为 12 并加
+  _Static_assert 钉住 sizeof。
+- ⏳ 下一步候选：mmap 文件映射、poll/select、符号
+  链接、yfs 删除日志/一致性、ramfs 大文件。
 
 ## 从零构建
 

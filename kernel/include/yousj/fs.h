@@ -111,6 +111,11 @@ int fs_mount_data(void);
  * negative errno. Used by execve. */
 long fs_read_all_path(const char *path, uint8_t *dst,
                       uint64_t cap);
+/* M13: unlink (files), rmdir (empty dirs), rename (same
+ * backend only, -EXDEV across). */
+long fs_unlink_path(const char *path);
+long fs_rmdir_path(const char *path);
+long fs_rename_path(const char *old_path, const char *new_path);
 /* Whether path exists; when it does, also reports whether
  * it is a directory and its size (either backend). For
  * chdir's validation and execve's staging. */

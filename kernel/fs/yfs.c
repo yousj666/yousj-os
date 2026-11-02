@@ -27,7 +27,9 @@
 #define DATA_SECTOR0    25
 #define BLOCK_SIZE      4096
 #define BLOCK_SECTORS   8
-#define DIRECT          12
+#define DIRECT          11
+#define INDIRECT_ENTRIES 1024
+#define MAX_BLOCKS      (DIRECT + INDIRECT_ENTRIES)
 #define DIRENT_SIZE     32
 #define UNALLOC         0xFFFFFFFFu
 
@@ -35,9 +37,16 @@ struct yfs_inode {
     uint8_t type; /* 0 free, 1 file, 2 dir */
     uint8_t pad[3];
     uint32_t size;
-    uint32_t blocks[DIRECT];
+    uint32_t blocks[12]; /* DIRECT direct + 1 indirect slot;
+                            the on-disk struct is ALWAYS 64
+                            bytes -- sizing this array from
+                            DIRECT once shrank the struct to
+                            60 and corrupted every caller */
     uint32_t rsvd[2];
 };
+
+_Static_assert(sizeof(struct yfs_inode) == 64,
+               "on-disk inode must be exactly 64 bytes");
 
 static struct ata_drive g_drv;
 static bool g_mounted;
@@ -156,6 +165,60 @@ static int block_write(uint32_t blk, const uint8_t *src)
                      BLOCK_SECTORS, src) == 0 ? 0 : -E_IO_L;
 }
 
+/* --- block index translation (M13: single indirect) -------------
+ * blocks[0..10] are direct; blocks[11] names the indirect
+ * block, whose 1024 entries are block numbers or UNALLOC.
+ * A fresh indirect block is filled with UNALLOC markers --
+ * NOT zeros, because block 0 is a real data block. */
+
+static uint8_t g_iblk[BLOCK_SIZE];
+
+static int inode_get_block(const struct yfs_inode *n, uint32_t bi,
+                           uint32_t *out)
+{
+    if (bi < DIRECT) {
+        *out = n->blocks[bi];
+        return 0;
+    }
+    if (bi >= MAX_BLOCKS || n->blocks[DIRECT] == UNALLOC) {
+        *out = UNALLOC;
+        return 0;
+    }
+    if (block_read(n->blocks[DIRECT], g_iblk) != 0)
+        return -E_IO_L;
+    *out = ((const uint32_t *)g_iblk)[bi - DIRECT];
+    return 0;
+}
+
+/* Point index bi at blk, allocating the indirect block on
+ * first use. The caller writes the inode back. */
+static int inode_set_block(struct yfs_inode *n, uint32_t bi,
+                           uint32_t blk)
+{
+    uint32_t i;
+    if (bi < DIRECT) {
+        n->blocks[bi] = blk;
+        return 0;
+    }
+    if (bi >= MAX_BLOCKS)
+        return -E_NOSPC_L;
+    if (n->blocks[DIRECT] == UNALLOC) {
+        long nb = block_alloc();
+        if (nb < 0)
+            return (int)nb;
+        for (i = 0; i < INDIRECT_ENTRIES; i++)
+            ((uint32_t *)g_iblk)[i] = UNALLOC;
+        if (block_write((uint32_t)nb, g_iblk) != 0)
+            return -E_IO_L;
+        n->blocks[DIRECT] = (uint32_t)nb;
+    } else {
+        if (block_read(n->blocks[DIRECT], g_iblk) != 0)
+            return -E_IO_L;
+    }
+    ((uint32_t *)g_iblk)[bi - DIRECT] = blk;
+    return block_write(n->blocks[DIRECT], g_iblk);
+}
+
 /* --- content I/O ------------------------------------------------- */
 
 long yfs_pread(uint32_t ino, uint32_t off, void *dst, uint32_t count)
@@ -177,14 +240,19 @@ long yfs_pread(uint32_t ino, uint32_t off, void *dst, uint32_t count)
         uint32_t chunk = BLOCK_SIZE - bo;
         if (chunk > count - done)
             chunk = count - done;
-        if (bi >= DIRECT || n.blocks[bi] == UNALLOC) {
-            uint32_t i;
-            for (i = 0; i < chunk; i++)
-                d[done + i] = 0;
-        } else {
-            if (block_read(n.blocks[bi], g_blk) != 0)
+        {
+            uint32_t phys;
+            if (inode_get_block(&n, bi, &phys) != 0)
                 return -E_IO_L;
-            mem_copy(d + done, g_blk + bo, chunk);
+            if (phys == UNALLOC) {
+                uint32_t i;
+                for (i = 0; i < chunk; i++)
+                    d[done + i] = 0;
+            } else {
+                if (block_read(phys, g_blk) != 0)
+                    return -E_IO_L;
+                mem_copy(d + done, g_blk + bo, chunk);
+            }
         }
         done += chunk;
     }
@@ -210,21 +278,28 @@ long yfs_pwrite(uint32_t ino, uint32_t off, const void *src,
         long nb;
         if (chunk > count - done)
             chunk = count - done;
-        if (bi >= DIRECT)
-            return done > 0 ? (long)done : -E_NOSPC_L;
-        if (n.blocks[bi] == UNALLOC) {
-            nb = block_alloc();
-            if (nb < 0)
-                return done > 0 ? (long)done : nb;
-            n.blocks[bi] = (uint32_t)nb;
-        }
-        if (chunk < BLOCK_SIZE) {
-            if (block_read(n.blocks[bi], g_blk) != 0)
+        {
+            uint32_t phys;
+            if (bi >= MAX_BLOCKS)
+                return done > 0 ? (long)done : -E_NOSPC_L;
+            if (inode_get_block(&n, bi, &phys) != 0)
+                return -E_IO_L;
+            if (phys == UNALLOC) {
+                nb = block_alloc();
+                if (nb < 0)
+                    return done > 0 ? (long)done : nb;
+                phys = (uint32_t)nb;
+                if (inode_set_block(&n, bi, phys) != 0)
+                    return -E_IO_L;
+            }
+            if (chunk < BLOCK_SIZE) {
+                if (block_read(phys, g_blk) != 0)
+                    return -E_IO_L;
+            }
+            mem_copy(g_blk + bo, s + done, chunk);
+            if (block_write(phys, g_blk) != 0)
                 return -E_IO_L;
         }
-        mem_copy(g_blk + bo, s + done, chunk);
-        if (block_write(n.blocks[bi], g_blk) != 0)
-            return -E_IO_L;
         done += chunk;
         if (off + done > n.size)
             n.size = off + done;
@@ -246,11 +321,20 @@ int yfs_truncate(uint32_t ino, uint32_t size)
         return inode_write(ino, &n);
     }
     keep = (size + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    for (i = keep; i < DIRECT; i++) {
-        if (n.blocks[i] != UNALLOC) {
-            block_free(n.blocks[i]);
-            n.blocks[i] = UNALLOC;
+    for (i = keep; i < MAX_BLOCKS; i++) {
+        uint32_t phys;
+        if (inode_get_block(&n, i, &phys) != 0)
+            return -E_IO_L;
+        if (phys != UNALLOC) {
+            block_free(phys);
+            if (inode_set_block(&n, i, UNALLOC) != 0)
+                return -E_IO_L;
         }
+    }
+    if (keep <= DIRECT && n.blocks[DIRECT] != UNALLOC) {
+        /* nothing indirect survives: free the table itself */
+        block_free(n.blocks[DIRECT]);
+        n.blocks[DIRECT] = UNALLOC;
     }
     n.size = size;
     return inode_write(ino, &n);
@@ -336,12 +420,282 @@ uint32_t yfs_size(uint32_t ino)
     return n.size;
 }
 
+/* Write bytes into a directory's own content (yfs_pwrite
+ * refuses directories by design). Direct blocks only: a
+ * directory tops out at DIRECT blocks of entries. */
+static int dir_write_bytes(uint32_t dino, uint32_t off,
+                           const void *src, uint32_t count)
+{
+    struct yfs_inode pn;
+    const uint8_t *s8 = (const uint8_t *)src;
+    uint32_t done = 0;
+
+    if (inode_read(dino, &pn) != 0)
+        return -E_IO_L;
+    if (pn.type != 2)
+        return -E_NOTDIR_L;
+    while (done < count) {
+        uint32_t pos = off + done;
+        uint32_t bi = pos / BLOCK_SIZE, bo = pos % BLOCK_SIZE;
+        uint32_t chunk = BLOCK_SIZE - bo;
+        if (chunk > count - done)
+            chunk = count - done;
+        if (bi >= DIRECT)
+            return -E_NOSPC_L;
+        if (pn.blocks[bi] == UNALLOC) {
+            long nb = block_alloc();
+            if (nb < 0)
+                return (int)nb;
+            pn.blocks[bi] = (uint32_t)nb;
+        }
+        if (block_read(pn.blocks[bi], g_blk) != 0)
+            return -E_IO_L;
+        mem_copy(g_blk + bo, s8 + done, chunk);
+        if (block_write(pn.blocks[bi], g_blk) != 0)
+            return -E_IO_L;
+        done += chunk;
+        if (off + done > pn.size)
+            pn.size = off + done;
+    }
+    return inode_write(dino, &pn);
+}
+
+static int dir_link(uint32_t pino, const char *name, uint32_t target)
+{
+    struct yfs_inode parent;
+    struct dirent_raw de;
+    uint32_t i, slot;
+
+    if (inode_read(pino, &parent) != 0)
+        return -E_IO_L;
+    slot = parent.size / DIRENT_SIZE;
+    for (i = 0; i < parent.size / DIRENT_SIZE; i++) {
+        if (yfs_pread(pino, i * DIRENT_SIZE, &de, DIRENT_SIZE) !=
+            DIRENT_SIZE)
+            return -E_IO_L;
+        if (de.name[0] == '\0') {
+            slot = i;
+            break;
+        }
+    }
+    de.ino = target;
+    mem_zero((uint8_t *)de.name, sizeof(de.name));
+    mem_copy((uint8_t *)de.name, (const uint8_t *)name,
+             str_len(name));
+    return dir_write_bytes(pino, slot * DIRENT_SIZE, &de,
+                           DIRENT_SIZE);
+}
+
+/* --- M13: removal, rename, open references -----------------------
+ * rsvd[0] of an inode carries the open-file reference count
+ * in its low 16 bits and the unlinked flag at 0x10000. An
+ * unlinked inode's blocks are freed when the count reaches
+ * zero (immediately when it is already zero). */
+
+#define REFS_OF(n)   ((n)->rsvd[0] & 0xFFFFu)
+#define UNLINKED_OF(n) (((n)->rsvd[0] & 0x10000u) != 0)
+
+static int free_inode(uint32_t ino)
+{
+    struct yfs_inode n;
+    if (yfs_truncate(ino, 0) != 0)
+        return -E_IO_L;
+    if (inode_read(ino, &n) != 0)
+        return -E_IO_L;
+    n.type = 0;
+    n.rsvd[0] = 0;
+    return inode_write(ino, &n);
+}
+
+static int remove_dirent(uint32_t pino, uint32_t slot,
+                         uint32_t target)
+{
+    struct dirent_raw zero;
+    struct yfs_inode t;
+
+    mem_zero((uint8_t *)&zero, sizeof(zero));
+    if (dir_write_bytes(pino, slot * DIRENT_SIZE, &zero,
+                        DIRENT_SIZE) != 0)
+        return -E_IO_L;
+    if (inode_read(target, &t) != 0)
+        return -E_IO_L;
+    t.rsvd[0] |= 0x10000u;
+    if (inode_write(target, &t) != 0)
+        return -E_IO_L;
+    if (REFS_OF(&t) == 0)
+        return free_inode(target);
+    return 0;
+}
+
+static int dir_is_empty(uint32_t ino)
+{
+    struct yfs_inode n;
+    struct dirent_raw de;
+    uint32_t i, slots;
+    if (inode_read(ino, &n) != 0)
+        return -E_IO_L;
+    slots = n.size / DIRENT_SIZE;
+    for (i = 0; i < slots; i++) {
+        if (yfs_pread(ino, i * DIRENT_SIZE, &de, DIRENT_SIZE) !=
+            DIRENT_SIZE)
+            return -E_IO_L;
+        if (de.name[0] != '\0')
+            return 0;
+    }
+    return 1;
+}
+
+long yfs_unlink(const char *parent_rel, const char *name,
+                bool want_dir)
+{
+    long pino = yfs_lookup(parent_rel);
+    uint32_t slot;
+    long target;
+    struct yfs_inode t;
+
+    if (pino < 0)
+        return pino;
+    target = dir_find((uint32_t)pino, name, &slot);
+    if (target < 0)
+        return target;
+    if (inode_read((uint32_t)target, &t) != 0)
+        return -E_IO_L;
+    if (want_dir) {
+        int empty;
+        if (t.type != 2)
+            return -E_NOTDIR_L;
+        if (target == 0)
+            return -E_INVAL_L;
+        empty = dir_is_empty((uint32_t)target);
+        if (empty < 0)
+            return empty;
+        if (!empty)
+            return -39; /* ENOTEMPTY */
+    } else {
+        if (t.type == 2)
+            return -E_ISDIR_L;
+    }
+    return remove_dirent((uint32_t)pino, slot, (uint32_t)target);
+}
+
+/* Split "a/b/c" into parent "a/b" + name "c" ("" parent = root). */
+static void split_rel(const char *rel, char *parent, char *name)
+{
+    uint64_t i, last = 0xFFFFFFFFFFFFFFFFULL, n = str_len(rel);
+    for (i = 0; i < n; i++)
+        if (rel[i] == '/')
+            last = i;
+    if (last == 0xFFFFFFFFFFFFFFFFULL) {
+        parent[0] = '\0';
+        for (i = 0; i <= n; i++)
+            name[i] = rel[i];
+    } else {
+        for (i = 0; i < last; i++)
+            parent[i] = rel[i];
+        parent[last] = '\0';
+        for (i = last + 1; i <= n; i++)
+            name[i - last - 1] = rel[i];
+    }
+}
+
+long yfs_rename(const char *old_rel, const char *new_rel)
+{
+    char oparent[128], oname[40], nparent[128], nname[40];
+    long src, npino, existing;
+    struct yfs_inode sn, tn;
+    uint32_t oslot, tslot;
+
+    src = yfs_lookup(old_rel);
+    if (src < 0)
+        return src;
+    if (src == 0)
+        return -E_INVAL_L;
+    if (inode_read((uint32_t)src, &sn) != 0)
+        return -E_IO_L;
+    split_rel(old_rel, oparent, oname);
+    split_rel(new_rel, nparent, nname);
+    if (str_len(nname) > YFS_MAX_NAME)
+        return -E_NAMETOOLONG_L;
+    npino = yfs_lookup(nparent);
+    if (npino < 0)
+        return npino;
+    if (inode_read((uint32_t)npino, &tn) != 0)
+        return -E_IO_L;
+    if (tn.type != 2)
+        return -E_NOTDIR_L;
+    existing = dir_find((uint32_t)npino, nname, &tslot);
+    if (existing >= 0 && existing != src) {
+        struct yfs_inode en;
+        int rc;
+        if (inode_read((uint32_t)existing, &en) != 0)
+            return -E_IO_L;
+        if (en.type == 2) {
+            int empty;
+            if (sn.type != 2)
+                return -E_ISDIR_L;
+            empty = dir_is_empty((uint32_t)existing);
+            if (empty < 0)
+                return empty;
+            if (!empty)
+                return -39;
+        } else if (sn.type == 2) {
+            return -E_NOTDIR_L;
+        }
+        rc = remove_dirent((uint32_t)npino, tslot,
+                           (uint32_t)existing);
+        if (rc != 0)
+            return rc;
+    }
+    if (existing == src)
+        return 0; /* rename onto itself */
+    if (dir_link((uint32_t)npino, nname, (uint32_t)src) != 0)
+        return -E_IO_L;
+    {
+        long opino = yfs_lookup(oparent);
+        if (opino < 0)
+            return opino;
+        if (dir_find((uint32_t)opino, oname, &oslot) != src)
+            return -E_IO_L;
+        {
+            struct dirent_raw zero;
+            mem_zero((uint8_t *)&zero, sizeof(zero));
+            if (dir_write_bytes((uint32_t)opino,
+                                oslot * DIRENT_SIZE, &zero,
+                                DIRENT_SIZE) != 0)
+                return -E_IO_L;
+        }
+    }
+    return 0;
+}
+
+void yfs_note_open(uint32_t ino)
+{
+    struct yfs_inode n;
+    if (inode_read(ino, &n) != 0)
+        return;
+    n.rsvd[0] = (n.rsvd[0] & 0xFFFF0000u) | ((REFS_OF(&n) + 1) & 0xFFFFu);
+    inode_write(ino, &n);
+}
+
+void yfs_note_close(uint32_t ino)
+{
+    struct yfs_inode n;
+    if (inode_read(ino, &n) != 0)
+        return;
+    if (REFS_OF(&n) > 0)
+        n.rsvd[0] = (n.rsvd[0] & 0xFFFF0000u) | (REFS_OF(&n) - 1);
+    else
+        return;
+    inode_write(ino, &n);
+    if (UNLINKED_OF(&n) && REFS_OF(&n) == 0)
+        free_inode(ino);
+}
+
 long yfs_mknod(const char *parent_rel, const char *name, bool is_dir)
 {
     long pino;
     struct yfs_inode parent, fresh;
-    uint32_t i, free_ino = 0xFFFFFFFFu, slot;
-    struct dirent_raw de;
+    uint32_t i, free_ino = 0xFFFFFFFFu;
 
     if (str_len(name) > YFS_MAX_NAME)
         return -E_NAMETOOLONG_L;
@@ -368,51 +722,12 @@ long yfs_mknod(const char *parent_rel, const char *name, bool is_dir)
     mem_zero((uint8_t *)&fresh, sizeof(fresh));
     fresh.type = is_dir ? 2 : 1;
     fresh.size = 0;
-    for (i = 0; i < DIRECT; i++)
-        fresh.blocks[i] = UNALLOC;
+    for (i = 0; i < 12; i++)
+        fresh.blocks[i] = UNALLOC; /* all slots incl. indirect */
     if (inode_write(free_ino, &fresh) != 0)
         return -E_IO_L;
-    /* link it into the parent: first empty slot, else append */
-    slot = parent.size / DIRENT_SIZE;
-    for (i = 0; i < parent.size / DIRENT_SIZE; i++) {
-        if (yfs_pread((uint32_t)pino, i * DIRENT_SIZE, &de,
-                      DIRENT_SIZE) != DIRENT_SIZE)
-            return -E_IO_L;
-        if (de.name[0] == '\0') {
-            slot = i;
-            break;
-        }
-    }
-    de.ino = free_ino;
-    mem_zero((uint8_t *)de.name, sizeof(de.name));
-    mem_copy((uint8_t *)de.name, (const uint8_t *)name,
-             str_len(name));
-    {
-        /* directories write their own content: go through the
-         * inode directly (yfs_pwrite refuses dirs by design). */
-        struct yfs_inode pn;
-        uint32_t pos = slot * DIRENT_SIZE;
-        uint32_t bi = pos / BLOCK_SIZE, bo = pos % BLOCK_SIZE;
-        if (inode_read((uint32_t)pino, &pn) != 0)
-            return -E_IO_L;
-        if (bi >= DIRECT)
-            return -E_NOSPC_L;
-        if (pn.blocks[bi] == UNALLOC) {
-            long nb = block_alloc();
-            if (nb < 0)
-                return nb;
-            pn.blocks[bi] = (uint32_t)nb;
-        }
-        if (block_read(pn.blocks[bi], g_blk) != 0)
-            return -E_IO_L;
-        mem_copy(g_blk + bo, (const uint8_t *)&de, DIRENT_SIZE);
-        if (block_write(pn.blocks[bi], g_blk) != 0)
-            return -E_IO_L;
-        if (pos + DIRENT_SIZE > pn.size)
-            pn.size = pos + DIRENT_SIZE;
-        if (inode_write((uint32_t)pino, &pn) != 0)
-            return -E_IO_L;
-    }
+    if (dir_link((uint32_t)pino, name, free_ino) != 0)
+        return -E_IO_L;
     return (long)free_ino;
 }
 
@@ -478,7 +793,7 @@ static int yfs_format(struct ata_drive *d)
     g_data_blocks = (d->sectors - DATA_SECTOR0) / BLOCK_SECTORS;
     mem_zero(g_sec, ATA_SECTOR_SIZE);
     mem_copy(g_sec, (const uint8_t *)"YOUSJFS1", 8);
-    *(uint32_t *)(g_sec + 8) = 1; /* version */
+    *(uint32_t *)(g_sec + 8) = 2; /* version: M13 indirect */
     *(uint32_t *)(g_sec + 12) = d->sectors;
     *(uint32_t *)(g_sec + 16) = g_data_blocks;
     if (ata_write(d, SB_SECTOR, 1, g_sec) != 0)
@@ -494,8 +809,8 @@ static int yfs_format(struct ata_drive *d)
     mem_zero((uint8_t *)&root, sizeof(root));
     root.type = 2;
     root.size = 0;
-    for (i = 0; i < DIRECT; i++)
-        root.blocks[i] = UNALLOC;
+    for (i = 0; i < 12; i++)
+        root.blocks[i] = UNALLOC; /* all slots incl. indirect */
     if (inode_write(0, &root) != 0)
         return -E_IO_L;
     g_mounted = true;
@@ -515,7 +830,8 @@ int yfs_mount(void)
             continue;
         if (ata_read(&d, SB_SECTOR, 1, g_sec) != 0)
             continue;
-        if (sector_has_magic(g_sec)) {
+        if (sector_has_magic(g_sec) &&
+            *(const uint32_t *)(g_sec + 8) == 2) {
             g_drv = d;
             g_data_blocks = *(const uint32_t *)(g_sec + 16);
             if (g_data_blocks == 0)

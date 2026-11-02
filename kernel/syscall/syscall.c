@@ -933,6 +933,49 @@ static long sys_getcwd_sys(uint64_t buf, uint64_t size)
     return (long)len;
 }
 
+/* --- M13: unlink / rmdir / rename ------------------------------- */
+
+static long sys_unlink_sys(uint64_t path_ptr)
+{
+    struct task *me = sched_current();
+    static char path_buf[256];
+    static char resolved[256];
+
+    if (copy_user_string(path_ptr, path_buf, sizeof(path_buf)) != 0)
+        return -YOUSJ_EFAULT;
+    resolve_path(me, path_buf, resolved);
+    return fs_unlink_path(resolved);
+}
+
+static long sys_rmdir_sys(uint64_t path_ptr)
+{
+    struct task *me = sched_current();
+    static char path_buf[256];
+    static char resolved[256];
+
+    if (copy_user_string(path_ptr, path_buf, sizeof(path_buf)) != 0)
+        return -YOUSJ_EFAULT;
+    resolve_path(me, path_buf, resolved);
+    return fs_rmdir_path(resolved);
+}
+
+static long sys_rename_sys(uint64_t old_ptr, uint64_t new_ptr)
+{
+    struct task *me = sched_current();
+    static char old_buf[256];
+    static char new_buf[256];
+    static char rold[256];
+    static char rnew[256];
+
+    if (copy_user_string(old_ptr, old_buf, sizeof(old_buf)) != 0)
+        return -YOUSJ_EFAULT;
+    if (copy_user_string(new_ptr, new_buf, sizeof(new_buf)) != 0)
+        return -YOUSJ_EFAULT;
+    resolve_path(me, old_buf, rold);
+    resolve_path(me, new_buf, rnew);
+    return fs_rename_path(rold, rnew);
+}
+
 /* --- M10: pipes and descriptor duplication ----------------------- */
 
 static long sys_read_pipe(struct yousj_file *f, uint64_t buf,
@@ -1333,6 +1376,16 @@ static long dispatch_inner(struct yousj_syscall_ctx *ctx)
         return sys_chdir_sys(a1);
     case YOUSJ_SYS_getcwd:
         return sys_getcwd_sys(a1, a2);
+    case YOUSJ_SYS_unlink:
+        return sys_unlink_sys(a1);
+    case YOUSJ_SYS_unlinkat:
+        return (long)a1 == YOUSJ_AT_FDCWD
+                   ? sys_unlink_sys(a2)
+                   : -YOUSJ_EBADF; /* real dirfds unsupported */
+    case YOUSJ_SYS_rmdir:
+        return sys_rmdir_sys(a1);
+    case YOUSJ_SYS_rename:
+        return sys_rename_sys(a1, a2);
     case YOUSJ_SYS_pipe:
         return sys_pipe2_sys(a1, 0);
     case YOUSJ_SYS_pipe2:
