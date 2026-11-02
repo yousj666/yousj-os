@@ -52,6 +52,7 @@
 #define SYS_umask 95
 #define SYS_lseek 8
 #define SYS_getdents64 217
+#define SYS_sendfile 40
 
 #define AT_FDCWD (-100)
 #define AT_SYMLINK_NOFOLLOW 0x100
@@ -254,6 +255,10 @@ int main(int argc, char **argv)
     sys_call1(SYS_rmdir, (long)(uintptr_t)p);
     join(p, dir, "mdir2");
     sys_call1(SYS_rmdir, (long)(uintptr_t)p);
+    join(p, dir, "sf-src");
+    sys_call1(SYS_unlink, (long)(uintptr_t)p);
+    join(p, dir, "sf-dst");
+    sys_call1(SYS_unlink, (long)(uintptr_t)p);
     join(p, dir, "r3.txt");
     sys_call1(SYS_unlink, (long)(uintptr_t)p);
     join(p, dir, "ln3");
@@ -647,6 +652,58 @@ int main(int argc, char **argv)
         report("seekdir", ok);
     }
 
+    /* --- M40: sendfile between files --- */
+    {
+        char rb[32];
+        long ifd, ofd, n;
+        int64_t off = 4;
+        join(p, dir, "sf-src");
+        ifd = sys_call4(SYS_open, (long)(uintptr_t)p,
+                        0101, 0644, 0);
+        sys_call3(SYS_write, ifd,
+                  (long)(uintptr_t)"0123456789ABCDEF", 16);
+        sys_call1(SYS_close, ifd);
+        ifd = sys_call3(SYS_open, (long)(uintptr_t)p, 0,
+                        0);
+        join(p, dir, "sf-dst");
+        ofd = sys_call4(SYS_open, (long)(uintptr_t)p,
+                        0101, 0644, 0);
+        n = sys_call4(SYS_sendfile, ofd, ifd,
+                      (long)(uintptr_t)&off, 6);
+        int ok = n == 6 && off == 10;
+        /* input offset untouched by the offset form */
+        rb[0] = '?';
+        ok = ok && sys_call3(SYS_read, ifd,
+                             (long)(uintptr_t)rb, 1) == 1 &&
+             rb[0] == '0';
+        /* the streaming form resumes at offset 1 */
+        n = sys_call4(SYS_sendfile, ofd, ifd, 0, 100);
+        ok = ok && n == 15;
+        /* EOF: a further copy moves nothing */
+        ok = ok && sys_call4(SYS_sendfile, ofd, ifd, 0,
+                             10) == 0;
+        sys_call1(SYS_close, ifd);
+        sys_call1(SYS_close, ofd);
+        ofd = sys_call3(SYS_open, (long)(uintptr_t)p, 0,
+                        0);
+        {
+            char all[32];
+            long got = sys_call3(SYS_read, ofd,
+                                 (long)(uintptr_t)all,
+                                 sizeof(all));
+            const char *want = "456789123456789ABCDEF";
+            uint64_t j = 0;
+            ok = ok && got == 21;
+            while (ok && j < 21) {
+                if (all[j] != want[j])
+                    ok = 0;
+                j++;
+            }
+        }
+        sys_call1(SYS_close, ofd);
+        report("sendfile", ok);
+    }
+
     sys_call1(SYS_close, dfd);
 
     /* teardown: remove the whole tree so a second run in
@@ -672,6 +729,10 @@ int main(int argc, char **argv)
     sys_call1(SYS_rmdir, (long)(uintptr_t)p);
     join(p, dir, "mdir2");
     sys_call1(SYS_rmdir, (long)(uintptr_t)p);
+    join(p, dir, "sf-src");
+    sys_call1(SYS_unlink, (long)(uintptr_t)p);
+    join(p, dir, "sf-dst");
+    sys_call1(SYS_unlink, (long)(uintptr_t)p);
     join(p, dir, "sub2");
     sys_call1(SYS_rmdir, (long)(uintptr_t)p);
     join(p, dir, "f.txt");

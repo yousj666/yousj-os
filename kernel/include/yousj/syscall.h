@@ -87,6 +87,7 @@
 #define YOUSJ_SYS_fchownat    260   /* M36 */
 #define YOUSJ_SYS_fchmodat    268   /* M36 */
 #define YOUSJ_SYS_umask        95   /* M37 */
+#define YOUSJ_SYS_sendfile     40   /* M40 */
 #define YOUSJ_SYS_dup3        292  /* M10 */
 #define YOUSJ_SYS_pipe2       293  /* M10 */
 #define YOUSJ_SYS_time        201  /* M23 */

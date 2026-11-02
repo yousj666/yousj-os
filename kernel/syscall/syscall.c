@@ -63,6 +63,8 @@ static struct yousj_file *fd_file_of(struct task *t, long fd); /* M9, defined wi
 static void resolve_path(struct task *t, const char *path, char *out);
 static long sys_read_pipe(struct yousj_file *f, uint64_t buf, uint64_t count);
 static long sys_write_pipe(struct yousj_file *f, uint64_t buf, uint64_t len);
+static long pipe_write_mem(struct yousj_file *f,
+                           const uint8_t *src, uint64_t len);
 
 /* Called from sched_schedule() on every switch (weak hook, see
  * sched.c): TSS.rsp0 and cpu_local.kernel_rsp must always name the
@@ -1108,6 +1110,77 @@ static long sys_getdents64(long fd, uint64_t buf, uint64_t count)
     if (!user_range_ok(buf, count))
         return -YOUSJ_EFAULT;
     return file_getdents(f, (uint8_t *)(uintptr_t)buf, count);
+}
+
+/* --- M40: sendfile -----------------------------------
+ * Kernel-bounced copy (a stack buffer, so a blocking
+ * pipe write cannot interleave with another sendfile's
+ * data). The input must be a file -- pipes as input are
+ * EINVAL, the historical sendfile contract; splice
+ * remains the pipe-to-pipe tool and is still ENOSYS.
+ * With an offset pointer the input offset is untouched
+ * and the pointer is advanced by what was copied; with
+ * NULL the input's own offset advances. */
+static long sys_sendfile(long out_fd, long in_fd,
+                         uint64_t off_ptr, uint64_t count)
+{
+    struct task *me = sched_current();
+    struct yousj_file *in = fd_file_of(me, in_fd);
+    struct yousj_file *out = fd_file_of(me, out_fd);
+    uint8_t kbuf[1024];
+    uint64_t done = 0;
+    int64_t off = 0;
+    long result;
+
+    if (in == NULL || out == NULL)
+        return -YOUSJ_EBADF;
+    if (in->pipe != NULL)
+        return -YOUSJ_EINVAL;
+    if (off_ptr != 0) {
+        if (!user_range_ok(off_ptr, 8))
+            return -YOUSJ_EFAULT;
+        off = *(const int64_t *)(uintptr_t)off_ptr;
+        if (off < 0)
+            return -YOUSJ_EINVAL;
+    }
+    result = 0;
+    while (done < count) {
+        uint64_t want = count - done;
+        long n, w;
+        if (want > sizeof(kbuf))
+            want = sizeof(kbuf);
+        if (off_ptr != 0)
+            n = fs_pread_file(in, (uint64_t)off + done,
+                              kbuf, want);
+        else
+            n = file_read(in, kbuf, want);
+        if (n < 0) {
+            result = n;
+            goto out;
+        }
+        if (n == 0)
+            break;
+        if (out->pipe != NULL)
+            w = pipe_write_mem(out, kbuf, (uint64_t)n);
+        else if (out->backend == 0 && out->node == NULL)
+            w = -YOUSJ_EINVAL; /* the console cannot take it */
+        else
+            w = file_write(out, kbuf, (uint64_t)n);
+        if (w < 0) {
+            result = w;
+            goto out;
+        }
+        done += (uint64_t)w;
+        if (w < n)
+            break; /* short write: report what moved */
+    }
+    result = (long)done;
+out:
+    if (off_ptr != 0 && done > 0) {
+        int64_t noff = off + (int64_t)done;
+        *(int64_t *)(uintptr_t)off_ptr = noff;
+    }
+    return done > 0 ? (long)done : result;
 }
 
 static long sys_mkdir_sys(uint64_t path_ptr, long mode)
@@ -2188,12 +2261,26 @@ static long sys_write_pipe(struct yousj_file *f, uint64_t buf,
     struct yousj_pipe *p = f->pipe;
     uint64_t written = 0;
 
+    if (!user_range_ok(buf, len))
+        return -YOUSJ_EFAULT;
+    return pipe_write_mem(f, (const uint8_t *)(uintptr_t)buf,
+                          len);
+}
+
+/* M40 split: the pipe-write loop over a memory source.
+ * sys_write_pipe validates the user range first;
+ * sendfile feeds it a kernel buffer instead. */
+static long pipe_write_mem(struct yousj_file *f,
+                           const uint8_t *src, uint64_t len)
+{
+    struct task *me = sched_current();
+    struct yousj_pipe *p = f->pipe;
+    uint64_t written = 0;
+
     if ((f->flags & YOUSJ_O_ACCMODE) != YOUSJ_O_WRONLY)
         return -YOUSJ_EBADF;
     if (len == 0)
         return 0;
-    if (!user_range_ok(buf, len))
-        return -YOUSJ_EFAULT;
     for (;;) {
         uint64_t space, chunk, i;
         if (p->readers == 0) {
@@ -2209,8 +2296,7 @@ static long sys_write_pipe(struct yousj_file *f, uint64_t buf,
         if (space > 0) {
             chunk = len - written < space ? len - written : space;
             for (i = 0; i < chunk; i++) {
-                p->buf[p->tail] =
-                    ((const uint8_t *)(uintptr_t)buf)[written + i];
+                p->buf[p->tail] = src[written + i];
                 p->tail = (p->tail + 1) % YOUSJ_PIPE_CAP;
             }
             p->count += (uint32_t)chunk;
@@ -3041,6 +3127,8 @@ static long dispatch_inner(struct yousj_syscall_ctx *ctx)
                    : -YOUSJ_EBADF;
     case YOUSJ_SYS_fchownat:
         return sys_fchownat((long)a1, a2, (long)a5);
+    case YOUSJ_SYS_sendfile:
+        return sys_sendfile((long)a1, (long)a2, a3, a4);
     case YOUSJ_SYS_umask: {
         struct task *t = sched_current();
         long old = (long)t->umask;

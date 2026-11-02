@@ -27,6 +27,8 @@
 #define SYS_lseek        8
 #define SYS_rt_sigaction 13
 #define SYS_pipe         22
+#define SYS_sendfile     40
+#define SYS_unlink       87
 #define SYS_dup          32
 #define SYS_dup2         33
 #define SYS_clone        56
@@ -330,6 +332,33 @@ static void t_cloexec(void)
     report2("cloexec", (st & 0xFF) == 0 && ((st >> 8) & 0xFF) == 0, st);
 }
 
+/* M40: sendfile from a file into a pipe. */
+static void t_sendfile_pipe(void)
+{
+    int fds[2] = { -1, -1 };
+    char buf[16];
+    long fd, n, got;
+    fd = sys_call3(SYS_open, (long)(uintptr_t)"/sf.txt",
+                   0101, 0644);
+    sys_call3(SYS_write, fd, (long)(uintptr_t)"sendfile!",
+              9);
+    sys_call3(SYS_close, fd, 0, 0);
+    fd = sys_call3(SYS_open, (long)(uintptr_t)"/sf.txt", 0,
+                   0);
+    sys_call3(SYS_pipe, (long)(uintptr_t)fds, 0, 0);
+    n = sys_call4(SYS_sendfile, fds[1], fd, 0, 9);
+    sys_call3(SYS_close, fds[1], 0, 0);
+    got = sys_call3(SYS_read, fds[0], (long)(uintptr_t)buf,
+                    (long)sizeof(buf));
+    report2("sendfile-pipe",
+            n == 9 && got == 9 &&
+                bytes_eq(buf, "sendfile!", 9),
+            n);
+    sys_call3(SYS_close, fds[0], 0, 0);
+    sys_call3(SYS_close, fd, 0, 0);
+    sys_call3(SYS_unlink, (long)(uintptr_t)"/sf.txt", 0, 0);
+}
+
 int main(int argc, char **argv)
 {
     if (argc > 2 && argv[1][0] >= '0' && argv[1][0] <= '9' &&
@@ -337,6 +366,7 @@ int main(int argc, char **argv)
         return exec_child_mode(argc, argv);
     out("pipetest: M10 pipe/dup suite\n");
     t_basic();
+    t_sendfile_pipe();
     t_block_eof();
     t_epipe();
     t_full();

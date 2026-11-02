@@ -48,7 +48,7 @@ def check(name, cond):
     print(('PASS ' if cond else 'FAIL ') + name)
     if not cond: fails.append(name)
 
-SCEN = ['basic', 'block-eof', 'epipe', 'full', 'dup', 'cloexec']
+SCEN = ['basic', 'sendfile-pipe', 'block-eof', 'epipe', 'full', 'dup', 'cloexec']
 check('shell prompt', until('sh> ', 45))
 
 def run_suite(tag):

@@ -593,9 +593,20 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   任务 maps 为空，与 Linux 一致。验收：
   pidtest 加 maps-self（mmap 后映射行、镜像
   路径、[stack] 都在）。
+- ✅ sendfile M40（2026-11-03）：sendfile(40)
+  转正，内核栈缓冲中转（会阻塞的管道写入不
+  用静态缓冲、避免并发串数据）；sys_write_
+  pipe 拆出内存源核心 pipe_write_mem 共用。
+  偏移指针形式走 fs_pread_file、不动输入偏
+  移、指针按实拷字节推进；NULL 形式走输入
+  自身偏移。输入必须是文件（管道作输入
+  EINVAL，历史契约）；splice/copy_file_
+  range 仍 ENOSYS。验收：dirfdtest 加
+  sendfile（偏移/流式/EOF 三段＋内容比对，
+  ramfs/yfs 各一遍）、pipetest 加
+  sendfile-pipe。
 - ⏳ 下一步候选：硬链接（目录项重构）、
-  sendfile/splice 等零拷贝家族盘点、/proc
-  其余项（fd/ 目录）。
+  /proc/<pid>/fd 目录、splice。
 
 ## 从零构建
 
