@@ -116,6 +116,15 @@ long fs_read_all_path(const char *path, uint8_t *dst,
 long fs_unlink_path(const char *path);
 long fs_rmdir_path(const char *path);
 long fs_rename_path(const char *old_path, const char *new_path);
+bool fs_file_is_dir(struct yousj_file *f);
+/* M14: positional I/O on an open file object (the mmap
+ * layer's read-in / write-back path; the object's own
+ * offset is untouched and access-mode checks are the
+ * caller's job, done once at mmap time). */
+long fs_pread_file(struct yousj_file *f, uint64_t off,
+                   uint8_t *dst, uint64_t count);
+long fs_pwrite_file(struct yousj_file *f, uint64_t off,
+                    const uint8_t *src, uint64_t count);
 /* Whether path exists; when it does, also reports whether
  * it is a directory and its size (either backend). For
  * chdir's validation and execve's staging. */

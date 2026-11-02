@@ -203,8 +203,23 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   60，而磁盘格式是 64——每次 inode 读都溢出 4 字节砸穿
   调用者栈帧（ls 打开 /data 必崩）。已写死为 12 并加
   _Static_assert 钉住 sizeof。
-- ⏳ 下一步候选：mmap 文件映射、poll/select、符号
-  链接、yfs 删除日志/一致性、ramfs 大文件。
+- ✅ 调度 M14（2026-11-02）：文件 mmap——mmap(9) 支持
+  文件映射（此前仅匿名）：每任务 16 个 VMA 记录区域与
+  后备文件（持有文件对象引用）；映射建立时**急切填充**
+  （内容拷入新页、超 EOF 部分为零，无缺页异常路径）；
+  MAP_PRIVATE 写不回文件；MAP_SHARED 在 msync(26)、
+  munmap、exec、进程退出时经 VMM 翻译＋定位写回后备
+  文件，ramfs/yfs 双后端一致；munmap 只整区释放（部分
+  重叠 -EINVAL，不做 VMA 分割）；fork 时 VMA 随地址空间
+  复制（页是深拷贝，跨进程共享一致性不在此阶段）。模型
+  的已知边界：映射是快照——映射后经 write() 改文件，映
+  射里看不到；共享映射的脏页在上述写回点之前对其他读
+  者不可见。验收：`tools/qemu-mmap-test.py` 在带盘启动
+  下跑 mmtest 两轮（anon/私有读/私有写隔离/ramfs 共享
+  写回/yfs 共享写回/非零偏移六场景）＋PMM 稳态，其余
+  九链不回归。
+- ⏳ 下一步候选：poll/select、符号链接、mmap 缺页填
+  充（真按需分页）、yfs 一致性日志。
 
 ## 从零构建
 

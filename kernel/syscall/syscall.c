@@ -28,6 +28,11 @@
 #include <yousj/pmm.h>
 #include <drivers/serial.h>
 
+static void vma_release_in(struct vmm_space *sp,
+                           struct yousj_vma *v, bool unmap_pages);
+static void vmas_release_all(struct task *me,
+                             struct vmm_space *sp);
+
 /* Per-CPU data reached via GS after swapgs (SYSCALL_DESIGN 3.3).
  * Field offsets are CONTRACT with syscall_entry.S:
  *   +0 kernel_rsp, +8 user_rsp_save, +16 current_task,
@@ -265,6 +270,12 @@ void process_exit(long status, int sig)
     }
     me->sig_killed = sig;
 
+    /* M14: release VMAs first -- MAP_SHARED regions write
+     * back while the address space is still intact, and each
+     * VMA's own file reference drops here (the fd references
+     * below are separate). Pages die with the space. */
+    vmas_release_all(me, me->mm);
+
     /* M9: close every open file (shared objects are refcounted;
      * the console singleton ignores the put). */
     {
@@ -495,6 +506,15 @@ static long sys_clone(struct yousj_syscall_ctx *ctx, long flags,
             }
             child->fd_console_closed = me->fd_console_closed;
             child->fd_cloexec = me->fd_cloexec;
+            /* M14: VMAs copy with the address space (the pages
+             * themselves are deep-copied by the window clone);
+             * file backings gain a reference per child VMA. */
+            for (i = 0; i < YOUSJ_MAX_VMA; i++) {
+                child->vmas[i] = me->vmas[i];
+                if (child->vmas[i].used &&
+                    child->vmas[i].file != NULL)
+                    file_get(child->vmas[i].file);
+            }
             for (i = 0; i < YOUSJ_CWD_MAX; i++)
                 child->cwd_path[i] = me->cwd_path[i];
         }
@@ -679,6 +699,9 @@ static long sys_execve(uint64_t path_ptr, uint64_t argv_ptr,
         }
         sched_set_name(me, base);
     }
+    /* M14: release the old image's VMAs (shared file regions
+     * write back against the old space before it dies). */
+    vmas_release_all(me, old != NULL ? old : me->mm);
     vmm_load_cr3(space->pml4_phys);
     if (old != NULL && old != space) {
         vmm_free_user_data(old);
@@ -1232,23 +1255,118 @@ static long sys_brk(uint64_t addr)
     return (long)addr;
 }
 
+#define PROT_READ_K  0x1
+#define PROT_WRITE_K 0x2
+#define MAP_SHARED_K  0x01
+#define MAP_PRIVATE_K 0x02
+#define MAP_ANON_K    0x20
+#define EACCES_K 13
+
+/* Write back the intersection of [start, start+len) with the
+ * VMA's pages into the backing file. The pages are reached
+ * through the VMM (translate + HHDM), never by assuming the
+ * caller's CR3. */
+static void vma_writeback_range(struct vmm_space *sp,
+                                struct yousj_vma *v,
+                                uint64_t start, uint64_t len)
+{
+    uint64_t va, end;
+
+    if (v->file == NULL || !v->shared || sp == NULL)
+        return;
+    if (start < v->base) {
+        len -= v->base - start;
+        start = v->base;
+    }
+    end = start + len;
+    if (end > v->base + v->len)
+        end = v->base + v->len;
+    for (va = start; va < end; va += YOUSJ_PAGE_SIZE) {
+        uint64_t phys, chunk = end - va;
+        if (chunk > YOUSJ_PAGE_SIZE)
+            chunk = YOUSJ_PAGE_SIZE;
+        if (vmm_translate(sp, va, &phys, NULL) != 0)
+            continue;
+        fs_pwrite_file(v->file, v->file_off + (va - v->base),
+                       yousj_phys_to_virt(phys), chunk);
+    }
+}
+
+static void vma_release_in(struct vmm_space *sp,
+                           struct yousj_vma *v, bool unmap_pages)
+{
+    uint64_t pg;
+
+    if (!v->used)
+        return;
+    vma_writeback_range(sp, v, v->base, v->len);
+    if (unmap_pages && sp != NULL) {
+        for (pg = 0; pg < v->len / YOUSJ_PAGE_SIZE; pg++)
+            unmap_free_page(sp, v->base + pg * YOUSJ_PAGE_SIZE);
+    }
+    if (v->file != NULL)
+        file_put(v->file);
+    v->used = false;
+    v->file = NULL;
+}
+
+static void vmas_release_all(struct task *me, struct vmm_space *sp)
+{
+    int i;
+    for (i = 0; i < YOUSJ_MAX_VMA; i++)
+        if (me->vmas[i].used)
+            vma_release_in(sp, &me->vmas[i], false);
+}
+
 static long sys_mmap(uint64_t addr, uint64_t len, uint64_t prot,
-                     uint64_t flags, long fd)
+                     uint64_t flags, long fd, uint64_t offset)
 {
     struct task *me = sched_current();
+    struct yousj_file *file = NULL;
+    struct yousj_vma *vma = NULL;
     uint64_t base, pg, npages;
     uint32_t vflags = YOUSJ_VMM_USER;
+    bool anon = (flags & MAP_ANON_K) != 0;
+    bool shared = (flags & MAP_SHARED_K) != 0;
+    int i;
 
-    (void)addr; /* hints are ignored; MAP_FIXED is not supported */
-    (void)fd;
+    (void)addr; /* hints are ignored; MAP_FIXED is unsupported */
     if (me->mm == NULL)
-        return -YOUSJ_EINVAL;
-    if ((flags & 0x20) == 0) /* MAP_ANONYMOUS: file maps need a VFS */
-        return -YOUSJ_ENODEV;
-    if ((flags & 0x02) == 0) /* MAP_PRIVATE only (no MAP_SHARED) */
         return -YOUSJ_EINVAL;
     if (len == 0 || len > YOUSJ_MMAP_MAX_LEN)
         return -YOUSJ_EINVAL;
+    if (shared && (flags & MAP_PRIVATE_K))
+        return -YOUSJ_EINVAL;
+    if (!anon && !shared && !(flags & MAP_PRIVATE_K))
+        return -YOUSJ_EINVAL;
+    if (!anon) {
+        long acc;
+        file = fd_file_of(me, fd);
+        if (file == NULL)
+            return -YOUSJ_EBADF;
+        if (file->pipe != NULL)
+            return -YOUSJ_ENODEV;
+        if (file->backend == 0 && file->node == NULL)
+            return -YOUSJ_ENODEV; /* console */
+        if (fs_file_is_dir(file))
+            return -EACCES_K; /* directories cannot be mapped */
+        if ((offset & (YOUSJ_PAGE_SIZE - 1)) != 0)
+            return -YOUSJ_EINVAL;
+        acc = file->flags & YOUSJ_O_ACCMODE;
+        if ((prot & PROT_READ_K) && acc == YOUSJ_O_WRONLY)
+            return -EACCES_K;
+        if (shared && (prot & PROT_WRITE_K) &&
+            acc == YOUSJ_O_RDONLY)
+            return -EACCES_K;
+    }
+    for (i = 0; i < YOUSJ_MAX_VMA; i++) {
+        if (!me->vmas[i].used) {
+            vma = &me->vmas[i];
+            break;
+        }
+    }
+    if (vma == NULL)
+        return -YOUSJ_ENOMEM;
     if (prot & 0x1)
         vflags |= YOUSJ_VMM_READ;
     if (prot & 0x2)
@@ -1266,11 +1384,34 @@ static long sys_mmap(uint64_t addr, uint64_t len, uint64_t prot,
                           vflags) != 0) {
             while (pg > 0) {
                 pg--;
-                unmap_free_page(me->mm, base + pg * YOUSJ_PAGE_SIZE);
+                unmap_free_page(me->mm,
+                                base + pg * YOUSJ_PAGE_SIZE);
             }
             return -YOUSJ_ENOMEM;
         }
     }
+    if (file != NULL) {
+        /* Eager population (stage-1 model: no demand paging):
+         * copy the file's bytes into the fresh pages; anything
+         * past EOF stays zero. The mapping is a snapshot --
+         * later write()s to the file are not visible in it. */
+        file_get(file);
+        for (pg = 0; pg < npages; pg++) {
+            uint64_t phys;
+            if (vmm_translate(me->mm,
+                              base + pg * YOUSJ_PAGE_SIZE,
+                              &phys, NULL) == 0)
+                fs_pread_file(file, offset + pg * YOUSJ_PAGE_SIZE,
+                              yousj_phys_to_virt(phys),
+                              YOUSJ_PAGE_SIZE);
+        }
+    }
+    vma->base = base;
+    vma->len = npages * YOUSJ_PAGE_SIZE;
+    vma->file_off = offset;
+    vma->file = file;
+    vma->shared = shared;
+    vma->used = true;
     me->mmap_next = base + npages * YOUSJ_PAGE_SIZE + YOUSJ_PAGE_SIZE;
     return (long)base;
 }
@@ -1278,15 +1419,55 @@ static long sys_mmap(uint64_t addr, uint64_t len, uint64_t prot,
 static long sys_munmap(uint64_t addr, uint64_t len)
 {
     struct task *me = sched_current();
-    uint64_t pg, npages;
+    uint64_t end;
+    int i;
 
-    if (me->mm == NULL || len == 0 || (addr & (YOUSJ_PAGE_SIZE - 1)) != 0 ||
+    if (me->mm == NULL || len == 0 ||
+        (addr & (YOUSJ_PAGE_SIZE - 1)) != 0 ||
         !user_range_ok(addr, len))
         return -YOUSJ_EINVAL;
-    npages = (len + YOUSJ_PAGE_SIZE - 1) / YOUSJ_PAGE_SIZE;
-    for (pg = 0; pg < npages; pg++)
-        unmap_free_page(me->mm, addr + pg * YOUSJ_PAGE_SIZE);
-    return 0; /* bump pointer is not reclaimed (stage-1 note) */
+    len = (len + YOUSJ_PAGE_SIZE - 1) & ~(YOUSJ_PAGE_SIZE - 1ULL);
+    end = addr + len;
+    /* Stage-1 rule: a VMA is released whole or not at all --
+     * partial overlaps are refused rather than split. Ranges
+     * that touch no VMA (brk, ELF images) are a no-op success,
+     * as in Linux. */
+    for (i = 0; i < YOUSJ_MAX_VMA; i++) {
+        struct yousj_vma *v = &me->vmas[i];
+        if (!v->used)
+            continue;
+        if (addr < v->base + v->len && v->base < end) {
+            if (addr > v->base || end < v->base + v->len)
+                return -YOUSJ_EINVAL;
+        }
+    }
+    for (i = 0; i < YOUSJ_MAX_VMA; i++) {
+        struct yousj_vma *v = &me->vmas[i];
+        if (v->used && addr <= v->base &&
+            v->base + v->len <= end)
+            vma_release_in(me->mm, v, true);
+    }
+    return 0;
+}
+
+static long sys_msync(uint64_t addr, uint64_t len, uint64_t flags)
+{
+    struct task *me = sched_current();
+    int i;
+
+    (void)flags; /* MS_SYNC and MS_ASYNC both write back now */
+    if (me->mm == NULL ||
+        (addr & (YOUSJ_PAGE_SIZE - 1)) != 0 || len == 0)
+        return -YOUSJ_EINVAL;
+    for (i = 0; i < YOUSJ_MAX_VMA; i++) {
+        struct yousj_vma *v = &me->vmas[i];
+        if (v->used && addr >= v->base &&
+            addr < v->base + v->len) {
+            vma_writeback_range(me->mm, v, addr, len);
+            return 0;
+        }
+    }
+    return -YOUSJ_ENOMEM; /* never mapped */
 }
 
 #define ARCH_SET_FS 0x1002
@@ -1397,7 +1578,9 @@ static long dispatch_inner(struct yousj_syscall_ctx *ctx)
     case YOUSJ_SYS_dup3:
         return sys_dup3_sys((long)a1, (long)a2, (long)a3);
     case YOUSJ_SYS_mmap:
-        return sys_mmap(a1, a2, a3, a4, (long)a5);
+        return sys_mmap(a1, a2, a3, a4, (long)a5, ctx->a6);
+    case YOUSJ_SYS_msync:
+        return sys_msync(a1, a2, a3);
     case YOUSJ_SYS_munmap:
         return sys_munmap(a1, a2);
     case YOUSJ_SYS_brk:

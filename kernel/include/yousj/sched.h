@@ -68,6 +68,19 @@ struct task {
                                      (arch_prctl ARCH_SET_FS) */
     uint64_t        mmap_next;    /* user tasks: next free VA for
                                      anonymous mmap (bump pointer) */
+    /* M14: mmap regions. A file-backed VMA holds a reference
+     * on the open-file object (file_get at mmap time). Pages
+     * are populated eagerly at mmap; MAP_SHARED regions write
+     * back on msync/munmap/exec/exit. */
+#define YOUSJ_MAX_VMA 16
+    struct yousj_vma {
+        uint64_t base;
+        uint64_t len;      /* page-rounded length */
+        uint64_t file_off; /* page-aligned file offset */
+        struct yousj_file *file; /* NULL = anonymous */
+        bool     shared;
+        bool     used;
+    } vmas[YOUSJ_MAX_VMA];
     uint64_t        wake_tick;    /* nonzero while sleeping: tick at
                                      which sched_tick() wakes the
                                      task (M2). Cleared on wake. */

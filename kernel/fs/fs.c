@@ -799,6 +799,69 @@ long file_write(struct yousj_file *f, const uint8_t *src,
     return n;
 }
 
+bool fs_file_is_dir(struct yousj_file *f)
+{
+    if (f == NULL)
+        return false;
+    if (f->backend == 1)
+        return yfs_is_dir(f->yfs_ino);
+    return f->node != NULL && f->node->is_dir;
+}
+
+long fs_pread_file(struct yousj_file *f, uint64_t off,
+                   uint8_t *dst, uint64_t count)
+{
+    uint64_t done = 0;
+    if (f == NULL || f->pipe != NULL)
+        return -YOUSJ_EBADF;
+    if (f->backend == 0 && f->node == NULL)
+        return -YOUSJ_EBADF; /* the console is not mappable */
+    while (done < count) {
+        uint64_t chunk = count - done;
+        long n;
+        if (chunk > 65536)
+            chunk = 65536;
+        if (f->backend == 1)
+            n = yfs_pread(f->yfs_ino, (uint32_t)(off + done),
+                          dst + done, (uint32_t)chunk);
+        else
+            n = node_pread(f->node, (uint32_t)(off + done),
+                           dst + done, chunk);
+        if (n < 0)
+            return done > 0 ? (long)done : n;
+        if (n == 0)
+            break; /* EOF: the rest stays zero */
+        done += (uint64_t)n;
+    }
+    return (long)done;
+}
+
+long fs_pwrite_file(struct yousj_file *f, uint64_t off,
+                    const uint8_t *src, uint64_t count)
+{
+    uint64_t done = 0;
+    if (f == NULL || f->pipe != NULL)
+        return -YOUSJ_EBADF;
+    if (f->backend == 0 && f->node == NULL)
+        return -YOUSJ_EBADF;
+    while (done < count) {
+        uint64_t chunk = count - done;
+        long n;
+        if (chunk > 65536)
+            chunk = 65536;
+        if (f->backend == 1)
+            n = yfs_pwrite(f->yfs_ino, (uint32_t)(off + done),
+                           src + done, (uint32_t)chunk);
+        else
+            n = node_pwrite(f->node, (uint32_t)(off + done),
+                            src + done, chunk);
+        if (n < 0)
+            return done > 0 ? (long)done : n;
+        done += (uint64_t)n;
+    }
+    return (long)done;
+}
+
 long file_seek(struct yousj_file *f, long off, long whence)
 {
     int64_t base, np;

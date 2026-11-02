@@ -20,6 +20,7 @@
 #define YOUSJ_SYS_lseek         8
 #define YOUSJ_SYS_mmap          9
 #define YOUSJ_SYS_munmap       11
+#define YOUSJ_SYS_msync        26   /* M14 */
 #define YOUSJ_SYS_brk          12
 #define YOUSJ_SYS_rt_sigaction 13   /* M7: signal batch */
 #define YOUSJ_SYS_rt_sigprocmask 14
