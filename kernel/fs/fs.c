@@ -1111,29 +1111,111 @@ long fs_read_all_path(const char *path, uint8_t *dst, uint64_t cap)
     }
 }
 
-bool fs_path_stat(const char *path, bool *is_dir_out,
-                  uint64_t *size_out)
+/* --- M20: stat information -------------------------------- */
+
+#define S_IFREG_K 0100000u
+#define S_IFDIR_K 0040000u
+#define S_IFLNK_K 0120000u
+#define S_IFIFO_K 0010000u
+#define S_IFCHR_K 0020000u
+
+static void stat_from_ramfs_node(struct yousj_ramfs_node *n,
+                                 struct yousj_stat_info *info)
+{
+    if (n->is_link) {
+        info->mode = S_IFLNK_K | 0777u;
+        info->size = n->size;
+    } else if (n->is_dir) {
+        info->mode = S_IFDIR_K | 0755u;
+        info->size = 0;
+    } else {
+        info->mode = S_IFREG_K | 0644u;
+        info->size = n->size;
+    }
+    info->ino = (uint64_t)(n - g_nodes) + 2;
+}
+
+static bool stat_from_yfs_ino(uint32_t ino,
+                              struct yousj_stat_info *info)
+{
+    int t = yfs_type_of(ino);
+    if (t == 3) {
+        info->mode = S_IFLNK_K | 0777u;
+        info->size = yfs_size(ino);
+    } else if (t == 2) {
+        info->mode = S_IFDIR_K | 0755u;
+        info->size = 0;
+    } else if (t == 1) {
+        info->mode = S_IFREG_K | 0644u;
+        info->size = yfs_size(ino);
+    } else {
+        return false;
+    }
+    info->ino = (uint64_t)ino + 1000000u;
+    return true;
+}
+
+bool fs_path_stat2(const char *path, bool follow,
+                   struct yousj_stat_info *info)
 {
     char resolved[PATH_MAX_LEN + 1];
-    if (fs_resolve_links(path, resolved, true) != 0)
+    if (fs_resolve_links(path, resolved, follow) != 0)
         return false;
     path = resolved;
     if (is_data_path(path)) {
         long ino = yfs_lookup(data_rel(path));
         if (ino < 0)
             return false;
-        *is_dir_out = yfs_is_dir((uint32_t)ino);
-        *size_out = yfs_size((uint32_t)ino);
-        return true;
+        return stat_from_yfs_ino((uint32_t)ino, info);
     }
     {
         struct yousj_ramfs_node *n = fs_lookup(path);
         if (n == NULL)
             return false;
-        *is_dir_out = n->is_dir;
-        *size_out = n->size;
+        stat_from_ramfs_node(n, info);
         return true;
     }
+}
+
+bool fs_file_stat(struct yousj_file *f,
+                  struct yousj_stat_info *info)
+{
+    if (f == NULL)
+        return false;
+    if (f->epoll != NULL) {
+        info->mode = S_IFREG_K | 0600u;
+        info->size = 0;
+        info->ino = 0;
+        return true;
+    }
+    if (f->pipe != NULL) {
+        info->mode = S_IFIFO_K | 0644u;
+        info->size = 0;
+        info->ino = 0;
+        return true;
+    }
+    if (f->backend == 1)
+        return stat_from_yfs_ino(f->yfs_ino, info);
+    if (f->node != NULL) {
+        stat_from_ramfs_node(f->node, info);
+        return true;
+    }
+    /* the console */
+    info->mode = S_IFCHR_K | 0666u;
+    info->size = 0;
+    info->ino = 1;
+    return true;
+}
+
+bool fs_path_stat(const char *path, bool *is_dir_out,
+                  uint64_t *size_out)
+{
+    struct yousj_stat_info info;
+    if (!fs_path_stat2(path, true, &info))
+        return false;
+    *is_dir_out = (info.mode & 0170000u) == S_IFDIR_K;
+    *size_out = info.size;
+    return true;
 }
 
 int fs_mount_data(void)

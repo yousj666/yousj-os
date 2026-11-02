@@ -134,6 +134,13 @@ check('p2 rename keep->renamed',
 sess.buf = b''
 sess.run_expect('ln -s renamed.txt /data/k-link', 'sh> ')
 check('p2 rm h.txt', sess.run_expect('rm /data/h.txt', 'sh> '))
+sess.buf = b''
+ok = sess.run_expect('stattest /data/stx', 'STATTEST DONE')
+seg = sess.buf.decode(errors='replace')
+check('p2 stattest on yfs (all six, no FAIL)',
+      ok and 'stattest: link PASS' in seg and
+      'stattest: empty-path PASS' in seg and
+      'FAIL' not in seg)
 qemu.kill()  # power cut again
 qemu.wait()
 s.close()

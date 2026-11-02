@@ -159,6 +159,18 @@ long fs_pwrite_file(struct yousj_file *f, uint64_t off,
 bool fs_path_stat(const char *path, bool *is_dir_out,
                   uint64_t *size_out);
 
+/* M20: the stat family's view of a file. mode carries the
+ * full Linux type+permission bits. */
+struct yousj_stat_info {
+    uint32_t mode;
+    uint64_t size;
+    uint64_t ino;
+};
+bool fs_path_stat2(const char *path, bool follow,
+                   struct yousj_stat_info *info);
+bool fs_file_stat(struct yousj_file *f,
+                  struct yousj_stat_info *info);
+
 void file_get(struct yousj_file *f);
 void file_put(struct yousj_file *f);
 

@@ -959,6 +959,104 @@ static long sys_getcwd_sys(uint64_t buf, uint64_t size)
 static short fd_ready_file(struct yousj_file *f, long fd,
                            short events);
 
+/* --- M20: the stat family ------------------------------ */
+
+struct stat_k {
+    uint64_t dev;
+    uint64_t ino;
+    uint64_t nlink;
+    uint32_t mode;
+    uint32_t uid;
+    uint32_t gid;
+    uint32_t pad0;
+    uint64_t rdev;
+    int64_t size;
+    int64_t blksize;
+    int64_t blocks;
+    uint64_t atime, atime_nsec;
+    uint64_t mtime, mtime_nsec;
+    uint64_t ctime, ctime_nsec;
+    int64_t unused[3];
+};
+
+static long fill_stat(uint64_t stat_ptr,
+                      const struct yousj_stat_info *info)
+{
+    struct stat_k *st;
+    if (!user_range_ok(stat_ptr, sizeof(struct stat_k)))
+        return -YOUSJ_EFAULT;
+    st = (struct stat_k *)(uintptr_t)stat_ptr;
+    {
+        uint8_t *p = (uint8_t *)st;
+        uint64_t i;
+        for (i = 0; i < sizeof(*st); i++)
+            p[i] = 0;
+    }
+    st->ino = info->ino;
+    st->nlink = ((info->mode & 0170000u) == 0040000u) ? 2 : 1;
+    st->mode = info->mode;
+    st->size = (int64_t)info->size;
+    st->blksize = 4096;
+    st->blocks = (int64_t)((info->size + 511) / 512);
+    return 0;
+}
+
+static long sys_stat_path(uint64_t path_ptr, uint64_t stat_ptr,
+                          bool follow)
+{
+    struct task *me = sched_current();
+    char path_buf[256];
+    static char resolved[256];
+    struct yousj_stat_info info;
+    if (copy_user_string(path_ptr, path_buf,
+                         sizeof(path_buf)) != 0)
+        return -YOUSJ_EFAULT;
+    if (path_buf[0] == '\0')
+        return -YOUSJ_ENOENT;
+    resolve_path(me, path_buf, resolved);
+    if (!fs_path_stat2(resolved, follow, &info))
+        return -YOUSJ_ENOENT;
+    return fill_stat(stat_ptr, &info);
+}
+
+static long sys_fstat(long fd, uint64_t stat_ptr)
+{
+    struct task *me = sched_current();
+    struct yousj_file *f = fd_file_of(me, fd);
+    struct yousj_stat_info info;
+    if (f == NULL)
+        return -YOUSJ_EBADF;
+    if (!fs_file_stat(f, &info))
+        return -YOUSJ_EBADF;
+    return fill_stat(stat_ptr, &info);
+}
+
+#define AT_FDCWD_K        (-100)
+#define AT_SYMLINK_NOFOLLOW_K 0x100
+#define AT_EMPTY_PATH_K   0x1000
+
+static long sys_newfstatat(long dirfd, uint64_t path_ptr,
+                           uint64_t stat_ptr, long flags)
+{
+    if (flags & ~(AT_SYMLINK_NOFOLLOW_K | AT_EMPTY_PATH_K))
+        return -YOUSJ_EINVAL;
+    if (!user_range_ok(path_ptr, 1))
+        return -YOUSJ_EFAULT;
+    if (*(const char *)(uintptr_t)path_ptr == '\0') {
+        /* empty path: only meaningful with AT_EMPTY_PATH,
+         * where the dirfd itself is the subject */
+        if (!(flags & AT_EMPTY_PATH_K))
+            return -YOUSJ_ENOENT;
+        if (dirfd == AT_FDCWD_K)
+            return -YOUSJ_ENOENT;
+        return sys_fstat(dirfd, stat_ptr);
+    }
+    if (dirfd != AT_FDCWD_K)
+        return -YOUSJ_ENOSYS; /* no per-directory base yet */
+    return sys_stat_path(path_ptr, stat_ptr,
+                         !(flags & AT_SYMLINK_NOFOLLOW_K));
+}
+
 /* --- M18: epoll ---------------------------------------- */
 
 #define EPOLL_CLOEXEC_K 0x80000 /* == YOUSJ_O_CLOEXEC */
@@ -2134,6 +2232,14 @@ static long dispatch_inner(struct yousj_syscall_ctx *ctx)
         return sys_pselect_sys((long)a1, a2, a3, a4, a5);
     case YOUSJ_SYS_unlink:
         return sys_unlink_sys(a1);
+    case YOUSJ_SYS_stat:
+        return sys_stat_path(a1, a2, true);
+    case YOUSJ_SYS_lstat:
+        return sys_stat_path(a1, a2, false);
+    case YOUSJ_SYS_fstat:
+        return sys_fstat((long)a1, a2);
+    case YOUSJ_SYS_newfstatat:
+        return sys_newfstatat((long)a1, a2, a3, (long)a4);
     case YOUSJ_SYS_epoll_create1:
         return sys_epoll_create1((long)a1);
     case YOUSJ_SYS_epoll_ctl:

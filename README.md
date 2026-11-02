@@ -294,7 +294,23 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   跑满 3 轮后在事务中途硬杀、第五段验哨兵文件完好、
   目录可列、探针文件可建可删、100KiB 大文件仍逐字节
   校验通过；其余十二链不回归。
-- ⏳ 下一步候选：lstat、mprotect、brk 按需化。
+- ✅ 接口 M20（2026-11-02）：stat 家族补齐——此前
+  fs_path_stat 只供 execve/chdir 内部探询，用户态没有
+  任何 stat 系统调用。现新增 stat(4)、fstat(5)、
+  lstat(6)、newfstatat(262)：fs 层 fs_path_stat2 带
+  跟随开关（lstat 与 AT_SYMLINK_NOFOLLOW 名副其实地
+  返回链接自身：S_IFLNK＋目标长度为 size），fs_file_stat
+  覆盖打开文件（控制台报字符设备、管道报 FIFO、epoll
+  报普通文件）。newfstatat 支持 AT_FDCWD 与
+  AT_EMPTY_PATH；相对 dirfd 暂回 ENOSYS（如实记档）。
+  struct stat 按 x86_64 Linux 布局填写（mode/ino/size/
+  nlink/blksize/blocks，时间为零——尚无时钟来源）。
+  验收：stattest 六场景（文件 stat 与 fstat 一致、链接
+  本体与目标对照、fstatat 双向、新建/缺失/悬空链接、
+  控制台字符设备、AT_EMPTY_PATH）在 ramfs 与 yfs 两后
+  端各全过（fs 套件两轮＋disk 套件 p2），其余各链不
+  回归。
+- ⏳ 下一步候选：mprotect、brk 按需化。
 
 ## 从零构建
 

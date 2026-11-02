@@ -16,6 +16,9 @@
 #define YOUSJ_SYS_read          0
 #define YOUSJ_SYS_write         1
 #define YOUSJ_SYS_open          2
+#define YOUSJ_SYS_stat          4  /* M20 */
+#define YOUSJ_SYS_fstat         5  /* M20 */
+#define YOUSJ_SYS_lstat         6  /* M20 */
 #define YOUSJ_SYS_close         3
 #define YOUSJ_SYS_lseek         8
 #define YOUSJ_SYS_poll          7   /* M15 */
@@ -58,7 +61,8 @@
 #define YOUSJ_SYS_rmdir        84   /* M13 */
 #define YOUSJ_SYS_unlink       87   /* M13 */
 #define YOUSJ_SYS_getdents64  217
-#define YOUSJ_SYS_openat      257  /* M9 */
+#define YOUSJ_SYS_openat      257
+#define YOUSJ_SYS_newfstatat  262  /* M20 */  /* M9 */
 #define YOUSJ_SYS_unlinkat    263  /* M13 */
 #define YOUSJ_SYS_symlink      88   /* M16 */
 #define YOUSJ_SYS_readlink     89   /* M16 */

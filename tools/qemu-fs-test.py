@@ -64,6 +64,15 @@ def run_suite(tag):
     check(tag + ' fstest exited 0',
           until('sh> ', 10, mark) and 'FSTEST DONE' in seg
           and '[exit ' not in seg.rsplit('FSTEST DONE', 1)[1].split('free')[0])
+    smark = len(buf)
+    send('stattest /stx')
+    ok_sdone = until('STATTEST DONE', 60, smark)
+    check(tag + ' stattest finished', ok_sdone)
+    sseg = buf[smark:].decode(errors='replace')
+    for name in ['file', 'link', 'fstatat', 'dir-missing',
+                 'console', 'empty-path']:
+        check(tag + ' stattest ' + name,
+              ('stattest: ' + name + ' PASS') in sseg)
     fmark = len(buf)
     f = free_pages(fmark)
     check(tag + ' free read', f is not None)
