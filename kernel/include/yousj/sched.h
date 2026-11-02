@@ -68,6 +68,16 @@ struct task {
                                      (arch_prctl ARCH_SET_FS) */
     uint64_t        mmap_next;    /* user tasks: next free VA for
                                      anonymous mmap (bump pointer) */
+    /* M24: user-access fault recovery. While a syscall
+     * runs, uaccess_armed is 1 and uaccess_jb holds a
+     * setjmp landing pad in the dispatcher frame; a
+     * kernel-mode fault on a user address that demand
+     * paging cannot resolve longjmps back there and the
+     * syscall returns -EFAULT instead of halting the
+     * kernel. Reset on task creation (a copied pad points
+     * into the parent's kernel stack). */
+    uint64_t        uaccess_jb[16];
+    int             uaccess_armed;
     /* M14: mmap regions. A file-backed VMA holds a reference
      * on the open-file object (file_get at mmap time). Pages
      * are populated eagerly at mmap; MAP_SHARED regions write

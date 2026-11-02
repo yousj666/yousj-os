@@ -23,6 +23,7 @@
  *     is unchanged.
  */
 #include <yousj/types.h>
+#include <yousj/uaccess.h>
 #include <yousj/signal.h>
 #include <yousj/sched.h>
 #include <yousj/user.h>
@@ -548,7 +549,7 @@ long sys_rt_sigpending(uint64_t set_ptr, uint64_t sigsetsize)
     return 0;
 }
 
-long sys_rt_sigreturn(struct yousj_syscall_ctx *ctx)
+static long sys_rt_sigreturn_inner(struct yousj_syscall_ctx *ctx)
 {
     struct task *me = sched_current();
     uint64_t f = ctx->frame[YOUSJ_FR_RSP];
@@ -616,4 +617,24 @@ long sys_rt_sigreturn(struct yousj_syscall_ctx *ctx)
         return (long)fr->restart_nr;
     }
     return (long)mc->rax;
+}
+
+/* M24: sigreturn dereferences the user-built frame after
+ * range checks only, and it bypasses the dispatcher (and
+ * its recovery pad), so it arms its own: a frame pointer
+ * into unmapped or protected window space returns
+ * -EFAULT here instead of halting the kernel. */
+long sys_rt_sigreturn(struct yousj_syscall_ctx *ctx)
+{
+    struct task *me = sched_current();
+    volatile long rc;
+
+    if (me == NULL)
+        return sys_rt_sigreturn_inner(ctx);
+    me->uaccess_armed = 0;
+    if (UACCESS_TRY(me))
+        return -YOUSJ_EFAULT;
+    rc = sys_rt_sigreturn_inner(ctx);
+    UACCESS_END(me);
+    return rc;
 }

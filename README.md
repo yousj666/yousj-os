@@ -365,9 +365,31 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   clock id、mtime 创建即当下且写入 1.2 秒后前进）在
   ramfs 两轮、yfs（disk 套件第二段）各全过，其余
   十四链不回归。
-- ⏳ 下一步候选：copy_to_user 异常恢复（M21 记档的
-  内核直写用户内存无防护问题）、utimensat 与独立
-  atime/ctime 跟踪。
+- ✅ 健壮性 M24（2026-11-02）：copy_to_user 异常恢复
+  ——M21 记档的那颗雷拆了。此前内核对用户指针只有
+  范围检查：指向只读页或未映射窗口的出参（wait4 的
+  rusage 是实测案例）会让内核在主管态缺页、当场停机，
+  任何程序一个坏参数就能打死整机。现在任务结构里
+  挂了一块恢复垫：调度器全程布防（__builtin_setjmp
+  垫在调度帧里），缺页处理在「内核态、用户窗口地址、
+  按需分页救不了、已布防」时 __builtin_longjmp 跳回
+  垫子，系统调用干干净净返回 -EFAULT。用户态缺页不
+  走这条路，真段错误照旧 SIGSEGV；rt_sigreturn 绕过
+  调度器，它自带一块垫（帧指针同样先查范围再解引用，
+  是同类可达的停机点）。信号投递时往用户栈写帧一步
+  未纳入：栈页由 exec 预映射且不可被 mprotect/munmap
+  触及（非 VMA），构造上不可缺页。覆盖面是整个调度
+  器——所有处理函数的用户内存解引用（路径串、数据
+  缓冲、出参）一并受益，包括 wait4 的「EFAULT 不回收
+  僵尸」既有语义（写出在回收之前，跳回即保住僵尸）。
+  验收：新套件 faulttest 八场景两轮全过——rusage 指
+  只读页（M21 原案）得 EFAULT 且僵尸保留可重试、往
+  只读页 read、往未映射窗口 read/stat/nanosleep/
+  gettimeofday/子进程内野 rsp 的 sigreturn 全部
+  -EFAULT、事后系统照常工作；其余十五链不回归。
+- ⏳ 下一步候选：utimensat 与独立 atime/ctime 跟踪、
+  /proc 雏形（ps 的数据已有原生通道，可先做
+  /proc/uptime 与 /proc/meminfo）。
 
 ## 从零构建
 

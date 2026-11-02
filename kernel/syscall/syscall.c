@@ -19,6 +19,7 @@
 #include <yousj/syscall.h>
 #include <yousj/signal.h>
 #include <yousj/time.h>
+#include <yousj/uaccess.h>
 #include <yousj/fpu.h>
 #include <yousj/fs.h>
 #include <yousj/sched.h>
@@ -2284,6 +2285,17 @@ void yousj_page_fault(struct yousj_pf_info *info)
                           YOUSJ_VMM_USER) == 0)
             return;
     }
+    /* M24: a kernel-mode access to a user address that
+     * demand paging could not resolve, while the running
+     * syscall armed its recovery pad: unwind to the pad
+     * and let the syscall return -EFAULT instead of
+     * halting the machine. The ring check keeps this from
+     * ever swallowing a genuine user-mode SEGV. */
+    if ((info->cs & 3) == 0 && me != NULL && me->uaccess_armed &&
+        info->cr2 >= YOUSJ_USER_BASE && info->cr2 < YOUSJ_USER_LIMIT) {
+        me->uaccess_armed = 0;
+        __builtin_longjmp((void *)me->uaccess_jb, 1);
+    }
     if ((info->cs & 3) == 3 && me != NULL && me->mm != NULL) {
         serial_puts("\nYousj OS: task ");
         serial_puts(me->name);
@@ -2529,13 +2541,31 @@ static long dispatch_inner(struct yousj_syscall_ctx *ctx)
 
 long yousj_syscall_dispatch(struct yousj_syscall_ctx *ctx)
 {
+    struct task *me = sched_current();
+    volatile long rc;
+
     /* rt_sigreturn restores a saved ring-3 context wholesale;
      * the exit gate would only corrupt it, so it bypasses the
      * gate entirely (pending signals are picked up at the next
-     * syscall or timer return instead). */
+     * syscall or timer return instead). It arms its own
+     * recovery pad in signal.c. */
     if ((long)ctx->no == YOUSJ_SYS_rt_sigreturn)
         return sys_rt_sigreturn(ctx);
-    return signal_syscall_exit(ctx, dispatch_inner(ctx));
+    if (me == NULL)
+        return signal_syscall_exit(ctx, dispatch_inner(ctx));
+    /* M24: the whole dispatch runs under the recovery pad.
+     * Every user-memory dereference in every handler --
+     * path strings, data buffers, out-params -- turns into
+     * a plain -EFAULT when it faults unresolvably, instead
+     * of halting the kernel. A recovered return skips the
+     * signal exit gate; pending signals are picked up at
+     * the next syscall or timer return. */
+    me->uaccess_armed = 0;
+    if (UACCESS_TRY(me))
+        return -YOUSJ_EFAULT;
+    rc = dispatch_inner(ctx);
+    UACCESS_END(me);
+    return signal_syscall_exit(ctx, rc);
 }
 
 
