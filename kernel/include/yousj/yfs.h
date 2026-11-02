@@ -36,6 +36,7 @@ uint32_t yfs_disk_sectors(void);
 long yfs_lookup(const char *rel);          /* inode or -errno */
 bool yfs_is_dir(uint32_t ino);
 uint32_t yfs_size(uint32_t ino);
+uint32_t yfs_mtime(uint32_t ino); /* M23: inode rsvd[1] */
 long yfs_mknod_t(const char *parent_rel, const char *name,
                  uint8_t type);
 long yfs_mknod(const char *parent_rel, const char *name,

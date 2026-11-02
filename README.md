@@ -348,8 +348,26 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   可用/越界一字节 SEGV）两轮全过，其余十三链不回归
   （disk 套件首轮因与 UEFI 验收并行抢 CPU 出现 harness
   超时假失败，单独重跑 ALL OK）。
-- ⏳ 下一步候选：RTC 时钟（stat 时间戳与文件时间）、
-  copy_to_user 异常恢复。
+- ✅ 时间 M23（2026-11-02）：内核有了真实时钟。启动
+  时读 CMOS RTC（等 UIP 落下、双读一致才采信；按
+  Register B 解 BCD/二进制与 12/24 小时制）播种墙钟，
+  之后由 100 Hz 节拍推进（RTC 按 UTC 对待，与 QEMU
+  默认一致）。新系统调用：time(201)、
+  gettimeofday(96)、clock_gettime(228；REALTIME 墙钟、
+  MONOTONIC 开机节拍、其他 clock id 回 EINVAL)。
+  stat 的时间戳不再恒为零：fs 层只跟踪一个 mtime
+  （atime/ctime 暂同值）——ramfs 节点带内存字段，创建/
+  写入/截断时打戳；yfs 把 mtime 存进 inode 一直闲置
+  的 rsvd[1] 字段（借位不改格式：pwrite/截断/建 inode
+  时打戳，随 inode 落盘、断电不丢）。验收：新套件
+  timetest 六场景（epoch 与宿主机实测相差 3 秒内、
+  time 指针式、gettimeofday 一致性、双时钟语义+坏
+  clock id、mtime 创建即当下且写入 1.2 秒后前进）在
+  ramfs 两轮、yfs（disk 套件第二段）各全过，其余
+  十四链不回归。
+- ⏳ 下一步候选：copy_to_user 异常恢复（M21 记档的
+  内核直写用户内存无防护问题）、utimensat 与独立
+  atime/ctime 跟踪。
 
 ## 从零构建
 

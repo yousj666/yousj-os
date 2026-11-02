@@ -6,6 +6,7 @@
  * The bootloader hands us struct yousj_boot_info* in RDI (see boot.h).
  */
 #include <yousj/types.h>
+#include <yousj/time.h>
 #include <yousj/boot.h>
 #include <yousj/pmm.h>
 #include <yousj/vmm.h>
@@ -362,6 +363,10 @@ void kmain(struct yousj_boot_info *boot_info)
     }
 
     serial_puts("Yousj OS: boot_info OK, memory map received\n");
+
+    /* M23: seed the wall clock from the CMOS RTC before
+     * anything can ask for a timestamp. */
+    time_init();
 
     /* Stage 1, step 1 (done 2026-11-01): physical page allocator. */
     pmm_init(boot_info);

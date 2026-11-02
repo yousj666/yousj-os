@@ -165,6 +165,7 @@ struct yousj_stat_info {
     uint32_t mode;
     uint64_t size;
     uint64_t ino;
+    uint64_t mtime; /* M23: seconds since the epoch */
 };
 bool fs_path_stat2(const char *path, bool follow,
                    struct yousj_stat_info *info);

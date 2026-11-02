@@ -70,6 +70,9 @@
 #define YOUSJ_SYS_symlinkat   266   /* M16 */
 #define YOUSJ_SYS_dup3        292  /* M10 */
 #define YOUSJ_SYS_pipe2       293  /* M10 */
+#define YOUSJ_SYS_time        201  /* M23 */
+#define YOUSJ_SYS_gettimeofday 96  /* M23 */
+#define YOUSJ_SYS_clock_gettime 228 /* M23 */
 #define YOUSJ_SYS_arch_prctl  158
 #define YOUSJ_SYS_rt_sigpending 127 /* M7 */
 #define YOUSJ_SYS_sigaltstack  131  /* M7: -ENOSYS for now */

@@ -141,6 +141,13 @@ check('p2 stattest on yfs (all six, no FAIL)',
       ok and 'stattest: link PASS' in seg and
       'stattest: empty-path PASS' in seg and
       'FAIL' not in seg)
+sess.buf = b''
+ok = sess.run_expect('timetest /data/tt-file', 'TIMETEST DONE', 60)
+seg = sess.buf.decode(errors='replace')
+check('p2 timetest on yfs (all six, no FAIL)',
+      ok and 'timetest: mtime PASS' in seg and
+      'timetest: clocks PASS' in seg and
+      'FAIL' not in seg)
 qemu.kill()  # power cut again
 qemu.wait()
 s.close()

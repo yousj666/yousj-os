@@ -10,6 +10,7 @@
  */
 #include <yousj/types.h>
 #include <yousj/fs.h>
+#include <yousj/time.h>
 #include <yousj/yfs.h>
 #include <yousj/pmm.h>
 #include <yousj/vmm.h> /* errno magnitudes + phys_to_virt */
@@ -83,6 +84,7 @@ struct yousj_ramfs_node {
     struct yousj_ramfs_node *child_head;
     struct yousj_ramfs_node *sibling;
     uint32_t size;                      /* regular files */
+    uint32_t mtime;                     /* M23: epoch seconds */
     uint32_t pages[MAX_FILE_PAGES];     /* phys frames, 0 = hole */
     uint16_t open_refs;                 /* M13: live file objects */
     bool unlinked;                      /* M13: name removed; the
@@ -165,6 +167,7 @@ static struct yousj_ramfs_node *node_create(
     mem_copy((uint8_t *)n->name, (const uint8_t *)name, len);
     n->name[len] = '\0';
     n->is_dir = is_dir;
+    n->mtime = (uint32_t)yousj_now_unix();
     n->parent = parent;
     n->sibling = parent->child_head;
     parent->child_head = n;
@@ -313,6 +316,7 @@ static long node_pwrite(struct yousj_ramfs_node *n, uint64_t off,
     }
     if (done > 0 && off + done > n->size)
         n->size = (uint32_t)(off + done);
+        n->mtime = (uint32_t)yousj_now_unix();
     return (long)done;
 }
 
@@ -326,6 +330,7 @@ static void node_truncate(struct yousj_ramfs_node *n)
         }
     }
     n->size = 0;
+    n->mtime = (uint32_t)yousj_now_unix();
 }
 
 /* --- M13: detach / deferred free -------------------------------- */
@@ -1122,6 +1127,7 @@ long fs_read_all_path(const char *path, uint8_t *dst, uint64_t cap)
 static void stat_from_ramfs_node(struct yousj_ramfs_node *n,
                                  struct yousj_stat_info *info)
 {
+    info->mtime = n->mtime;
     if (n->is_link) {
         info->mode = S_IFLNK_K | 0777u;
         info->size = n->size;
@@ -1139,6 +1145,7 @@ static bool stat_from_yfs_ino(uint32_t ino,
                               struct yousj_stat_info *info)
 {
     int t = yfs_type_of(ino);
+    info->mtime = yfs_mtime(ino);
     if (t == 3) {
         info->mode = S_IFLNK_K | 0777u;
         info->size = yfs_size(ino);
@@ -1184,12 +1191,14 @@ bool fs_file_stat(struct yousj_file *f,
         return false;
     if (f->epoll != NULL) {
         info->mode = S_IFREG_K | 0600u;
+        info->mtime = 0;
         info->size = 0;
         info->ino = 0;
         return true;
     }
     if (f->pipe != NULL) {
         info->mode = S_IFIFO_K | 0644u;
+        info->mtime = 0;
         info->size = 0;
         info->ino = 0;
         return true;
@@ -1202,6 +1211,7 @@ bool fs_file_stat(struct yousj_file *f,
     }
     /* the console */
     info->mode = S_IFCHR_K | 0666u;
+    info->mtime = 0;
     info->size = 0;
     info->ino = 1;
     return true;

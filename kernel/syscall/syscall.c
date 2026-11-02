@@ -18,6 +18,7 @@
 #include <yousj/types.h>
 #include <yousj/syscall.h>
 #include <yousj/signal.h>
+#include <yousj/time.h>
 #include <yousj/fpu.h>
 #include <yousj/fs.h>
 #include <yousj/sched.h>
@@ -1005,6 +1006,11 @@ static long fill_stat(uint64_t stat_ptr,
     st->size = (int64_t)info->size;
     st->blksize = 4096;
     st->blocks = (int64_t)((info->size + 511) / 512);
+    /* M23: one tracked timestamp serves atime/mtime/ctime
+     * (no separate bookkeeping for the three yet). */
+    st->atime = (int64_t)info->mtime;
+    st->mtime = (int64_t)info->mtime;
+    st->ctime = (int64_t)info->mtime;
     return 0;
 }
 
@@ -1040,6 +1046,14 @@ static long sys_fstat(long fd, uint64_t stat_ptr)
 
 #define AT_FDCWD_K        (-100)
 #define AT_SYMLINK_NOFOLLOW_K 0x100
+struct timeval_k {
+    int64_t sec;
+    int64_t usec;
+};
+struct timespec_k {
+    int64_t sec;
+    int64_t nsec;
+};
 #define AT_EMPTY_PATH_K   0x1000
 
 static long sys_newfstatat(long dirfd, uint64_t path_ptr,
@@ -2436,6 +2450,46 @@ static long dispatch_inner(struct yousj_syscall_ctx *ctx)
         return sys_munmap(a1, a2);
     case YOUSJ_SYS_brk:
         return sys_brk(a1);
+    case YOUSJ_SYS_time: {
+        uint64_t now = yousj_now_unix();
+        if (a1 != 0) {
+            if (!user_range_ok(a1, 8))
+                return -YOUSJ_EFAULT;
+            *(uint64_t *)(uintptr_t)a1 = now;
+        }
+        return (long)now;
+    }
+    case YOUSJ_SYS_gettimeofday: {
+        uint64_t sec, nsec;
+        struct timeval_k *tv;
+        if (a1 == 0)
+            return 0;
+        if (!user_range_ok(a1, sizeof(*tv)))
+            return -YOUSJ_EFAULT;
+        yousj_now_timespec(&sec, &nsec);
+        tv = (struct timeval_k *)(uintptr_t)a1;
+        tv->sec = (int64_t)sec;
+        tv->usec = (int64_t)(nsec / 1000);
+        return 0;
+    }
+    case YOUSJ_SYS_clock_gettime: {
+        uint64_t sec, nsec;
+        struct timespec_k *ts;
+        if (a2 == 0)
+            return -YOUSJ_EFAULT;
+        if (!user_range_ok(a2, sizeof(*ts)))
+            return -YOUSJ_EFAULT;
+        if (a1 == 0) /* CLOCK_REALTIME */
+            yousj_now_timespec(&sec, &nsec);
+        else if (a1 == 1) /* CLOCK_MONOTONIC */
+            yousj_mono_timespec(&sec, &nsec);
+        else
+            return -YOUSJ_EINVAL;
+        ts = (struct timespec_k *)(uintptr_t)a2;
+        ts->sec = (int64_t)sec;
+        ts->nsec = (int64_t)nsec;
+        return 0;
+    }
     case YOUSJ_SYS_arch_prctl:
         return sys_arch_prctl((long)a1, a2);
     case YOUSJ_SYS_nanosleep:

@@ -6,6 +6,7 @@
  * milestone. All buffers are static for the same reason.
  */
 #include <yousj/yfs.h>
+#include <yousj/time.h>
 #include <yousj/ata.h>
 
 #define E_NOENT_L   2
@@ -141,6 +142,8 @@ static int txn_find(uint32_t lba)
             return i;
     return -1;
 }
+
+static void stamp_mtime(struct yfs_inode *n); /* M23, below */
 
 static int yfs_rd(uint32_t lba, uint32_t count, void *buf)
 {
@@ -535,6 +538,7 @@ long yfs_pwrite(uint32_t ino, uint32_t off, const void *src,
         if (off + done > n.size)
             n.size = off + done;
     }
+    stamp_mtime(&n);
     if (inode_write(ino, &n) != 0)
         return -E_IO_L;
     return (long)done;
@@ -579,6 +583,7 @@ static int yfs_truncate_impl(uint32_t ino, uint32_t size)
         return -E_IO_L;
     if (size > n.size) { /* only shrinking is supported */
         n.size = size;
+        stamp_mtime(&n);
         return inode_write(ino, &n);
     }
     keep = (size + BLOCK_SIZE - 1) / BLOCK_SIZE;
@@ -598,6 +603,7 @@ static int yfs_truncate_impl(uint32_t ino, uint32_t size)
         n.blocks[DIRECT] = UNALLOC;
     }
     n.size = size;
+    stamp_mtime(&n);
     return inode_write(ino, &n);
 }
 
@@ -680,6 +686,23 @@ uint32_t yfs_size(uint32_t ino)
         return 0;
     return n.size;
 }
+
+/* M23: the modification time lives in inode rsvd[1] --
+ * a field the format always carried but never used, so
+ * no format version bump is needed. */
+uint32_t yfs_mtime(uint32_t ino)
+{
+    struct yfs_inode n;
+    if (inode_read(ino, &n) != 0)
+        return 0;
+    return n.rsvd[1];
+}
+
+static void stamp_mtime(struct yfs_inode *n)
+{
+    n->rsvd[1] = (uint32_t)yousj_now_unix();
+}
+
 
 /* Write bytes into a directory's own content (yfs_pwrite
  * refuses directories by design). Direct blocks only: a
@@ -996,6 +1019,7 @@ static long yfs_mknod_t_impl(const char *parent_rel,
     fresh.size = 0;
     for (i = 0; i < 12; i++)
         fresh.blocks[i] = UNALLOC; /* all slots incl. indirect */
+    stamp_mtime(&fresh);
     if (inode_write(free_ino, &fresh) != 0)
         return -E_IO_L;
     if (dir_link((uint32_t)pino, name, free_ino) != 0)
