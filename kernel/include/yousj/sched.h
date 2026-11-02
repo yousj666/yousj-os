@@ -20,6 +20,7 @@
 #define YOUSJ_SCHED_H
 
 #include <yousj/types.h>
+#include <yousj/signal.h> /* per-task signal state (M7) */
 
 struct vmm_space; /* from <yousj/vmm.h>; tasks only hold the pointer */
 
@@ -77,7 +78,12 @@ struct task {
      * resumes with (rax is forced to 0 by the landing). Field
      * order is the user_frame_resume() ABI in syscall_entry.S:
      * rdi, rsi, rdx, rcx (user RIP), r10, r8, r9, r11 (user
-     * RFLAGS), rsp. */
+     * RFLAGS), rsp, then (M7) the callee-saved set rbx, rbp,
+     * r12-r15. The callee-saved fields were an M5 gap -- the
+     * snapshot originally read only the entry frame, so a child
+     * that kept executing (instead of exec'ing at once, the only
+     * M5-tested path) resumed with garbage in the registers its
+     * compiled code keeps locals in. */
     uint64_t        resume_rdi;
     uint64_t        resume_rsi;
     uint64_t        resume_rdx;
@@ -87,10 +93,42 @@ struct task {
     uint64_t        resume_r9;
     uint64_t        resume_r11;
     uint64_t        resume_rsp;
+    uint64_t        resume_rbx;
+    uint64_t        resume_rbp;
+    uint64_t        resume_r12;
+    uint64_t        resume_r13;
+    uint64_t        resume_r14;
+    uint64_t        resume_r15;
     bool            has_resume;
     bool            mm_owned;     /* mm points at a pool space from
                                      vmm_space_alloc(): the exit
                                      path destroys it (M5). */
+    /* M7 signal state (see <yousj/signal.h>). Meaningful only
+     * for user tasks (mm != NULL); kernel threads never pass a
+     * delivery gate, so their bits simply never move. */
+    uint64_t        sig_pending;  /* queued signals, bit (sig-1) */
+    uint64_t        sig_blocked;  /* blocked mask, same encoding */
+    struct yousj_sigaction sig_act[YOUSJ_NSIG]; /* dispositions */
+    int             sig_killed;   /* when a signal ended this
+                                     task: its number, else 0;
+                                     wait4 builds the status
+                                     word from it (M7) */
+    int32_t         sig_sender[YOUSJ_NSIG]; /* last sender tid per
+                                     signal (siginfo si_pid) */
+    int32_t         sig_chld_status; /* wait-status word of the
+                                     most recent child event, for
+                                     SIGCHLD's si_status */
+    bool            sig_stopped;  /* a stop disposition is in
+                                     effect (ps shows 'T') */
+    bool            sig_parked;   /* the stop took the task off
+                                     the run queue (or blocked it
+                                     at a delivery gate); only
+                                     SIGCONT releases it */
+    bool            sig_wake;     /* the current block was cut
+                                     short by signal_send(), so
+                                     the interrupted syscall can
+                                     tell a signal wake from a
+                                     normal completion */
     bool            in_use;
 };
 
@@ -192,5 +230,23 @@ uint64_t sched_uptime_ticks(void);
  * side will build on this. Sleeping in the idle task is a no-op
  * yield -- idle must always stay able to run the fallback loop. */
 void sched_sleep_ticks(uint64_t ticks);
+
+/* M7 stop/continue mechanics (driven by signal.c):
+ * sched_park_task() applies a stop to a READY task (off the run
+ * queue, parked) or merely flags a BLOCKED/RUNNING one (the flag
+ * takes effect at its next delivery gate). sched_cont_task()
+ * clears the stop and releases a parked task. sched_self_park()
+ * stops the CURRENT task at a delivery gate and returns only
+ * after a SIGCONT released it. */
+void sched_park_task(struct task *t);
+void sched_cont_task(struct task *t);
+void sched_self_park(void);
+
+/* Signal-aware sleep for nanosleep: like sched_sleep_ticks(),
+ * but returns 1 when signal_send() cut the sleep short (the
+ * sig_wake flag is consumed) and 0 when the full time elapsed --
+ * including when the sleep was entered with a signal already
+ * pending-woken. */
+int sched_sleep_ticks_sig(uint64_t ticks);
 
 #endif /* YOUSJ_SCHED_H */

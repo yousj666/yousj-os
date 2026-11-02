@@ -21,6 +21,9 @@
 #define YOUSJ_SYS_mmap          9
 #define YOUSJ_SYS_munmap       11
 #define YOUSJ_SYS_brk          12
+#define YOUSJ_SYS_rt_sigaction 13   /* M7: signal batch */
+#define YOUSJ_SYS_rt_sigprocmask 14
+#define YOUSJ_SYS_rt_sigreturn 15
 #define YOUSJ_SYS_ioctl        16
 #define YOUSJ_SYS_pipe         22
 #define YOUSJ_SYS_dup          32
@@ -43,13 +46,16 @@
 #define YOUSJ_SYS_mkdir        83
 #define YOUSJ_SYS_getdents64  217
 #define YOUSJ_SYS_arch_prctl  158
+#define YOUSJ_SYS_rt_sigpending 127 /* M7 */
+#define YOUSJ_SYS_sigaltstack  131  /* M7: -ENOSYS for now */
 
 /* Yousj-native calls live far above the Linux-compatible range so the
  * two namespaces can never collide. */
 #define YOUSJ_SYS_NATIVE_BASE 0x1000
 
 /* ps_snapshot(buf, len) -> bytes written: one "<tid> <state> <name>"
- * line per task (state: R running, r ready, S sleeping, Z zombie).
+ * line per task (state: R running, r ready, S sleeping, Z zombie,
+ * T stopped by a signal -- M7).
  * Linux has no such syscall (the information lives in /proc there);
  * until Yousj has a VFS, this native call is how init's `ps`
  * built-in sees the task table. Deliberately text, deliberately

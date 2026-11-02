@@ -46,6 +46,26 @@ exc_hang:
 
     .globl irq0_stub
 irq0_stub:
+    /* GS discipline (M7): the syscall path's swapgs pairing only
+     * stays sound if EVERY kernel context runs with the kernel
+     * GS base. A ring-3 frame arrives with the user's base (0),
+     * and sched_tick() may switch straight from here to a task
+     * that is blocked inside a syscall -- that task's exit path
+     * dereferences %gs and would fault on the stranded user
+     * base (this exact crash, a #PF on `mov %r11,%gs:8`, is
+     * what M7's spinning-child scenario first produced). So:
+     * swap on the way in when the interrupted frame is ring 3,
+     * swap back before iretq to ring 3; ring-0 frames never
+     * swap. The decision reads the interrupted CS's RPL bits
+     * (hardware frame: [rsp]=RIP, [rsp+8]=CS at entry; the same
+     * test after the pops sees the canonicalized CS, whose RPL
+     * the canonicalization never changes). If the task blocks
+     * or exits inside this frame, the swap stays outstanding on
+     * its own stack -- balanced when (if) it resumes here. */
+    testb $3, 8(%rsp)
+    jz 9f
+    swapgs
+9:
     push %rax
     push %rcx
     push %rdx
@@ -92,6 +112,36 @@ irq0_stub:
     movq $0x08, 80(%rsp)
     movq $0x10, 104(%rsp)
 2:
+    /* Signal delivery gate (M7): hand signal_irq_check() the
+     * interrupted context. The callee-saved registers were never
+     * saved by this stub (the C handler chain preserves them,
+     * so they still hold the interrupted values); push them now
+     * -- 48 bytes, a multiple of 16, so the C call alignment is
+     * the same as at the irq0_handler call above. Pieces:
+     *   rdi = the 9 saved registers ([0]=r11 ... [8]=rax)
+     *   rsi = the hardware frame (rip, cs, rflags, rsp, ss)
+     *   rdx = the 6 pushes just made ([0]=r15 ... [40]=rbx )
+     * signal_irq_check() itself decides whether the frame is a
+     * ring-3 frame of a user task with anything to deliver; in
+     * the common case it returns immediately. It may rewrite
+     * the frame to enter a signal handler, block the task
+     * (stop), or exit it (fatal signal). */
+    push %rbx
+    push %rbp
+    push %r12
+    push %r13
+    push %r14
+    push %r15
+    lea 48(%rsp), %rdi
+    lea 120(%rsp), %rsi
+    mov %rsp, %rdx
+    call signal_irq_check
+    pop %r15
+    pop %r14
+    pop %r13
+    pop %r12
+    pop %rbp
+    pop %rbx
     pop %r11
     pop %r10
     pop %r9
@@ -101,6 +151,10 @@ irq0_stub:
     pop %rdx
     pop %rcx
     pop %rax
+    testb $3, 8(%rsp)       /* returning to ring 3: swap back */
+    jz 9f
+    swapgs
+9:
     iretq
 
     .section .rodata

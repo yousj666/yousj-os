@@ -17,6 +17,7 @@
  */
 #include <yousj/types.h>
 #include <yousj/syscall.h>
+#include <yousj/signal.h>
 #include <yousj/sched.h>
 #include <yousj/user.h>
 #include <yousj/gdt.h>
@@ -123,6 +124,9 @@ void syscall_init(void)
 #define YOUSJ_ENODEV 19
 #define YOUSJ_EINVAL 22
 #define YOUSJ_ENOSYS 38
+#define YOUSJ_ERESTARTSYS 512 /* internal: interrupted blocking call;
+                                 converted by the signal gate, never
+                                 a user-visible return (signal.c) */
 
 /* The one user-pointer rule (SYSCALL_DESIGN 4.3): the whole range
  * must lie in the sanctioned window. */
@@ -133,6 +137,11 @@ static int user_range_ok(uint64_t ptr, uint64_t len)
     if (len > YOUSJ_USER_LIMIT - ptr)
         return 0;
     return 1;
+}
+
+int yousj_user_range_ok(uint64_t ptr, uint64_t len)
+{
+    return user_range_ok(ptr, len);
 }
 
 static void mem_fill(void *dst, uint8_t v, uint64_t n)
@@ -185,7 +194,11 @@ static long sys_write(long fd, uint64_t buf, uint64_t len)
     return (long)len;
 }
 
-static void sys_exit_common(long status)
+/* The one process-exit path: exit/exit_group arrive with
+ * sig == 0 and a status; fatal signal delivery (signal.c) with
+ * sig != 0. Records how the task died for wait4, tears the
+ * address space down, and never returns. */
+void process_exit(long status, int sig)
 {
     struct task *me = sched_current();
 
@@ -193,12 +206,21 @@ static void sys_exit_common(long status)
         /* Linux: "Attempted to kill init". Stage 1 has no way to
          * recover the console once init is gone, so this is a
          * panic, exactly as the design prescribes. */
-        serial_puts("\nYousj OS: PANIC: Attempted to kill init (exit ");
-        serial_put_u64((uint64_t)status);
-        serial_puts("), halting\n");
+        if (sig != 0) {
+            serial_puts("\nYousj OS: PANIC: Attempted to kill init "
+                        "(signal ");
+            serial_put_u64((uint64_t)sig);
+            serial_puts("), halting\n");
+        } else {
+            serial_puts("\nYousj OS: PANIC: Attempted to kill init "
+                        "(exit ");
+            serial_put_u64((uint64_t)status);
+            serial_puts("), halting\n");
+        }
         for (;;)
             __asm__ volatile("cli; hlt");
     }
+    me->sig_killed = sig;
 
     /* Process teardown (SCHED_DESIGN 6.1): an owned address
      * space is destroyed here, while this task is still the one
@@ -225,7 +247,22 @@ static void sys_exit_common(long status)
     if (g_init_task != NULL)
         sched_adopt_children(me->tid, g_init_task->tid);
 
-    sched_exit_current((int)status);
+    /* SIGCHLD to the parent (M7), carrying the same status word
+     * wait4 will report. It is queued before the zombie transition
+     * below; sched_exit_current() additionally wakes a parent
+     * blocked in wait4 on us, so the notification cannot be lost
+     * even when the parent has no SIGCHLD handler. */
+    {
+        struct task *parent = sched_find_task((int)me->parent_tid);
+        if (parent != NULL && parent->mm != NULL) {
+            parent->sig_chld_status = sig != 0
+                ? (sig | (signal_is_core(sig) ? 0x80 : 0))
+                : (int)(status << 8);
+            (void)signal_send(parent, YOUSJ_SIGCHLD, (int)me->tid);
+        }
+    }
+
+    sched_exit_current(sig != 0 ? 0 : (int)status);
 }
 
 /* --- batch 2: the process family (M5) ----------------------------------- */
@@ -247,7 +284,13 @@ static long sys_wait4(long pid, uint64_t status_ptr, long options,
         struct task *z = sched_find_zombie_child(me->tid, (int)pid);
 
         if (z != NULL) {
-            int raw = z->exit_status;
+            /* Status word (Linux layout): exit code in the high
+             * byte for exit(); the signal number in the low 7
+             * bits (plus the 0x80 core bit) for a signal death. */
+            int word = z->sig_killed != 0
+                ? (z->sig_killed |
+                   (signal_is_core(z->sig_killed) ? 0x80 : 0))
+                : (z->exit_status << 8);
             uint64_t ztid = z->tid;
 
             /* Validate and fill the outputs BEFORE reaping: on
@@ -255,7 +298,7 @@ static long sys_wait4(long pid, uint64_t status_ptr, long options,
             if (status_ptr != 0) {
                 if (!user_range_ok(status_ptr, 4))
                     return -YOUSJ_EFAULT;
-                *(int *)(uintptr_t)status_ptr = raw << 8;
+                *(int *)(uintptr_t)status_ptr = word;
             }
             if (rusage_ptr != 0) {
                 uint64_t i;
@@ -271,6 +314,14 @@ static long sys_wait4(long pid, uint64_t status_ptr, long options,
             return -YOUSJ_ECHILD;
         if (options & YOUSJ_WNOHANG)
             return 0;
+        /* A signal wake is honoured only after the zombie scan
+         * above had its chance (a child that exited is reported
+         * first, exactly like Linux). */
+        if (me->sig_wake) {
+            me->sig_wake = false;
+            if (signal_deliverable_pending(me))
+                return -YOUSJ_ERESTARTSYS;
+        }
         /* Sleep until a matching child exits: sched_exit_current
          * wakes us through wait_target. */
         me->wait_target = pid;
@@ -301,7 +352,8 @@ static void clone_child_start(void *arg)
     }
 }
 
-static long sys_clone(long flags, uint64_t child_stack)
+static long sys_clone(struct yousj_syscall_ctx *ctx, long flags,
+                      uint64_t child_stack)
 {
     struct task *me = sched_current();
     const uint64_t *frame;
@@ -316,7 +368,7 @@ static long sys_clone(long flags, uint64_t child_stack)
     if ((flags & ~0xFFL) != 0 ||
         ((flags & 0xFF) != 0 && (flags & 0xFF) != YOUSJ_SIGCHLD))
         return -YOUSJ_EINVAL;
-    frame = (const uint64_t *)(uintptr_t)g_cpu_local.syscall_frame;
+    frame = ctx->frame;
     if (frame == NULL)
         return -YOUSJ_EINVAL;
 
@@ -355,7 +407,17 @@ static long sys_clone(long flags, uint64_t child_stack)
         child->resume_rcx = frame[56 / 8];
         child->resume_r11 = frame[64 / 8];
         child->resume_rsp = g_cpu_local.user_rsp_save;
+        /* Callee-saved set, captured by the entry shim (M7):
+         * without it the child resumes with garbage in exactly
+         * the registers compiled code keeps its locals in. */
+        child->resume_rbx = ctx->callee[0];
+        child->resume_rbp = ctx->callee[1];
+        child->resume_r12 = ctx->callee[2];
+        child->resume_r13 = ctx->callee[3];
+        child->resume_r14 = ctx->callee[4];
+        child->resume_r15 = ctx->callee[5];
         child->has_resume = true;
+        signal_clone_inherit(child, me);
     }
     __asm__ volatile("push %0; popfq" : : "r"(flags_saved) : "memory");
 
@@ -380,6 +442,8 @@ extern const uint8_t _binary_hello_elf_start[];
 extern const uint8_t _binary_hello_elf_end[];
 extern const uint8_t _binary_sh_elf_start[];
 extern const uint8_t _binary_sh_elf_end[];
+extern const uint8_t _binary_sigtest_elf_start[];
+extern const uint8_t _binary_sigtest_elf_end[];
 
 struct exec_image {
     const char   *path;
@@ -391,6 +455,7 @@ static const struct exec_image g_exec_images[] = {
     { "/init",      _binary_yousj_init_elf_start, _binary_yousj_init_elf_end },
     { "/bin/hello", _binary_hello_elf_start,      _binary_hello_elf_end },
     { "/bin/sh",    _binary_sh_elf_start,         _binary_sh_elf_end },
+    { "/bin/sigtest", _binary_sigtest_elf_start,  _binary_sigtest_elf_end },
 };
 
 static int kstreq(const char *a, const char *b)
@@ -511,6 +576,7 @@ static long sys_execve(uint64_t path_ptr, uint64_t argv_ptr,
     old = me->mm;
     me->mm = space;
     me->mm_owned = true;
+    signal_exec_reset(me);
     me->brk_start = heap_base;
     me->brk_end = heap_base;
     me->mmap_next = YOUSJ_MMAP_BASE;
@@ -571,6 +637,13 @@ static long sys_read(long fd, uint64_t buf, uint64_t count)
             break;
         }
         sched_sleep_ticks(2);
+        /* M7: a deliverable signal interrupts the wait; the
+         * dispatcher-side gate turns this into -EINTR or a
+         * restart, per the handler's SA_RESTART. */
+        if (signal_deliverable_pending(sched_current())) {
+            sched_current()->sig_wake = false;
+            return -YOUSJ_ERESTARTSYS;
+        }
     }
     while (got < count) {
         int c = serial_getc_nonblock();
@@ -594,9 +667,22 @@ static long sys_nanosleep(uint64_t req_ptr)
     /* 100 Hz tick = 10 ms; round the sub-second part up so a
      * sleep never returns early. */
     ticks = ts[0] * 100 + (ts[1] + 9999999ULL) / 10000000ULL;
-    if (ticks > 0)
-        sched_sleep_ticks(ticks);
-    return 0; /* no signals exist yet, so no -EINTR path */
+    if (ticks > 0) {
+        /* Sleep against an absolute deadline so a signal wake
+         * can be told apart from elapsed time, and a spurious
+         * early wake simply re-enters the remaining sleep. */
+        uint64_t deadline = sched_uptime_ticks() + ticks;
+        for (;;) {
+            uint64_t now = sched_uptime_ticks();
+            int woken;
+            if (now >= deadline)
+                break;
+            woken = sched_sleep_ticks_sig(deadline - now);
+            if (woken && signal_deliverable_pending(sched_current()))
+                return -YOUSJ_ERESTARTSYS;
+        }
+    }
+    return 0;
 }
 
 static void uts_copy_field(char *dst, const char *src)
@@ -738,17 +824,24 @@ static long sys_kill(long pid, long sig)
 {
     struct task *victim;
 
-    if (sig < 0 || sig > 64)
+    if (sig < 0 || sig >= YOUSJ_NSIG)
         return -YOUSJ_EINVAL;
     victim = sched_find_task((int)pid);
-    if (victim == NULL)
+    if (victim == NULL || victim->state == TASK_ZOMBIE)
         return -YOUSJ_ESRCH;
-    /* Stage-1 semantics (sched_kill_task): only READY/BLOCKED
-     * tasks can be retired, and retirement is total. Real signal
-     * delivery arrives with the process family in M5. */
-    if (sched_kill_task(victim) != 0)
-        return -YOUSJ_EPERM;
-    return 0;
+    if (sig == 0)
+        return 0; /* existence check only (Linux) */
+    /* Kernel threads have no signal gates, so for them kill
+     * keeps its stage-1 meaning (sched_kill_task: total,
+     * immediate retirement) for any signal. User tasks get real
+     * queued delivery (M7). */
+    if (victim->mm == NULL) {
+        if (sched_kill_task(victim) != 0)
+            return -YOUSJ_EPERM;
+        return 0;
+    }
+    return signal_send(victim, (int)sig,
+                       (int)sched_current()->tid);
 }
 
 static long sys_ps_snapshot(uint64_t buf, uint64_t len)
@@ -762,51 +855,72 @@ static long sys_ps_snapshot(uint64_t buf, uint64_t len)
 
 /* --- dispatcher --------------------------------------------------------- */
 
-long yousj_syscall_dispatch(long no, long a1, long a2, long a3,
-                            long a4, long a5, long a6)
+/* The switch itself. Arguments arrive via the entry shim's
+ * context (syscall_entry.S); results flow back through
+ * yousj_syscall_dispatch(), which adds the signal exit gate. */
+static long dispatch_inner(struct yousj_syscall_ctx *ctx)
 {
+    long no = (long)ctx->no;
+    uint64_t a1 = ctx->a1, a2 = ctx->a2, a3 = ctx->a3;
+    uint64_t a4 = ctx->a4, a5 = ctx->a5;
+
     switch (no) {
     case YOUSJ_SYS_read:
-        return sys_read(a1, (uint64_t)a2, (uint64_t)a3);
+        return sys_read((long)a1, a2, a3);
     case YOUSJ_SYS_write:
-        return sys_write(a1, (uint64_t)a2, (uint64_t)a3);
+        return sys_write((long)a1, a2, a3);
     case YOUSJ_SYS_mmap:
-        return sys_mmap((uint64_t)a1, (uint64_t)a2, (uint64_t)a3,
-                        (uint64_t)a4, a5);
+        return sys_mmap(a1, a2, a3, a4, (long)a5);
     case YOUSJ_SYS_munmap:
-        return sys_munmap((uint64_t)a1, (uint64_t)a2);
+        return sys_munmap(a1, a2);
     case YOUSJ_SYS_brk:
-        return sys_brk((uint64_t)a1);
+        return sys_brk(a1);
     case YOUSJ_SYS_arch_prctl:
-        return sys_arch_prctl(a1, (uint64_t)a2);
+        return sys_arch_prctl((long)a1, a2);
     case YOUSJ_SYS_nanosleep:
-        return sys_nanosleep((uint64_t)a1);
+        return sys_nanosleep(a1);
     case YOUSJ_SYS_getpid:
         return (long)sched_current()->tid;
     case YOUSJ_SYS_kill:
-        return sys_kill(a1, a2);
+        return sys_kill((long)a1, (long)a2);
     case YOUSJ_SYS_uname:
-        return sys_uname((uint64_t)a1);
+        return sys_uname(a1);
     case YOUSJ_SYS_wait4:
-        return sys_wait4(a1, (uint64_t)a2, a3, (uint64_t)a4);
+        return sys_wait4((long)a1, a2, (long)a3, a4);
     case YOUSJ_SYS_clone:
-        return sys_clone(a1, (uint64_t)a2);
+        return sys_clone(ctx, (long)a1, a2);
     case YOUSJ_SYS_execve:
-        return sys_execve((uint64_t)a1, (uint64_t)a2, (uint64_t)a3);
+        return sys_execve(a1, a2, a3);
+    case YOUSJ_SYS_rt_sigaction:
+        return sys_rt_sigaction((long)a1, a2, a3, a4);
+    case YOUSJ_SYS_rt_sigprocmask:
+        return sys_rt_sigprocmask((long)a1, a2, a3, a4);
+    case YOUSJ_SYS_rt_sigpending:
+        return sys_rt_sigpending(a1, a2);
+    case YOUSJ_SYS_sigaltstack:
+        return -YOUSJ_ENOSYS; /* no alternate stacks yet (M7 note) */
     case YOUSJ_SYS_exit:
     case YOUSJ_SYS_exit_group:
-        sys_exit_common(a1);
+        process_exit((long)a1, 0);
         __builtin_unreachable();
     case YOUSJ_SYS_NATIVE_PS_SNAPSHOT:
-        return sys_ps_snapshot((uint64_t)a1, (uint64_t)a2);
+        return sys_ps_snapshot(a1, a2);
     case YOUSJ_SYS_NATIVE_PMM_FREE:
         return (long)pmm_free_page_count();
     default:
-        (void)a4;
-        (void)a5;
-        (void)a6;
         return -YOUSJ_ENOSYS;
     }
+}
+
+long yousj_syscall_dispatch(struct yousj_syscall_ctx *ctx)
+{
+    /* rt_sigreturn restores a saved ring-3 context wholesale;
+     * the exit gate would only corrupt it, so it bypasses the
+     * gate entirely (pending signals are picked up at the next
+     * syscall or timer return instead). */
+    if ((long)ctx->no == YOUSJ_SYS_rt_sigreturn)
+        return sys_rt_sigreturn(ctx);
+    return signal_syscall_exit(ctx, dispatch_inner(ctx));
 }
 
 

@@ -72,7 +72,7 @@ syscall_entry:
     mov %rax, %rdi          /* syscall number */
 
     sti
-    call yousj_syscall_dispatch
+    call syscall_dispatch_shim
     cli
 
     pop %r9                 /* restore the user's r9 -- it is a
@@ -95,6 +95,48 @@ syscall_entry:
     mov %gs:8, %rsp         /* back to the user stack */
     swapgs
     sysretq
+
+/* The dispatcher shim (M7): yousj_syscall_dispatch() takes a
+ * struct yousj_syscall_ctx (see <yousj/signal.h>) so the signal
+ * machinery can see -- and, for rt_sigreturn, rewrite -- the
+ * COMPLETE ring-3 register set. The argument registers are
+ * already in place from the shuffle above; what is missing is
+ * a6 (the topmost entry push, now one slot above this call's
+ * return address), the entry frame pointer (cpu_local.
+ * syscall_frame) and the user callee-saved registers, none of
+ * which a plain C call could observe reliably. The ctx is
+ * built on this task's kernel stack (128 bytes, so the 16-byte
+ * call alignment the entry arranged is preserved); the callee-
+ * saved set is reloaded FROM the ctx afterwards, which is how
+ * rt_sigreturn's restored values take effect. */
+syscall_dispatch_shim:
+    sub $128, %rsp
+    mov %rdi, 0(%rsp)       /* no */
+    mov %rsi, 8(%rsp)       /* a1 */
+    mov %rdx, 16(%rsp)      /* a2 */
+    mov %rcx, 24(%rsp)      /* a3 */
+    mov %r8, 32(%rsp)       /* a4 */
+    mov %r9, 40(%rsp)       /* a5 */
+    mov 136(%rsp), %rax     /* a6: [rsp+128]=ret, [+136]=a6 slot */
+    mov %rax, 48(%rsp)      /* a6 */
+    mov %gs:24, %rax        /* cpu_local.syscall_frame */
+    mov %rax, 56(%rsp)      /* frame */
+    mov %rbx, 64(%rsp)      /* callee[0..5] */
+    mov %rbp, 72(%rsp)
+    mov %r12, 80(%rsp)
+    mov %r13, 88(%rsp)
+    mov %r14, 96(%rsp)
+    mov %r15, 104(%rsp)
+    mov %rsp, %rdi
+    call yousj_syscall_dispatch
+    mov 64(%rsp), %rbx
+    mov 72(%rsp), %rbp
+    mov 80(%rsp), %r12
+    mov 88(%rsp), %r13
+    mov 96(%rsp), %r14
+    mov 104(%rsp), %r15
+    add $128, %rsp
+    ret
 
 /* void enter_user_mode(uint64_t ip, uint64_t sp)
  * Build the iretq frame for the first ring-3 landing: user SS,
@@ -128,16 +170,24 @@ user_frame_resume:
     mov $0x1B, %ax          /* user data segments, as in ring 3 */
     mov %ax, %ds
     mov %ax, %es
-    mov %rdi, %rbx
-    mov 0(%rbx), %rdi
-    mov 8(%rbx), %rsi
-    mov 16(%rbx), %rdx
-    mov 24(%rbx), %rcx      /* user RIP (sysret loads it) */
-    mov 32(%rbx), %r10
-    mov 40(%rbx), %r8
-    mov 48(%rbx), %r9
-    mov 56(%rbx), %r11      /* user RFLAGS (sysret loads it) */
-    mov 64(%rbx), %rsp      /* user stack pointer */
+    mov %rdi, %rax          /* base in rax: rbx itself is loaded
+                             * from the snapshot (M7) */
+    mov 0(%rax), %rdi
+    mov 8(%rax), %rsi
+    mov 16(%rax), %rdx
+    mov 24(%rax), %rcx      /* user RIP (sysret loads it) */
+    mov 32(%rax), %r10
+    mov 40(%rax), %r8
+    mov 48(%rax), %r9
+    mov 56(%rax), %r11      /* user RFLAGS (sysret loads it) */
+    mov 72(%rax), %rbx      /* callee-saved set (M7) */
+    mov 80(%rax), %rbp
+    mov 88(%rax), %r12
+    mov 96(%rax), %r13
+    mov 104(%rax), %r14
+    mov 112(%rax), %r15
+    mov 64(%rax), %rsp      /* user stack pointer (last: every
+                             * load above reads through rax) */
     xor %eax, %eax          /* the child sees clone() == 0 */
     sysretq
 

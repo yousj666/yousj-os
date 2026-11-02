@@ -581,7 +581,7 @@ uint64_t sched_snapshot_tasks(char *buf, uint64_t cap)
             continue;
         snap_put_u64(&w, (uint64_t)t->tid);
         snap_putc(&w, ' ');
-        snap_putc(&w, snap_state_char(t->state));
+        snap_putc(&w, t->sig_stopped ? 'T' : snap_state_char(t->state));
         snap_putc(&w, ' ');
         snap_puts(&w, t->name);
         snap_putc(&w, '\n');
@@ -646,4 +646,83 @@ void sched_sleep_ticks(uint64_t ticks)
     sched_schedule();
     /* Resumed after sched_tick() woke us and the scheduler picked
      * us again; wake_tick was cleared by the wake scan. */
+}
+
+/* --- M7: stop/continue and signal-aware sleeping --------------------- */
+
+void sched_park_task(struct task *t)
+{
+#ifdef YOUSJ_KERNEL
+    uint64_t flags;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(flags));
+#endif
+    if (t != NULL && t->in_use && t->state != TASK_ZOMBIE) {
+        t->sig_stopped = true;
+        if (t->state == TASK_READY) {
+            rq_remove(t);
+            t->state = TASK_BLOCKED;
+            t->sig_parked = true;
+        }
+        /* A BLOCKED or RUNNING target keeps its state: the flag
+         * alone is the stop order, and its next delivery gate
+         * (or sched_self_park from its own exit check) enforces
+         * it. Parking a task out from under an arbitrary block
+         * would corrupt the wait it is in. */
+    }
+#ifdef YOUSJ_KERNEL
+    __asm__ volatile("push %0; popfq" : : "r"(flags) : "memory");
+#endif
+}
+
+void sched_cont_task(struct task *t)
+{
+#ifdef YOUSJ_KERNEL
+    uint64_t flags;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(flags));
+#endif
+    if (t != NULL && t->in_use) {
+        t->sig_stopped = false;
+        if (t->sig_parked) {
+            t->sig_parked = false;
+            if (t->state == TASK_BLOCKED)
+                sched_wake(t);
+        }
+    }
+#ifdef YOUSJ_KERNEL
+    __asm__ volatile("push %0; popfq" : : "r"(flags) : "memory");
+#endif
+}
+
+void sched_self_park(void)
+{
+    struct task *me = g_current;
+
+    if (me == NULL || me == g_idle)
+        return;
+    me->sig_stopped = true;
+    me->sig_parked = true;
+    sched_block_current();
+    /* sched_cont_task() cleared both flags and woke us. */
+}
+
+int sched_sleep_ticks_sig(uint64_t ticks)
+{
+    uint64_t deadline;
+
+    if (g_current == NULL || g_current == g_idle || ticks == 0)
+        return 0;
+    deadline = g_ticks + ticks;
+    for (;;) {
+        if (g_current->sig_wake) {
+            g_current->sig_wake = false;
+            return 1;
+        }
+        if (g_ticks >= deadline)
+            return 0;
+        g_current->wake_tick = deadline;
+        g_current->state = TASK_BLOCKED;
+        sched_schedule();
+        /* On resume the loop re-checks: signal wake (sig_wake
+         * set, wake_tick cleared by signal_send) or deadline. */
+    }
 }

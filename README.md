@@ -85,8 +85,30 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   帧。验收：`make check`/`make test`、Multiboot 冒烟、
   `tools/qemu-proc-test.py`（三轮 hello 后 PMM 对账归零）、
   UEFI 链到 Shell 提示符，全部 PASS。
-- ⏳ 下一步：信号机制、FPU/SSE 状态、文件系统（execve 映像
-  表退役）。
+- ✅ 调度 M7（2026-11-02）：信号机制落地——标准信号 1–31
+  全套默认处置（终止/终止+core 位/忽略/停止/继续）＋捕获型
+  投递。投递只发生在两个回用户态闸门：syscall 出口与定时器
+  中断返回（后者让纯自旋、不做 syscall 的程序也能收到处理
+  器信号）。rt_sigaction/rt_sigprocmask/rt_sigpending/
+  rt_sigreturn 按 Linux 布局实现（rt_sigframe 含 ucontext＋
+  siginfo，restorer 契约）；kill(62) 改为真投递（sig=0 探活、
+  内核线程保留阶段一语义）；子进程退出向父进程发 SIGCHLD
+  （带 si_pid/si_status）；阻塞型 read/nanosleep/wait4 支持
+  -EINTR 与 SA_RESTART（经 -ERESTARTSYS 内部标记＋sigreturn
+  回绕 syscall 指令实现）；SIGSTOP/SIGCONT 停启、掩码与处置
+  的 clone/exec 继承规则齐备。验收：`tools/qemu-signal-test.py`
+  驱动 shell 跑 /bin/sigtest 十一场景全 PASS（handler/mask/
+  default-term/stop-cont/sigkill/eintr/restart/sigchld/
+  irq-deliver/clone-inherit/exec-reset），跑完 PMM 对账归零。
+  施工中连带修复两个 M5 遗留的真 bug：①clone 子进程寄存器
+  快照缺被调用者保存寄存器（rbx/rbp/r12–r15）——继续执行的
+  子进程（而非立即 exec）会带着垃圾寄存器恢复，M5 验收只测
+  了 fork 后立即 exec 而漏检，现经入口 shim 的 syscall 上下
+  文补齐；②定时器中断不做 swapgs——从 Ring 3 帧调度到正
+  阻塞在 syscall 里的任务时，其出口路径会踩到被遗落的用户
+  GS 基址而 #PF，现 irq0_stub 对 Ring 3 帧进出各 swapgs
+  一次，GS 纪律与调度顺序彻底解耦。
+- ⏳ 下一步：FPU/SSE 状态、文件系统（execve 映像表退役）。
 
 ## 从零构建
 
