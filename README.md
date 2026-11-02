@@ -139,8 +139,22 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   进程/信号/FX/UEFI 五链不回归。已知边界：无持久化存储
   （关机即失）、无 dup/fcntl、O_CLOEXEC 未实现（fd 跨 exec
   保留）、路径上限 255、无符号/硬链接。
-- ⏳ 下一步候选：管道 pipe（进程间通信）、mmap 文件映射、
-  dup2＋Shell 重定向、持久化后端（initramfs/磁盘）。
+- ✅ 调度 M10（2026-11-02）：管道与描述符复制——匿名管道
+  （4KiB 环形缓冲、端计数按 open-file 对象计，阻塞读写走
+  2-tick 轮询睡眠＋信号 -ERESTARTSYS 协议，写无读者发
+  SIGPIPE 并返回 -EPIPE，非阻塞走 -EAGAIN）；pipe(22)/
+  pipe2(293)、dup(32)/dup2(33)/dup3(292)；close-on-exec
+  全套（open/pipe2/dup3 设置、execve 提交点关闭、fork 继
+  承掩码）。fd 分配跳过未关闭的隐含控制台槽。Shell 支持
+  重定向（> >> < 2>）与单管道 |（状态取右侧命令），echo
+  内建支持 > / >>（dup 保存/恢复 stdout）；新增 /bin/cat。
+  验收：`tools/qemu-pipe-test.py` 中 /bin/pipetest 六场景
+  （基础读写、阻塞 EOF、无读者 EPIPE、非阻塞填满 4096、
+  dup 共享偏移、cloexec 跨 exec 消失）连跑两遍全 PASS＋
+  PMM 稳态；shell 级九项检查（重定向落盘、cat 读回、管
+  道、stdin 重定向、echo 落盘与追加）全 PASS；七链不回归。
+- ⏳ 下一步候选：mmap 文件映射、持久化后端（initramfs/磁
+  盘，让 ramfs 重启不丢）、poll/select、符号链接。
 
 ## 从零构建
 

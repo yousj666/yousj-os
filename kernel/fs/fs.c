@@ -327,8 +327,64 @@ void file_put(struct yousj_file *f)
 {
     if (f == NULL || f == &g_console_file)
         return;
-    if (--f->refcount <= 0)
+    if (--f->refcount <= 0) {
+        /* M10: releasing the last reference to a pipe end drops
+         * the pipe's end count; the pipe itself dies when both
+         * counts reach zero. Blocked peers poll these counts,
+         * so no explicit wakeup is needed at this stage. */
+        if (f->pipe != NULL) {
+            struct yousj_pipe *p = f->pipe;
+            if ((f->flags & YOUSJ_O_ACCMODE) == YOUSJ_O_RDONLY)
+                p->readers--;
+            else if ((f->flags & YOUSJ_O_ACCMODE) == YOUSJ_O_WRONLY)
+                p->writers--;
+            if (p->readers <= 0 && p->writers <= 0)
+                p->in_use = false;
+            f->pipe = NULL;
+        }
         f->in_use = false;
+    }
+}
+
+#define MAX_PIPES 16
+static struct yousj_pipe g_pipes[MAX_PIPES];
+
+long fs_pipe_create(struct yousj_file **rd_out,
+                    struct yousj_file **wr_out)
+{
+    struct yousj_pipe *p = NULL;
+    struct yousj_file *rd, *wr;
+    int i;
+
+    for (i = 0; i < MAX_PIPES; i++) {
+        if (!g_pipes[i].in_use) {
+            p = &g_pipes[i];
+            break;
+        }
+    }
+    if (p == NULL)
+        return -YOUSJ_ENFILE;
+    mem_zero((uint8_t *)p, sizeof(*p));
+    p->in_use = true;
+    p->readers = 1;
+    p->writers = 1;
+    rd = file_alloc();
+    wr = file_alloc();
+    if (rd == NULL || wr == NULL) {
+        if (rd != NULL)
+            rd->in_use = false;
+        if (wr != NULL)
+            wr->in_use = false;
+        p->in_use = false;
+        return -YOUSJ_ENFILE;
+    }
+    rd->pipe = p;
+    rd->flags = YOUSJ_O_RDONLY;
+    wr->pipe = p;
+    wr->flags = YOUSJ_O_WRONLY;
+    *rd_out = rd;
+    *wr_out = wr;
+    return 0;
 }
 
 long fs_open_path(const char *path, long flags,
@@ -374,7 +430,7 @@ long fs_open_path(const char *path, long flags,
 long file_read(struct yousj_file *f, uint8_t *dst, uint64_t count)
 {
     long n;
-    if (f == NULL || f->node == NULL)
+    if (f == NULL || f->node == NULL || f->pipe != NULL)
         return -YOUSJ_EBADF;
     if (f->node->is_dir)
         return -YOUSJ_EISDIR;
@@ -390,7 +446,7 @@ long file_write(struct yousj_file *f, const uint8_t *src,
                 uint64_t count)
 {
     long n;
-    if (f == NULL || f->node == NULL)
+    if (f == NULL || f->node == NULL || f->pipe != NULL)
         return -YOUSJ_EBADF;
     if (f->node->is_dir)
         return -YOUSJ_EISDIR;
@@ -463,6 +519,7 @@ void fs_init(void)
 {
     mem_zero((uint8_t *)g_nodes, sizeof(g_nodes));
     mem_zero((uint8_t *)g_files, sizeof(g_files));
+    mem_zero((uint8_t *)g_pipes, sizeof(g_pipes));
     mem_zero((uint8_t *)&g_console_file, sizeof(g_console_file));
     g_console_file.in_use = true;
     g_console_file.flags = YOUSJ_O_RDWR;
@@ -499,6 +556,10 @@ extern const uint8_t _binary_fxtest_elf_start[];
 extern const uint8_t _binary_fxtest_elf_end[];
 extern const uint8_t _binary_fstest_elf_start[];
 extern const uint8_t _binary_fstest_elf_end[];
+extern const uint8_t _binary_cat_elf_start[];
+extern const uint8_t _binary_cat_elf_end[];
+extern const uint8_t _binary_pipetest_elf_start[];
+extern const uint8_t _binary_pipetest_elf_end[];
 
 void fs_populate_embedded(void)
 {
@@ -515,4 +576,8 @@ void fs_populate_embedded(void)
                  (uint64_t)(_binary_fxtest_elf_end - _binary_fxtest_elf_start));
     install_file("/bin/fstest", _binary_fstest_elf_start,
                  (uint64_t)(_binary_fstest_elf_end - _binary_fstest_elf_start));
+    install_file("/bin/cat", _binary_cat_elf_start,
+                 (uint64_t)(_binary_cat_elf_end - _binary_cat_elf_start));
+    install_file("/bin/pipetest", _binary_pipetest_elf_start,
+                 (uint64_t)(_binary_pipetest_elf_end - _binary_pipetest_elf_start));
 }

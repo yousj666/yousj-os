@@ -29,6 +29,8 @@
 #define YOUSJ_O_TRUNC     0x200
 #define YOUSJ_O_APPEND    0x400
 #define YOUSJ_O_DIRECTORY 0x10000
+#define YOUSJ_O_NONBLOCK  0x800   /* M10 */
+#define YOUSJ_O_CLOEXEC   0x80000 /* M10 */
 
 #define YOUSJ_DT_DIR 4
 #define YOUSJ_DT_REG 8
@@ -37,12 +39,28 @@
 
 struct yousj_ramfs_node;
 
+/* M10: an anonymous pipe. One object, two file ends (a
+ * YOUSJ_O_RDONLY end and a YOUSJ_O_WRONLY end). readers and
+ * writers count open FILE OBJECTS (not fds -- dup/fork share
+ * the object), which is what EOF/EPIPE hinge on. */
+#define YOUSJ_PIPE_CAP 4096
+struct yousj_pipe {
+    uint8_t buf[YOUSJ_PIPE_CAP];
+    uint32_t head;    /* read position */
+    uint32_t tail;    /* write position */
+    uint32_t count;   /* bytes buffered */
+    int readers;
+    int writers;
+    bool in_use;
+};
+
 struct yousj_file {
-    struct yousj_ramfs_node *node; /* NULL: the console */
+    struct yousj_ramfs_node *node; /* NULL and pipe NULL: console */
+    struct yousj_pipe *pipe;       /* non-NULL: a pipe end (M10) */
     uint64_t offset;               /* shared across fork (the
                                       object is shared, not the
-                                      fd number) */
-    long flags;                    /* access mode + O_APPEND */
+                                      fd number); unused for pipes */
+    long flags;                    /* access mode + O_APPEND etc. */
     int refcount;
     bool in_use;
 };
@@ -73,6 +91,11 @@ long fs_open_path(const char *path, long flags,
 /* The pinned console file object (never freed; file_put on it
  * is a no-op). */
 struct yousj_file *fs_console_file(void);
+
+/* M10: create a pipe and its two end objects (each refcount 1).
+ * 0 or a negative errno. */
+long fs_pipe_create(struct yousj_file **rd_out,
+                    struct yousj_file **wr_out);
 
 void file_get(struct yousj_file *f);
 void file_put(struct yousj_file *f);

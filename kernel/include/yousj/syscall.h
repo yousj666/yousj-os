@@ -27,6 +27,7 @@
 #define YOUSJ_SYS_ioctl        16
 #define YOUSJ_SYS_pipe         22
 #define YOUSJ_SYS_dup          32
+#define YOUSJ_SYS_dup2         33   /* M10 */
 #define YOUSJ_SYS_nanosleep    35
 #define YOUSJ_SYS_getpid       39
 #define YOUSJ_SYS_clone        56   /* fork/exec come in stage 2 */
@@ -46,6 +47,8 @@
 #define YOUSJ_SYS_mkdir        83
 #define YOUSJ_SYS_getdents64  217
 #define YOUSJ_SYS_openat      257  /* M9 */
+#define YOUSJ_SYS_dup3        292  /* M10 */
+#define YOUSJ_SYS_pipe2       293  /* M10 */
 #define YOUSJ_SYS_arch_prctl  158
 #define YOUSJ_SYS_rt_sigpending 127 /* M7 */
 #define YOUSJ_SYS_sigaltstack  131  /* M7: -ENOSYS for now */

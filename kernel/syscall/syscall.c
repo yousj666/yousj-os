@@ -54,6 +54,8 @@ void syscall_set_init_task(struct task *t)
 static void wrmsr(uint32_t msr, uint64_t value);
 static struct yousj_file *fd_file_of(struct task *t, long fd); /* M9, defined with sys_read */
 static void resolve_path(struct task *t, const char *path, char *out);
+static long sys_read_pipe(struct yousj_file *f, uint64_t buf, uint64_t count);
+static long sys_write_pipe(struct yousj_file *f, uint64_t buf, uint64_t len);
 
 /* Called from sched_schedule() on every switch (weak hook, see
  * sched.c): TSS.rsp0 and cpu_local.kernel_rsp must always name the
@@ -145,7 +147,9 @@ void syscall_init(void)
 #define YOUSJ_EISDIR 21  /* M9 */
 #define YOUSJ_EINVAL 22
 #define YOUSJ_EMFILE 24  /* M9 */
+#define YOUSJ_EAGAIN 11  /* M10 */
 #define YOUSJ_ESPIPE 29  /* M9 */
+#define YOUSJ_EPIPE 32   /* M10 */
 #define YOUSJ_ERANGE 34  /* M9 */
 #define YOUSJ_ENOSYS 38
 #define YOUSJ_ERESTARTSYS 512 /* internal: interrupted blocking call;
@@ -222,6 +226,8 @@ static long sys_write(long fd, uint64_t buf, uint64_t len)
 
     if (f == NULL)
         return -YOUSJ_EBADF;
+    if (f->pipe != NULL)
+        return sys_write_pipe(f, buf, len);
     if (f->node == NULL)
         return sys_write_console(buf, len);
     if (len == 0)
@@ -488,6 +494,7 @@ static long sys_clone(struct yousj_syscall_ctx *ctx, long flags,
                 file_get(child->fd_file[i]);
             }
             child->fd_console_closed = me->fd_console_closed;
+            child->fd_cloexec = me->fd_cloexec;
             for (i = 0; i < YOUSJ_CWD_MAX; i++)
                 child->cwd_path[i] = me->cwd_path[i];
         }
@@ -642,6 +649,18 @@ static long sys_execve(uint64_t path_ptr, uint64_t argv_ptr,
     me->mm = space;
     me->mm_owned = true;
     signal_exec_reset(me);
+    /* M10: close-on-exec descriptors die at the commit point. */
+    {
+        int i;
+        for (i = 0; i < YOUSJ_NR_OPEN; i++) {
+            if ((me->fd_cloexec & (uint16_t)(1u << i)) &&
+                me->fd_file[i] != NULL) {
+                file_put(me->fd_file[i]);
+                me->fd_file[i] = NULL;
+            }
+        }
+        me->fd_cloexec = 0;
+    }
     fpu_init_area(me->fx_area); /* FPU state resets on exec (M8) */
     fpu_restore(me->fx_area);   /* the new image starts pristine */
     me->brk_start = heap_base;
@@ -763,6 +782,8 @@ static long sys_read(long fd, uint64_t buf, uint64_t count)
 
     if (f == NULL)
         return -YOUSJ_EBADF;
+    if (f->pipe != NULL)
+        return sys_read_pipe(f, buf, count);
     if (f->node == NULL)
         return sys_read_console(buf, count);
     if (count == 0)
@@ -776,12 +797,18 @@ static long fd_alloc(struct task *t, struct yousj_file *f)
 {
     long fd;
     for (fd = 0; fd < YOUSJ_NR_OPEN; fd++) {
-        if (t->fd_file[fd] == NULL) {
-            t->fd_file[fd] = f;
-            if (fd < 3)
-                t->fd_console_closed &= (uint8_t)~(1u << fd);
-            return fd;
-        }
+        if (t->fd_file[fd] != NULL)
+            continue;
+        /* A NULL stdio slot that was never closed is the
+         * implicit console -- occupied, not free. A closed one
+         * is fair game. */
+        if (fd < 3 && !(t->fd_console_closed & (uint8_t)(1u << fd)))
+            continue;
+        t->fd_file[fd] = f;
+        if (fd < 3)
+            t->fd_console_closed &= (uint8_t)~(1u << fd);
+        t->fd_cloexec &= (uint16_t)~(1u << fd);
+        return fd;
     }
     return -YOUSJ_EMFILE;
 }
@@ -805,6 +832,8 @@ static long sys_openat(long dirfd, uint64_t path_ptr, long flags)
     fd = fd_alloc(me, f);
     if (fd < 0)
         file_put(f);
+    else if (flags & YOUSJ_O_CLOEXEC)
+        me->fd_cloexec |= (uint16_t)(1u << fd);
     return fd;
 }
 
@@ -836,7 +865,7 @@ static long sys_lseek(long fd, long off, long whence)
     if (f == NULL)
         return -YOUSJ_EBADF;
     if (f->node == NULL)
-        return -YOUSJ_ESPIPE; /* the console is not seekable */
+        return -YOUSJ_ESPIPE; /* console and pipes: not seekable */
     return file_seek(f, off, whence);
 }
 
@@ -899,6 +928,175 @@ static long sys_getcwd_sys(uint64_t buf, uint64_t size)
     for (i = 0; i <= len; i++)
         ((char *)(uintptr_t)buf)[i] = cwd[i];
     return (long)len;
+}
+
+/* --- M10: pipes and descriptor duplication ----------------------- */
+
+static long sys_read_pipe(struct yousj_file *f, uint64_t buf,
+                          uint64_t count)
+{
+    struct task *me = sched_current();
+    struct yousj_pipe *p = f->pipe;
+
+    if ((f->flags & YOUSJ_O_ACCMODE) != YOUSJ_O_RDONLY)
+        return -YOUSJ_EBADF;
+    if (count == 0)
+        return 0;
+    if (!user_range_ok(buf, count))
+        return -YOUSJ_EFAULT;
+    for (;;) {
+        if (p->count > 0) {
+            uint64_t n = count < p->count ? count : p->count;
+            uint64_t i;
+            for (i = 0; i < n; i++) {
+                ((uint8_t *)(uintptr_t)buf)[i] = p->buf[p->head];
+                p->head = (p->head + 1) % YOUSJ_PIPE_CAP;
+            }
+            p->count -= (uint32_t)n;
+            return (long)n;
+        }
+        if (p->writers == 0)
+            return 0; /* EOF: every write end is gone */
+        if (f->flags & YOUSJ_O_NONBLOCK)
+            return -YOUSJ_EAGAIN;
+        if (signal_deliverable_pending(me)) {
+            me->sig_wake = false;
+            return -YOUSJ_ERESTARTSYS;
+        }
+        sched_sleep_ticks(2); /* poll, like the console reader */
+    }
+}
+
+static long sys_write_pipe(struct yousj_file *f, uint64_t buf,
+                           uint64_t len)
+{
+    struct task *me = sched_current();
+    struct yousj_pipe *p = f->pipe;
+    uint64_t written = 0;
+
+    if ((f->flags & YOUSJ_O_ACCMODE) != YOUSJ_O_WRONLY)
+        return -YOUSJ_EBADF;
+    if (len == 0)
+        return 0;
+    if (!user_range_ok(buf, len))
+        return -YOUSJ_EFAULT;
+    for (;;) {
+        uint64_t space, chunk, i;
+        if (p->readers == 0) {
+            if (written == 0) {
+                /* Linux: SIGPIPE first, then -EPIPE. A task that
+                 * catches/ignores SIGPIPE sees the plain error. */
+                signal_send(me, YOUSJ_SIGPIPE, me->tid);
+                return -YOUSJ_EPIPE;
+            }
+            return (long)written;
+        }
+        space = YOUSJ_PIPE_CAP - p->count;
+        if (space > 0) {
+            chunk = len - written < space ? len - written : space;
+            for (i = 0; i < chunk; i++) {
+                p->buf[p->tail] =
+                    ((const uint8_t *)(uintptr_t)buf)[written + i];
+                p->tail = (p->tail + 1) % YOUSJ_PIPE_CAP;
+            }
+            p->count += (uint32_t)chunk;
+            written += chunk;
+            if (written == len)
+                return (long)written;
+            continue;
+        }
+        if (f->flags & YOUSJ_O_NONBLOCK)
+            return written > 0 ? (long)written : -YOUSJ_EAGAIN;
+        if (signal_deliverable_pending(me)) {
+            me->sig_wake = false;
+            return written > 0 ? (long)written : -YOUSJ_ERESTARTSYS;
+        }
+        sched_sleep_ticks(2);
+    }
+}
+
+static long sys_pipe2_sys(uint64_t fds_ptr, long flags)
+{
+    struct task *me = sched_current();
+    struct yousj_file *rd, *wr;
+    long rc, fdr, fdw;
+    int32_t *out;
+
+    if (flags & ~(YOUSJ_O_CLOEXEC | YOUSJ_O_NONBLOCK))
+        return -YOUSJ_EINVAL;
+    if (!user_range_ok(fds_ptr, 8))
+        return -YOUSJ_EFAULT;
+    rc = fs_pipe_create(&rd, &wr);
+    if (rc != 0)
+        return rc;
+    if (flags & YOUSJ_O_NONBLOCK) {
+        rd->flags |= YOUSJ_O_NONBLOCK;
+        wr->flags |= YOUSJ_O_NONBLOCK;
+    }
+    fdr = fd_alloc(me, rd);
+    if (fdr < 0) {
+        file_put(rd);
+        file_put(wr);
+        return fdr;
+    }
+    fdw = fd_alloc(me, wr);
+    if (fdw < 0) {
+        me->fd_file[fdr] = NULL;
+        file_put(rd);
+        file_put(wr);
+        return fdw;
+    }
+    if (flags & YOUSJ_O_CLOEXEC) {
+        me->fd_cloexec |= (uint16_t)(1u << fdr);
+        me->fd_cloexec |= (uint16_t)(1u << fdw);
+    }
+    out = (int32_t *)(uintptr_t)fds_ptr;
+    out[0] = (int32_t)fdr;
+    out[1] = (int32_t)fdw;
+    return 0;
+}
+
+static long sys_dup_sys(long oldfd)
+{
+    struct task *me = sched_current();
+    struct yousj_file *f = fd_file_of(me, oldfd);
+    long fd;
+
+    if (f == NULL)
+        return -YOUSJ_EBADF;
+    file_get(f);
+    fd = fd_alloc(me, f);
+    if (fd < 0)
+        file_put(f);
+    return fd;
+}
+
+static long sys_dup3_sys(long oldfd, long newfd, long flags)
+{
+    struct task *me = sched_current();
+    struct yousj_file *f, *old;
+
+    if (flags & ~YOUSJ_O_CLOEXEC)
+        return -YOUSJ_EINVAL;
+    if (newfd < 0 || newfd >= YOUSJ_NR_OPEN)
+        return -YOUSJ_EBADF;
+    f = fd_file_of(me, oldfd);
+    if (f == NULL)
+        return -YOUSJ_EBADF;
+    if (oldfd == newfd)
+        return newfd;
+    old = me->fd_file[newfd];
+    if (old != NULL)
+        file_put(old);
+    me->fd_file[newfd] = f;
+    file_get(f);
+    if (newfd < 3)
+        me->fd_console_closed &= (uint8_t)~(1u << newfd);
+    if (flags & YOUSJ_O_CLOEXEC)
+        me->fd_cloexec |= (uint16_t)(1u << newfd);
+    else
+        me->fd_cloexec &= (uint16_t)~(1u << newfd);
+    return newfd;
 }
 
 static long sys_nanosleep(uint64_t req_ptr)
@@ -1132,6 +1330,16 @@ static long dispatch_inner(struct yousj_syscall_ctx *ctx)
         return sys_chdir_sys(a1);
     case YOUSJ_SYS_getcwd:
         return sys_getcwd_sys(a1, a2);
+    case YOUSJ_SYS_pipe:
+        return sys_pipe2_sys(a1, 0);
+    case YOUSJ_SYS_pipe2:
+        return sys_pipe2_sys(a1, (long)a2);
+    case YOUSJ_SYS_dup:
+        return sys_dup_sys((long)a1);
+    case YOUSJ_SYS_dup2:
+        return sys_dup3_sys((long)a1, (long)a2, 0);
+    case YOUSJ_SYS_dup3:
+        return sys_dup3_sys((long)a1, (long)a2, (long)a3);
     case YOUSJ_SYS_mmap:
         return sys_mmap(a1, a2, a3, a4, (long)a5);
     case YOUSJ_SYS_munmap:

@@ -149,6 +149,8 @@ struct task {
      * never had console fds installed still gets stdio). */
     struct yousj_file *fd_file[YOUSJ_NR_OPEN];
     uint8_t         fd_console_closed; /* bits for fds 0,1,2 */
+    uint16_t        fd_cloexec;        /* per-fd close-on-exec
+                                          bits (M10) */
     char            cwd_path[YOUSJ_CWD_MAX]; /* "" = "/" */
     bool            in_use;
 };
