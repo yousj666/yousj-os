@@ -127,7 +127,7 @@ $(BUILD)/ata.o: kernel/drivers/ata.c kernel/include/yousj/*.h
 	mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(BUILD)/initramfs.cpio: $(BUILD)/yousj-init.elf $(BUILD)/hello.elf $(BUILD)/sh.elf $(BUILD)/sigtest.elf $(BUILD)/fxtest.elf $(BUILD)/fstest.elf $(BUILD)/cat.elf $(BUILD)/pipetest.elf $(BUILD)/mkdir.elf $(BUILD)/ls.elf $(BUILD)/rm.elf $(BUILD)/rmdir.elf $(BUILD)/mv.elf $(BUILD)/bigfile.elf $(BUILD)/mmtest.elf $(BUILD)/polltest.elf tools/mkinitramfs.py $(wildcard rootfs/etc/*)
+$(BUILD)/initramfs.cpio: $(BUILD)/yousj-init.elf $(BUILD)/hello.elf $(BUILD)/sh.elf $(BUILD)/sigtest.elf $(BUILD)/fxtest.elf $(BUILD)/fstest.elf $(BUILD)/cat.elf $(BUILD)/pipetest.elf $(BUILD)/mkdir.elf $(BUILD)/ls.elf $(BUILD)/rm.elf $(BUILD)/rmdir.elf $(BUILD)/mv.elf $(BUILD)/bigfile.elf $(BUILD)/mmtest.elf $(BUILD)/polltest.elf $(BUILD)/ln.elf $(BUILD)/readlink.elf tools/mkinitramfs.py $(wildcard rootfs/etc/*)
 	python3 tools/mkinitramfs.py $(BUILD)
 
 $(BUILD)/initramfs_bin.o: $(BUILD)/initramfs.cpio
@@ -176,6 +176,14 @@ $(BUILD)/mmtest.elf: userland/mmtest.c userland/crt0.S userland/init.ld
 $(BUILD)/polltest.elf: userland/polltest.c userland/crt0.S userland/init.ld
 	mkdir -p $(BUILD)
 	gcc -ffreestanding -fno-stack-protector -fno-pie -static -nostdlib -mno-sse -mno-sse2 -mno-mmx -mcmodel=large -O2 -Wall -Wextra -Wl,-T,userland/init.ld -Wl,--build-id=none -o $@ userland/crt0.S userland/polltest.c
+
+$(BUILD)/ln.elf: userland/ln.c userland/crt0.S userland/init.ld
+	mkdir -p $(BUILD)
+	gcc -ffreestanding -fno-stack-protector -fno-pie -static -nostdlib -mno-sse -mno-sse2 -mno-mmx -mcmodel=large -O2 -Wall -Wextra -Wl,-T,userland/init.ld -Wl,--build-id=none -o $@ userland/crt0.S userland/ln.c
+
+$(BUILD)/readlink.elf: userland/readlink.c userland/crt0.S userland/init.ld
+	mkdir -p $(BUILD)
+	gcc -ffreestanding -fno-stack-protector -fno-pie -static -nostdlib -mno-sse -mno-sse2 -mno-mmx -mcmodel=large -O2 -Wall -Wextra -Wl,-T,userland/init.ld -Wl,--build-id=none -o $@ userland/crt0.S userland/readlink.c
 
 $(BUILD)/sh.elf: userland/sh.c userland/crt0.S userland/init.ld
 	mkdir -p $(BUILD)

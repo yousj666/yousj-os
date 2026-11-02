@@ -36,6 +36,8 @@
 #define SYS_rename     82
 #define SYS_rmdir      84
 #define SYS_unlink     87
+#define SYS_symlink    88
+#define SYS_readlink   89
 #define SYS_getdents64 217
 #define SYS_openat     257
 
@@ -465,6 +467,133 @@ static void t_rmdir(void)
     report("rmdir", r1 == 0 && r2 == -39 && r3 == -20);
 }
 
+
+/* --- M16: symlinks -------------------------------------- */
+
+static long read_str(const char *path, char *buf, long cap)
+{
+    long fd = open_(path, O_RDONLY);
+    long n;
+    if (fd < 0)
+        return fd;
+    n = sys_call3(SYS_read, fd, (long)(uintptr_t)buf, cap - 1);
+    sys_call3(SYS_close, fd, 0, 0);
+    if (n >= 0)
+        buf[n] = '\0';
+    return n;
+}
+
+static void t_symlink(void)
+{
+    char buf[32];
+    long fd;
+    /* the suite runs twice per boot: clear run 1's links */
+    sys_call3(SYS_unlink, (long)(uintptr_t)"/link1", 0, 0);
+    sys_call3(SYS_unlink, (long)(uintptr_t)"/link2", 0, 0);
+    sys_call3(SYS_unlink, (long)(uintptr_t)"/link3", 0, 0);
+    fd = open_("/real.txt", O_CREAT | O_RDWR | O_TRUNC);
+    long r;
+    if (fd < 0) {
+        report("symlink", 0);
+        return;
+    }
+    sys_call3(SYS_write, fd, (long)(uintptr_t)"DATA", 4);
+    sys_call3(SYS_close, fd, 0, 0);
+    r = sys_call3(SYS_symlink, (long)(uintptr_t)"real.txt",
+                  (long)(uintptr_t)"/link1", 0);
+    r += sys_call3(SYS_symlink, (long)(uintptr_t)"/real.txt",
+                   (long)(uintptr_t)"/link2", 0);
+    report("symlink", r == 0 &&
+           read_str("/link1", buf, sizeof buf) == 4 &&
+           buf[0] == 'D' && buf[3] == 'A' &&
+           read_str("/link2", buf, sizeof buf) == 4);
+}
+
+static void t_link_chain(void)
+{
+    char buf[32];
+    sys_call3(SYS_symlink, (long)(uintptr_t)"/link1",
+              (long)(uintptr_t)"/link3", 0);
+    report("link-chain",
+           read_str("/link3", buf, sizeof buf) == 4 &&
+           buf[0] == 'D');
+}
+
+static void t_link_loop(void)
+{
+    long fd;
+    sys_call3(SYS_symlink, (long)(uintptr_t)"/lb",
+              (long)(uintptr_t)"/la", 0);
+    sys_call3(SYS_symlink, (long)(uintptr_t)"/la",
+              (long)(uintptr_t)"/lb", 0);
+    fd = open_("/la", O_RDONLY);
+    report("link-loop", fd == -40);
+    if (fd >= 0)
+        sys_call3(SYS_close, fd, 0, 0);
+}
+
+static void t_link_dangle(void)
+{
+    static char buf[64];
+    long fd, n;
+    sys_call3(SYS_symlink, (long)(uintptr_t)"/no-such",
+              (long)(uintptr_t)"/dang", 0);
+    fd = open_("/dang", O_RDONLY);
+    n = sys_call3(SYS_readlink, (long)(uintptr_t)"/dang",
+                  (long)(uintptr_t)buf, sizeof buf - 1);
+    if (n >= 0)
+        buf[n] = '\0';
+    report("link-dangle", fd == -2 && n == 8 &&
+           buf[0] == '/' && buf[1] == 'n');
+    if (fd >= 0)
+        sys_call3(SYS_close, fd, 0, 0);
+}
+
+static void t_readlink(void)
+{
+    static char buf[64];
+    long n = sys_call3(SYS_readlink, (long)(uintptr_t)"/link1",
+                       (long)(uintptr_t)buf, sizeof buf - 1);
+    long bad;
+    if (n >= 0)
+        buf[n] = '\0';
+    bad = sys_call3(SYS_readlink, (long)(uintptr_t)"/real.txt",
+                    (long)(uintptr_t)buf, sizeof buf - 1);
+    report("readlink", n == 8 && buf[0] == 'r' &&
+           buf[7] == 't' && bad == -22);
+}
+
+static void t_link_midpath(void)
+{
+    char buf[32];
+    long fd;
+    sys_call3(SYS_mkdir, (long)(uintptr_t)"/ld", 0755, 0);
+    fd = open_("/ld/inner.txt", O_CREAT | O_RDWR | O_TRUNC);
+    if (fd < 0) {
+        report("link-midpath", 0);
+        return;
+    }
+    sys_call3(SYS_write, fd, (long)(uintptr_t)"IN", 2);
+    sys_call3(SYS_close, fd, 0, 0);
+    sys_call3(SYS_symlink, (long)(uintptr_t)"/ld",
+              (long)(uintptr_t)"/ldlink", 0);
+    report("link-midpath",
+           read_str("/ldlink/inner.txt", buf, sizeof buf) == 2 &&
+           buf[0] == 'I' && buf[1] == 'N');
+}
+
+static void t_link_unlink(void)
+{
+    char buf[32];
+    long r = sys_call3(SYS_unlink, (long)(uintptr_t)"/link2",
+                       0, 0);
+    long fd = open_("/link2", O_RDONLY);
+    report("link-unlink", r == 0 && fd == -2 &&
+           read_str("/real.txt", buf, sizeof buf) == 4);
+    if (fd >= 0)
+        sys_call3(SYS_close, fd, 0, 0);
+}
+
 int main(void)
 {
     long fd;
@@ -486,6 +615,13 @@ int main(void)
     t_unlink_open();
     t_rename();
     t_rmdir();
+    t_symlink();
+    t_link_chain();
+    t_link_loop();
+    t_link_dangle();
+    t_readlink();
+    t_link_midpath();
+    t_link_unlink();
 
     if (fd >= 0)
         sys_call3(SYS_close, fd, 0, 0);

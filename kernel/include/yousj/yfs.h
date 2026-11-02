@@ -36,8 +36,14 @@ uint32_t yfs_disk_sectors(void);
 long yfs_lookup(const char *rel);          /* inode or -errno */
 bool yfs_is_dir(uint32_t ino);
 uint32_t yfs_size(uint32_t ino);
+long yfs_mknod_t(const char *parent_rel, const char *name,
+                 uint8_t type);
 long yfs_mknod(const char *parent_rel, const char *name,
-               bool is_dir);               /* new inode or -errno */
+               bool is_dir);
+/* M16: inode types are 0 free, 1 file, 2 dir, 3 symlink. */
+int yfs_type_of(uint32_t ino);
+long yfs_symlink(const char *parent_rel, const char *name,
+                 const char *target);               /* new inode or -errno */
 long yfs_pread(uint32_t ino, uint32_t off, void *dst,
                uint32_t count);
 long yfs_pwrite(uint32_t ino, uint32_t off, const void *src,

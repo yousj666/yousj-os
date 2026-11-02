@@ -25,6 +25,7 @@
 #define YOUSJ_ENAMETOOLONG_L 36
 #define YOUSJ_EXDEV_L 18
 #define YOUSJ_ENOTEMPTY_L 39
+#define YOUSJ_ELOOP_L 40
 
 static uint64_t str_len(const char *s); /* defined below */
 
@@ -76,6 +77,7 @@ static void split_parent_name(const char *rel, char *parent,
 struct yousj_ramfs_node {
     bool in_use;
     bool is_dir;
+    bool is_link;                       /* M16: content = target */
     char name[NAME_MAX_LEN + 1];
     struct yousj_ramfs_node *parent;
     struct yousj_ramfs_node *child_head;
@@ -466,6 +468,183 @@ long fs_pipe_create(struct yousj_file **rd_out,
     return 0;
 }
 
+
+/* ------------------------------------------------------------------ */
+/* M16: symbolic-link resolution. Every path-taking entry
+ * point runs its path through fs_resolve_links first: any
+ * component that is a symlink is spliced out (targets may
+ * be absolute, or relative to the link's own directory),
+ * "." and ".." collapse, and chains are capped (ELOOP).
+ * Operations that act ON a name (mkdir, unlink, rmdir,
+ * rename, readlink) pass follow_final=false so the last
+ * component itself is never followed; readers pass true.
+ * Resolution happens purely in path space, so a link may
+ * cross the /data boundary in either direction. */
+
+static void path_copy(char *dst, const char *src)
+{
+    uint64_t i = 0;
+    while (src[i] != '\0' && i < PATH_MAX_LEN) {
+        dst[i] = src[i];
+        i++;
+    }
+    dst[i] = '\0';
+}
+
+/* Collapse "//", "." and ".." in place (absolute paths). */
+static void path_normalize(char *p)
+{
+    uint16_t starts[128];
+    int ncomp = 0;
+    uint64_t i = 0, w = 0;
+    while (p[i] != '\0') {
+        uint64_t j = i, len;
+        while (p[j] != '\0' && p[j] != '/')
+            j++;
+        len = j - i;
+        if (len == 1 && p[i] == '.') {
+            /* skip */
+        } else if (len == 2 && p[i] == '.' && p[i + 1] == '.') {
+            if (ncomp > 0)
+                w = starts[--ncomp];
+        } else if (len > 0) {
+            uint64_t k;
+            if (w == 0 || p[w - 1] != '/')
+                p[w++] = '/';
+            starts[ncomp++] = (uint16_t)w;
+            for (k = 0; k < len; k++)
+                p[w++] = p[i + k];
+        }
+        i = (p[j] == '/') ? j + 1 : j;
+    }
+    if (w == 0)
+        p[w++] = '/';
+    p[w] = '\0';
+}
+
+static void parent_of(const char *path, char *out)
+{
+    uint64_t n = str_len(path), i;
+    path_copy(out, path);
+    if (n <= 1) {
+        out[0] = '/';
+        out[1] = '\0';
+        return;
+    }
+    for (i = n - 1; i > 0; i--) {
+        if (out[i] == '/') {
+            if (i == 0) {
+                out[0] = '/';
+                out[1] = '\0';
+            } else {
+                out[i] = '\0';
+            }
+            return;
+        }
+    }
+    out[0] = '/';
+    out[1] = '\0';
+}
+
+/* 0 + is_link (+target text) when the path exists; ENOENT
+ * when it does not. */
+static long fs_link_check(const char *path, bool *is_link,
+                          char *target, uint64_t cap)
+{
+    *is_link = false;
+    if (is_data_path(path)) {
+        long ino = yfs_lookup(data_rel(path));
+        if (ino < 0)
+            return -YOUSJ_ENOENT;
+        if (yfs_type_of((uint32_t)ino) == 3) {
+            long n = yfs_pread((uint32_t)ino, 0,
+                               (uint8_t *)target,
+                               (uint32_t)(cap - 1));
+            if (n < 0)
+                return n;
+            target[n] = '\0';
+            *is_link = true;
+        }
+        return 0;
+    }
+    {
+        struct yousj_ramfs_node *n = fs_lookup(path);
+        if (n == NULL)
+            return -YOUSJ_ENOENT;
+        if (n->is_link) {
+            long got = node_pread(n, 0, (uint8_t *)target,
+                                  cap - 1);
+            if (got < 0)
+                return got;
+            target[got] = '\0';
+            *is_link = true;
+        }
+        return 0;
+    }
+}
+
+static long fs_resolve_links(const char *path, char *out,
+                             bool follow_final)
+{
+    char cur[PATH_MAX_LEN + 1];
+    int depth;
+    path_copy(cur, path);
+    path_normalize(cur);
+    for (depth = 0; ; depth++) {
+        bool spliced = false;
+        uint64_t i = 1; /* components follow the root '/' */
+        char prefix[PATH_MAX_LEN + 1];
+        prefix[0] = '/';
+        prefix[1] = '\0';
+        while (cur[i] != '\0') {
+            uint64_t j = i, plen;
+            bool final_comp, is_link;
+            char target[PATH_MAX_LEN + 1];
+            while (cur[j] != '\0' && cur[j] != '/')
+                j++;
+            final_comp = (cur[j] == '\0');
+            plen = str_len(prefix);
+            if (plen > 1)
+                prefix[plen++] = '/';
+            mem_copy((uint8_t *)prefix + plen,
+                     (const uint8_t *)cur + i, j - i);
+            prefix[plen + (j - i)] = '\0';
+            if ((!final_comp || follow_final) &&
+                fs_link_check(prefix, &is_link, target,
+                              sizeof target) == 0 && is_link) {
+                char next[PATH_MAX_LEN + 1];
+                uint64_t w;
+                if (depth >= 8)
+                    return -YOUSJ_ELOOP_L;
+                if (target[0] == '/') {
+                    path_copy(next, target);
+                } else {
+                    char parent[PATH_MAX_LEN + 1];
+                    parent_of(prefix, parent);
+                    path_copy(next, parent);
+                    w = str_len(next);
+                    if (w > 1)
+                        next[w++] = '/';
+                    next[w] = '\0';
+                    path_copy(next + w, target);
+                }
+                w = str_len(next);
+                if (cur[j] != '\0')
+                    path_copy(next + w, cur + j);
+                path_copy(cur, next);
+                path_normalize(cur);
+                spliced = true;
+                break;
+            }
+            i = (cur[j] == '/') ? j + 1 : j;
+        }
+        if (!spliced) {
+            path_copy(out, cur);
+            return 0;
+        }
+    }
+}
+
 static long ramfs_open_path(const char *path, long flags,
                             struct yousj_file **out)
 {
@@ -487,6 +666,8 @@ static long ramfs_open_path(const char *path, long flags,
         if (n == NULL)
             return -YOUSJ_ENOSPC;
     }
+    if (n->is_link)
+        return -YOUSJ_ELOOP_L; /* resolution missed one */
     if (n->is_dir) {
         if (acc != YOUSJ_O_RDONLY)
             return -YOUSJ_EISDIR;
@@ -529,6 +710,8 @@ static long yfs_open_path_fs(const char *rel, long flags,
                 return ino;
         }
     }
+    if (yfs_type_of((uint32_t)ino) == 3)
+        return -YOUSJ_ELOOP_L; /* resolution missed one */
     is_dir = yfs_is_dir((uint32_t)ino);
     if (is_dir) {
         if (acc != YOUSJ_O_RDONLY)
@@ -554,6 +737,11 @@ static long yfs_open_path_fs(const char *rel, long flags,
 long fs_open_path(const char *path, long flags,
                   struct yousj_file **out)
 {
+    char resolved[PATH_MAX_LEN + 1];
+    long rc = fs_resolve_links(path, resolved, true);
+    if (rc != 0)
+        return rc;
+    path = resolved;
     if (is_data_path(path))
         return yfs_open_path_fs(data_rel(path), flags, out);
     return ramfs_open_path(path, flags, out);
@@ -561,6 +749,11 @@ long fs_open_path(const char *path, long flags,
 
 long fs_mkdir_path(const char *path)
 {
+    char resolved[PATH_MAX_LEN + 1];
+    long rc = fs_resolve_links(path, resolved, false);
+    if (rc != 0)
+        return rc;
+    path = resolved;
     if (is_data_path(path)) {
         char parent[128], name[40];
         long ino;
@@ -573,6 +766,11 @@ long fs_mkdir_path(const char *path)
 
 long fs_unlink_path(const char *path)
 {
+    char resolved[PATH_MAX_LEN + 1];
+    long rc = fs_resolve_links(path, resolved, false);
+    if (rc != 0)
+        return rc;
+    path = resolved;
     if (is_data_path(path)) {
         char parent[128], name[40];
         split_parent_name(data_rel(path), parent, name);
@@ -598,6 +796,11 @@ long fs_unlink_path(const char *path)
 
 long fs_rmdir_path(const char *path)
 {
+    char resolved[PATH_MAX_LEN + 1];
+    long rc = fs_resolve_links(path, resolved, false);
+    if (rc != 0)
+        return rc;
+    path = resolved;
     if (is_data_path(path)) {
         char parent[128], name[40];
         split_parent_name(data_rel(path), parent, name);
@@ -627,6 +830,15 @@ long fs_rmdir_path(const char *path)
 
 long fs_rename_path(const char *old_path, const char *new_path)
 {
+    char ro[PATH_MAX_LEN + 1], rn[PATH_MAX_LEN + 1];
+    long rc = fs_resolve_links(old_path, ro, false);
+    if (rc != 0)
+        return rc;
+    rc = fs_resolve_links(new_path, rn, false);
+    if (rc != 0)
+        return rc;
+    old_path = ro;
+    new_path = rn;
     bool od = is_data_path(old_path), nd = is_data_path(new_path);
     char obase[NAME_MAX_LEN + 1], nbase[NAME_MAX_LEN + 1];
     struct yousj_ramfs_node *oparent, *nparent, *src, *dst, *a;
@@ -685,8 +897,72 @@ long fs_rename_path(const char *old_path, const char *new_path)
     return 0;
 }
 
+long fs_symlink_path(const char *target, const char *linkpath)
+{
+    char resolved[PATH_MAX_LEN + 1];
+    long rc = fs_resolve_links(linkpath, resolved, false);
+    if (rc != 0)
+        return rc;
+    if (str_len(target) > PATH_MAX_LEN)
+        return -YOUSJ_ENAMETOOLONG_L;
+    if (is_data_path(resolved)) {
+        char parent[128], name[40];
+        split_parent_name(data_rel(resolved), parent, name);
+        rc = yfs_symlink(parent, name, target);
+        return rc >= 0 ? 0 : rc;
+    }
+    {
+        char base[NAME_MAX_LEN + 1];
+        struct yousj_ramfs_node *parent = walk(resolved, true,
+                                               base);
+        struct yousj_ramfs_node *n;
+        if (parent == NULL)
+            return -YOUSJ_ENOENT;
+        if (node_find_child(parent, base, str_len(base)) != NULL)
+            return -YOUSJ_EEXIST_L;
+        n = node_create(parent, base, str_len(base), false);
+        if (n == NULL)
+            return -YOUSJ_ENOSPC;
+        n->is_link = true;
+        if (node_pwrite(n, 0, (const uint8_t *)target,
+                        str_len(target)) < 0)
+            return -YOUSJ_ENOSPC;
+        return 0;
+    }
+}
+
+long fs_readlink_path(const char *path, char *buf, uint64_t cap)
+{
+    char resolved[PATH_MAX_LEN + 1];
+    long rc = fs_resolve_links(path, resolved, false);
+    if (rc != 0)
+        return rc;
+    if (is_data_path(resolved)) {
+        long ino = yfs_lookup(data_rel(resolved));
+        if (ino < 0)
+            return ino;
+        if (yfs_type_of((uint32_t)ino) != 3)
+            return -YOUSJ_EINVAL;
+        return yfs_pread((uint32_t)ino, 0, (uint8_t *)buf,
+                         (uint32_t)cap);
+    }
+    {
+        struct yousj_ramfs_node *n = fs_lookup(resolved);
+        if (n == NULL)
+            return -YOUSJ_ENOENT;
+        if (!n->is_link)
+            return -YOUSJ_EINVAL;
+        return node_pread(n, 0, (uint8_t *)buf, cap);
+    }
+}
+
 long fs_read_all_path(const char *path, uint8_t *dst, uint64_t cap)
 {
+    char resolved[PATH_MAX_LEN + 1];
+    long rc = fs_resolve_links(path, resolved, true);
+    if (rc != 0)
+        return rc;
+    path = resolved;
     if (is_data_path(path)) {
         long ino = yfs_lookup(data_rel(path));
         uint32_t size;
@@ -716,6 +992,10 @@ long fs_read_all_path(const char *path, uint8_t *dst, uint64_t cap)
 bool fs_path_stat(const char *path, bool *is_dir_out,
                   uint64_t *size_out)
 {
+    char resolved[PATH_MAX_LEN + 1];
+    if (fs_resolve_links(path, resolved, true) != 0)
+        return false;
+    path = resolved;
     if (is_data_path(path)) {
         long ino = yfs_lookup(data_rel(path));
         if (ino < 0)
@@ -924,7 +1204,9 @@ long file_getdents(struct yousj_file *f, uint8_t *buf, uint64_t count)
             *(uint64_t *)(rec + 0) = cino + 2;
             *(uint64_t *)(rec + 8) = slot;
             *(uint16_t *)(rec + 16) = (uint16_t)reclen;
-            rec[18] = isdir ? YOUSJ_DT_DIR : YOUSJ_DT_REG;
+            rec[18] = isdir ? YOUSJ_DT_DIR
+                      : (cino >= 0 && yfs_type_of((uint32_t)cino) == 3)
+                          ? 10 : YOUSJ_DT_REG;
             mem_copy(rec + 19, (const uint8_t *)nm, namelen);
             used += reclen;
             f->offset = slot;
@@ -949,7 +1231,7 @@ long file_getdents(struct yousj_file *f, uint8_t *buf, uint64_t count)
         *(uint64_t *)(rec + 0) = 1; /* ino: no stable ids yet */
         *(uint64_t *)(rec + 8) = (uint64_t)(idx + 1);
         *(uint16_t *)(rec + 16) = (uint16_t)reclen;
-        rec[18] = c->is_dir ? YOUSJ_DT_DIR : YOUSJ_DT_REG;
+        rec[18] = c->is_dir ? YOUSJ_DT_DIR : c->is_link ? 10 : YOUSJ_DT_REG;
         mem_copy(rec + 19, (const uint8_t *)c->name, namelen);
         used += reclen;
         f->offset = idx + 1;

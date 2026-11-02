@@ -233,8 +233,22 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   其余十链不回归。注：磁盘套件一处断言在三机并行时出
   现过缓冲快照竞态（第二行输出未到就断言），已改为显
   式等待该行后单跑复验全绿，与内核无关。
-- ⏳ 下一步候选：符号链接、mmap 缺页填充（真按需分
-  页）、yfs 一致性日志、epoll。
+- ✅ 调度 M16（2026-11-02）：符号链接两后端齐全——
+  symlink(88)/symlinkat(266)/readlink(89)；ramfs 节点加
+  is_link 标志、yfs 新增链接型 inode（type 3），目标文
+  本都存为文件内容。路径解析层 fs_resolve_links 织入所
+  有带路径入口：逐分量跟随（目标可绝对、可相对链接所
+  在目录）、"." 与 ".." 归一、链深上限 8（超出 ELOOP）；
+  open/stat/exec 跟随末分量，mkdir/unlink/rmdir/rename/
+  readlink 不跟随末分量（删链接不伤真身）。解析纯在路
+  径空间进行，链接可跨 /data 边界。getdents 给链接报
+  DT_LNK，ls 显示 @ 后缀，新增 /bin/ln 与 /bin/readlink。
+  验收：fstest 七场景（相对/绝对目标、链、环、悬空、
+  readlink 本身与非链接 EINVAL、中间分量是链接、删链
+  留真身）两轮全过；磁盘套件在 /data 建相对链接、两次
+  硬杀断电后仍可读穿；其余十一链不回归。
+- ⏳ 下一步候选：mmap 缺页填充（真按需分页）、yfs 一
+  致性日志、epoll、lstat。
 
 ## 从零构建
 

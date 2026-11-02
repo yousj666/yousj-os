@@ -56,6 +56,9 @@
 #define YOUSJ_SYS_getdents64  217
 #define YOUSJ_SYS_openat      257  /* M9 */
 #define YOUSJ_SYS_unlinkat    263  /* M13 */
+#define YOUSJ_SYS_symlink      88   /* M16 */
+#define YOUSJ_SYS_readlink     89   /* M16 */
+#define YOUSJ_SYS_symlinkat   266   /* M16 */
 #define YOUSJ_SYS_dup3        292  /* M10 */
 #define YOUSJ_SYS_pipe2       293  /* M10 */
 #define YOUSJ_SYS_arch_prctl  158

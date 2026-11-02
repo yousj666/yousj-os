@@ -47,7 +47,9 @@ def check(name, cond):
 
 SCENARIOS = ['persist', 'write-read', 'append', 'trunc', 'seek',
              'dents', 'errors', 'fork-share', 'mkdir-cwd', 'openat',
-             'unlink', 'unlink-open', 'rename', 'rmdir']
+             'unlink', 'unlink-open', 'rename', 'rmdir',
+             'symlink', 'link-chain', 'link-loop', 'link-dangle',
+             'readlink', 'link-midpath', 'link-unlink']
 
 check('shell prompt', until('sh> ', 45))
 

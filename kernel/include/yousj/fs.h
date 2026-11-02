@@ -116,6 +116,13 @@ long fs_read_all_path(const char *path, uint8_t *dst,
 long fs_unlink_path(const char *path);
 long fs_rmdir_path(const char *path);
 long fs_rename_path(const char *old_path, const char *new_path);
+/* M16: symlinks. fs_symlink_path creates a link at linkpath
+ * holding target (stored verbatim, absolute or relative);
+ * fs_readlink_path returns the target's length, or -EINVAL
+ * when the path is not a link. */
+long fs_symlink_path(const char *target, const char *linkpath);
+long fs_readlink_path(const char *path, char *buf,
+                      uint64_t cap);
 bool fs_file_is_dir(struct yousj_file *f);
 /* M14: positional I/O on an open file object (the mmap
  * layer's read-in / write-back path; the object's own

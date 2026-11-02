@@ -132,6 +132,7 @@ check('p2 rename keep->renamed',
       sess.run_expect('mv /data/keep.txt /data/renamed.txt',
                       'sh> '))
 sess.buf = b''
+sess.run_expect('ln -s renamed.txt /data/k-link', 'sh> ')
 check('p2 rm h.txt', sess.run_expect('rm /data/h.txt', 'sh> '))
 qemu.kill()  # power cut again
 qemu.wait()
@@ -161,6 +162,11 @@ check('p3 bigfile verify after power cut',
       sess.run_expect('bigfile /data/big.bin 102400 check',
                       'sh> '))
 sess.buf = b''
+ok = sess.run_expect('cat /data/k-link', 'persist-me')
+ok = ok and sess.until('second-boot', 15)
+check('p3 symlink to renamed.txt reads through', ok)
+check('p3 readlink prints target',
+      sess.run_expect('readlink /data/k-link', 'renamed.txt'))
 check('p3 subdir file still there',
       sess.run_expect('cat /data/sub/a.txt', 'nested'))
 qemu.terminate()

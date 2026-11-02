@@ -69,6 +69,8 @@ int main(int argc, char **argv)
             out_s(buf + off + 19);
             if (type == DT_DIR)
                 out_s("/");
+            else if (type == 10) /* DT_LNK */
+                out_s("@");
             out_s("\n");
             if (reclen == 0)
                 return 1;

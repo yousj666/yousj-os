@@ -309,6 +309,36 @@ long yfs_pwrite(uint32_t ino, uint32_t off, const void *src,
     return (long)done;
 }
 
+long yfs_mknod(const char *parent_rel, const char *name,
+               bool is_dir)
+{
+    return yfs_mknod_t(parent_rel, name, is_dir ? 2 : 1);
+}
+
+int yfs_type_of(uint32_t ino)
+{
+    struct yfs_inode n;
+    if (inode_read(ino, &n) != 0)
+        return -1;
+    return n.type;
+}
+
+/* M16: a symlink inode (type 3) whose content is the target
+ * text, written through the regular content path. */
+long yfs_symlink(const char *parent_rel, const char *name,
+                 const char *target)
+{
+    long ino = yfs_mknod_t(parent_rel, name, 3);
+    uint32_t len;
+    if (ino < 0)
+        return ino;
+    len = (uint32_t)str_len(target);
+    if (yfs_pwrite((uint32_t)ino, 0, (const uint8_t *)target,
+                   len) != (long)len)
+        return -E_IO_L;
+    return ino;
+}
+
 int yfs_truncate(uint32_t ino, uint32_t size)
 {
     struct yfs_inode n;
@@ -691,7 +721,8 @@ void yfs_note_close(uint32_t ino)
         free_inode(ino);
 }
 
-long yfs_mknod(const char *parent_rel, const char *name, bool is_dir)
+long yfs_mknod_t(const char *parent_rel, const char *name,
+                 uint8_t type)
 {
     long pino;
     struct yfs_inode parent, fresh;
@@ -720,7 +751,7 @@ long yfs_mknod(const char *parent_rel, const char *name, bool is_dir)
     if (free_ino == 0xFFFFFFFFu)
         return -E_NOSPC_L;
     mem_zero((uint8_t *)&fresh, sizeof(fresh));
-    fresh.type = is_dir ? 2 : 1;
+    fresh.type = type;
     fresh.size = 0;
     for (i = 0; i < 12; i++)
         fresh.blocks[i] = UNALLOC; /* all slots incl. indirect */

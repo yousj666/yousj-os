@@ -956,6 +956,58 @@ static long sys_getcwd_sys(uint64_t buf, uint64_t size)
     return (long)len;
 }
 
+/* --- M16: symlink / readlink -------------------------- */
+
+static long sys_symlink(uint64_t target_ptr, uint64_t link_ptr)
+{
+    char target[264], linkpath[264], resolved[264];
+    struct task *me = sched_current();
+    long n;
+    n = copy_user_string(target_ptr, target, sizeof target);
+    if (n != 0)
+        return n;
+    n = copy_user_string(link_ptr, linkpath, sizeof linkpath);
+    if (n != 0)
+        return n;
+    resolve_path(me, linkpath, resolved);
+    return fs_symlink_path(target, resolved);
+}
+
+static long sys_symlinkat(uint64_t target_ptr, long dirfd,
+                          uint64_t link_ptr)
+{
+    if (dirfd != YOUSJ_AT_FDCWD)
+        return -YOUSJ_EBADF;
+    return sys_symlink(target_ptr, link_ptr);
+}
+
+static long sys_readlink(uint64_t path_ptr, uint64_t buf_ptr,
+                         uint64_t cap)
+{
+    char path[264], resolved[264], target[264];
+    struct task *me = sched_current();
+    long n;
+    n = copy_user_string(path_ptr, path, sizeof path);
+    if (n != 0)
+        return n;
+    if (!user_range_ok(buf_ptr, 1) || cap == 0)
+        return -YOUSJ_EFAULT;
+    if (cap > sizeof target)
+        cap = sizeof target;
+    resolve_path(me, path, resolved);
+    n = fs_readlink_path(resolved, target, cap);
+    if (n < 0)
+        return n;
+    if (!user_range_ok(buf_ptr, (uint64_t)n))
+        return -YOUSJ_EFAULT;
+    {
+        uint64_t i;
+        for (i = 0; i < (uint64_t)n; i++)
+            ((char *)(uintptr_t)buf_ptr)[i] = target[i];
+    }
+    return n;
+}
+
 /* --- M15: poll / select ------------------------------------------
  * One readiness probe serves the whole family. Regular files
  * are always ready; a pipe read end is readable with data or
@@ -1867,6 +1919,12 @@ static long dispatch_inner(struct yousj_syscall_ctx *ctx)
         return sys_pselect_sys((long)a1, a2, a3, a4, a5);
     case YOUSJ_SYS_unlink:
         return sys_unlink_sys(a1);
+    case YOUSJ_SYS_symlink:
+        return sys_symlink(a1, a2);
+    case YOUSJ_SYS_readlink:
+        return sys_readlink(a1, a2, a3);
+    case YOUSJ_SYS_symlinkat:
+        return sys_symlinkat(a1, (long)a2, a3);
     case YOUSJ_SYS_unlinkat:
         return (long)a1 == YOUSJ_AT_FDCWD
                    ? sys_unlink_sys(a2)
