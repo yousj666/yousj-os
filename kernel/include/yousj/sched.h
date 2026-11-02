@@ -145,6 +145,9 @@ struct task {
     uint64_t        sig_pending;  /* queued signals, bit (sig-1) */
     uint64_t        sig_blocked;  /* blocked mask, same encoding */
     struct yousj_sigaction sig_act[YOUSJ_NSIG]; /* dispositions */
+    uint64_t        sig_alt_sp;   /* M32: alternate signal stack */
+    uint64_t        sig_alt_size;
+    uint32_t        sig_alt_flags; /* YOUSJ_SS_DISABLE when off */
     int             sig_killed;   /* when a signal ended this
                                      task: its number, else 0;
                                      wait4 builds the status

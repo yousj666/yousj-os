@@ -35,6 +35,7 @@ static long sys_call4(long n, long a, long b, long c, long d)
     return r;
 }
 
+#define SYS_sigaltstack     131
 #define SYS_rt_sigaction    13
 #define SYS_rt_sigprocmask  14
 #define SYS_rt_sigpending   127
@@ -58,6 +59,7 @@ static long sys_call4(long n, long a, long b, long c, long d)
 #define SA_SIGINFO   0x00000004u
 #define SA_RESTORER  0x04000000u
 #define SA_RESTART   0x10000000u
+#define SA_ONSTACK   0x08000000u
 
 #define SIG_BLOCK   0
 #define SIG_UNBLOCK 1
@@ -281,6 +283,20 @@ static void fail_handler(int sig)
     (void)sig;
     out("SIGTEST exec-reset FAIL (handler survived exec)\n");
     exit_now(3);
+}
+
+/* For the altstack scenario (M32): records the stack
+ * pointer the handler actually runs on. */
+static uint8_t g_alt_stack[8192];
+static volatile long g_alt_rsp;
+static volatile long g_alt_ran;
+static void alt_handler(int sig)
+{
+    long sp;
+    (void)sig;
+    __asm__ volatile("mov %%rsp, %0" : "=r"(sp));
+    g_alt_rsp = sp;
+    g_alt_ran++;
 }
 
 /* For the IRQ-delivery scenario: the spinning child is stopped
@@ -597,6 +613,64 @@ static int streq(const char *a, const char *b)
     return *a == *b;
 }
 
+/* T12 (M32): sigaltstack + SA_ONSTACK delivery. */
+struct k_stack_t {
+    uint64_t ss_sp;
+    int32_t  ss_flags;
+    int32_t  ss_pad;
+    uint64_t ss_size;
+};
+static void t_altstack(void)
+{
+    long me = getpid();
+    struct k_stack_t ss, old;
+    long lo = (long)(uintptr_t)g_alt_stack;
+    long hi = lo + (long)sizeof(g_alt_stack);
+    int ok = 1;
+    long rc;
+
+    /* nothing configured: the query says SS_DISABLE (2) */
+    old.ss_sp = 0; old.ss_flags = 0; old.ss_size = 0;
+    rc = sys_call3(SYS_sigaltstack, 0, (long)(uintptr_t)&old, 0);
+    ok = ok && rc == 0 && old.ss_flags == 2;
+
+    /* too small: ENOMEM (-28), like Linux */
+    ss.ss_sp = (uint64_t)lo; ss.ss_flags = 0; ss.ss_size = 1024;
+    rc = sys_call3(SYS_sigaltstack, (long)(uintptr_t)&ss, 0, 0);
+    ok = ok && rc == -28;
+
+    /* configure the real one; the query round-trips it */
+    ss.ss_sp = (uint64_t)lo; ss.ss_flags = 0; ss.ss_size = 8192;
+    rc = sys_call3(SYS_sigaltstack, (long)(uintptr_t)&ss, 0, 0);
+    ok = ok && rc == 0;
+    rc = sys_call3(SYS_sigaltstack, 0, (long)(uintptr_t)&old, 0);
+    ok = ok && rc == 0 && (long)old.ss_sp == lo &&
+         old.ss_size == 8192 && old.ss_flags == 0;
+
+    /* SA_ONSTACK: the handler runs on the alt stack */
+    g_alt_ran = 0;
+    sigaction_(SIGUSR1, (void *)&alt_handler, SA_ONSTACK, NULL);
+    kill_pid(me, SIGUSR1);
+    ok = ok && g_alt_ran == 1 && g_alt_rsp > lo && g_alt_rsp < hi;
+
+    /* without SA_ONSTACK it stays on the ordinary stack */
+    sigaction_(SIGUSR1, (void *)&alt_handler, 0, NULL);
+    kill_pid(me, SIGUSR1);
+    ok = ok && g_alt_ran == 2 &&
+         (g_alt_rsp < lo || g_alt_rsp >= hi);
+
+    /* disabled again: SA_ONSTACK falls back too */
+    ss.ss_sp = 0; ss.ss_flags = 2; ss.ss_size = 0;
+    sys_call3(SYS_sigaltstack, (long)(uintptr_t)&ss, 0, 0);
+    sigaction_(SIGUSR1, (void *)&alt_handler, SA_ONSTACK, NULL);
+    kill_pid(me, SIGUSR1);
+    ok = ok && g_alt_ran == 3 &&
+         (g_alt_rsp < lo || g_alt_rsp >= hi);
+
+    sigdfl_(SIGUSR1);
+    report("altstack", ok);
+}
+
 int main(int argc, char **argv)
 {
     if (argc > 1 && streq(argv[1], "victim-pre")) {
@@ -630,6 +704,7 @@ int main(int argc, char **argv)
     t_irq_deliver();
     t_clone_inherit();
     t_exec_reset();
+    t_altstack();
     out("SIGTEST DONE\n");
     return 0;
 }

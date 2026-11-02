@@ -66,6 +66,7 @@ static inline uint64_t yousj_sig_bit(int sig)
 #define YOUSJ_SIG_IGN 1ULL
 
 /* sa_flags subset (Linux values). */
+#define YOUSJ_SA_ONSTACK   0x08000000u /* M32 */
 #define YOUSJ_SA_SIGINFO   0x00000004u
 #define YOUSJ_SA_RESTORER  0x04000000u
 #define YOUSJ_SA_RESTART   0x10000000u
@@ -222,6 +223,18 @@ long sys_rt_sigprocmask(long how, uint64_t set_ptr, uint64_t old_ptr,
                         uint64_t sigsetsize);
 long sys_rt_sigpending(uint64_t set_ptr, uint64_t sigsetsize);
 long sys_rt_sigreturn(struct yousj_syscall_ctx *ctx);
+long sys_sigaltstack(uint64_t ss_ptr, uint64_t old_ptr); /* M32 */
+
+/* sigaltstack(2) ABI (M32): the user stack_t layout. */
+#define YOUSJ_SS_ONSTACK   1
+#define YOUSJ_SS_DISABLE   2
+#define YOUSJ_MINSIGSTKSZ  2048
+struct yousj_stack_t {
+    uint64_t ss_sp;
+    int32_t  ss_flags;
+    int32_t  ss_pad;
+    uint64_t ss_size;
+};
 
 /* Inheritance rules: clone copies masks + dispositions and clears
  * pending; execve resets caught handlers to default (ignored

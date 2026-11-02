@@ -500,9 +500,19 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   cmdline 按原始字节生成（内核线程为空）。验收：
   pidtest 扩 self-link/cmdline-self/cmdline-
   child 三场景两轮；其余二十二链不回归。
-- ⏳ 下一步候选：sigaltstack、renameat 与
-  faccessat 等其余 *at 补齐、更多 /proc 生成项
-  （如 maps 示意/环境 environ)。
+- ✅ sigaltstack M32（2026-11-03）：131 号从
+  ENOSYS 转正。任务存备用栈（sp/size/flags）：
+  clone 继承、exec 清除（Linux 语义）；设置须
+  ≥MINSIGSTKSZ 2048（小了回 ENOMEM）、查询以
+  SS_DISABLE 报告未配置；投递帧构造点统一处理
+  SA_ONSTACK——已在备用栈上时嵌套投递不换栈，
+  ucontext 同步回填 uc_stack。未追踪 SS_ONSTACK
+  查询位（明示）。验收：sigtest 加 altstack 场
+  景（查询/过小/往返/ONSTACK 落栈/无标志回主栈/
+  禁用后回主栈）；其余二十三链不回归。
+- ⏳ 下一步候选：renameat 与 faccessat 等其余
+  *at 补齐、更多 /proc 生成项（如 environ）、
+  getdents 的 d_off 语义细化。
 
 ## 从零构建
 

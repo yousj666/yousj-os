@@ -77,7 +77,7 @@
 #define YOUSJ_SYS_clock_gettime 228 /* M23 */
 #define YOUSJ_SYS_arch_prctl  158
 #define YOUSJ_SYS_rt_sigpending 127 /* M7 */
-#define YOUSJ_SYS_sigaltstack  131  /* M7: -ENOSYS for now */
+#define YOUSJ_SYS_sigaltstack  131  /* M7 stub; real since M32 */
 
 /* Yousj-native calls live far above the Linux-compatible range so the
  * two namespaces can never collide. */

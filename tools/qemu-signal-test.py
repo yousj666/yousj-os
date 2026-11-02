@@ -49,7 +49,8 @@ def check(name, cond):
 
 SCENARIOS = ['handler', 'mask', 'default-term', 'stop-cont',
              'sigkill', 'eintr', 'restart', 'sigchld',
-             'irq-deliver', 'clone-inherit', 'exec-reset']
+             'irq-deliver', 'clone-inherit', 'exec-reset',
+             'altstack']
 
 check('shell prompt', until('sh> ', 45))
 mark = len(buf); f1 = free_pages(mark)

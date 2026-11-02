@@ -12,7 +12,8 @@
  *   - standard signals only; standard signals coalesce (one
  *     pending bit per signal, last sender wins), as on Linux;
  *   - no credentials: any task may signal any user task;
- *   - no alternate signal stack (sigaltstack is -ENOSYS);
+ *   - (M32: the alternate signal stack now exists; the
+ *     SS_ONSTACK query state is not tracked.)
  *   - "core dump" dispositions only set the wait-status bit;
  *     no core file is written (there is no filesystem yet);
  *   - SA_RESTART re-executes the interrupted syscall from
@@ -176,6 +177,10 @@ void signal_clone_inherit(struct task *child, struct task *parent)
     for (i = 0; i < YOUSJ_NSIG; i++)
         child->sig_act[i] = parent->sig_act[i];
     child->sig_pending = 0; /* pending signals are not inherited */
+    /* M32: the alternate stack is inherited (Linux). */
+    child->sig_alt_sp = parent->sig_alt_sp;
+    child->sig_alt_size = parent->sig_alt_size;
+    child->sig_alt_flags = parent->sig_alt_flags;
 }
 
 void signal_exec_reset(struct task *t)
@@ -186,6 +191,11 @@ void signal_exec_reset(struct task *t)
             t->sig_act[i].handler = YOUSJ_SIG_DFL;
     }
     /* Blocked mask and pending signals survive exec (Linux). */
+    /* M32: the alternate stack does NOT survive exec --
+     * the new image starts with it disabled (Linux). */
+    t->sig_alt_sp = 0;
+    t->sig_alt_size = 0;
+    t->sig_alt_flags = YOUSJ_SS_DISABLE;
 }
 
 /* --- the delivery gate --------------------------------------------------- */
@@ -220,7 +230,22 @@ static int build_frame(struct task *me, int sig,
 
     if (act->restorer == 0)
         return -1;
-    f = (snap->rsp - flen) & ~15ULL;
+    /* M32: SA_ONSTACK delivery builds the frame on the
+     * alternate stack when one is configured and the
+     * interrupted rsp is not already inside it (a nested
+     * delivery then continues on the same stack). */
+    {
+        uint64_t base = snap->rsp;
+        if ((act->flags & YOUSJ_SA_ONSTACK) &&
+            me->sig_alt_sp != 0 &&
+            !(me->sig_alt_flags & YOUSJ_SS_DISABLE)) {
+            uint64_t lo = me->sig_alt_sp;
+            uint64_t hi = lo + me->sig_alt_size;
+            if (snap->rsp < lo || snap->rsp > hi)
+                base = hi;
+        }
+        f = (base - flen) & ~15ULL;
+    }
     x = f - 8;
     if (!yousj_user_range_ok(x, flen + 8))
         return -1;
@@ -230,6 +255,15 @@ static int build_frame(struct task *me, int sig,
     fr->pretcode = act->restorer;
     fr->uc.uc_flags = restart ? YOUSJ_UC_RESTART : 0;
     fr->uc.uc_sigmask = me->sig_blocked;
+    /* M32: the frame reports the current alt stack, as
+     * Linux fills uc_stack. SS_ONSTACK (whether the
+     * interrupted context was on it) is not tracked. */
+    fr->uc.uc_stack_sp = me->sig_alt_sp;
+    fr->uc.uc_stack_flags =
+        (me->sig_alt_sp == 0 ||
+         (me->sig_alt_flags & YOUSJ_SS_DISABLE))
+            ? YOUSJ_SS_DISABLE : 0;
+    fr->uc.uc_stack_size = me->sig_alt_size;
     mc = &fr->uc.uc_mcontext;
     mc->r8 = snap->r8;   mc->r9 = snap->r9;
     mc->r10 = snap->r10; mc->r11 = snap->r11;
@@ -637,4 +671,51 @@ long sys_rt_sigreturn(struct yousj_syscall_ctx *ctx)
     rc = sys_rt_sigreturn_inner(ctx);
     UACCESS_END(me);
     return rc;
+}
+
+/* M32: sigaltstack(2). The query reports SS_DISABLE
+ * whenever no stack is in force. Setting a stack needs
+ * at least MINSIGSTKSZ bytes (Linux answers a smaller
+ * one with ENOMEM); SS_DISABLE turns the current one
+ * off. Only flags 0 and SS_DISABLE are accepted on
+ * input (SS_ONSTACK is an output-only state on Linux,
+ * and it is not tracked here). */
+long sys_sigaltstack(uint64_t ss_ptr, uint64_t old_ptr)
+{
+    struct task *me = sched_current();
+    if (me == NULL)
+        return -YOUSJ_EFAULT;
+    if (old_ptr != 0) {
+        struct yousj_stack_t *o =
+            (struct yousj_stack_t *)(uintptr_t)old_ptr;
+        if (!yousj_user_range_ok(old_ptr, sizeof(*o)))
+            return -YOUSJ_EFAULT;
+        o->ss_sp = me->sig_alt_sp;
+        o->ss_flags = (me->sig_alt_sp == 0 ||
+                       (me->sig_alt_flags & YOUSJ_SS_DISABLE))
+                          ? YOUSJ_SS_DISABLE
+                          : 0;
+        o->ss_pad = 0;
+        o->ss_size = me->sig_alt_size;
+    }
+    if (ss_ptr != 0) {
+        const struct yousj_stack_t *n =
+            (const struct yousj_stack_t *)(uintptr_t)ss_ptr;
+        if (!yousj_user_range_ok(ss_ptr, sizeof(*n)))
+            return -YOUSJ_EFAULT;
+        if (n->ss_flags & ~(int32_t)YOUSJ_SS_DISABLE)
+            return -YOUSJ_EINVAL;
+        if (n->ss_flags & YOUSJ_SS_DISABLE) {
+            me->sig_alt_flags |= YOUSJ_SS_DISABLE;
+        } else {
+            if (n->ss_size < YOUSJ_MINSIGSTKSZ)
+                return -28; /* ENOMEM, as Linux answers */
+            if (!yousj_user_range_ok(n->ss_sp, n->ss_size))
+                return -YOUSJ_EFAULT;
+            me->sig_alt_sp = n->ss_sp;
+            me->sig_alt_size = n->ss_size;
+            me->sig_alt_flags = 0;
+        }
+    }
+    return 0;
 }

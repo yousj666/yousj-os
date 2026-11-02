@@ -2823,7 +2823,7 @@ static long dispatch_inner(struct yousj_syscall_ctx *ctx)
     case YOUSJ_SYS_rt_sigpending:
         return sys_rt_sigpending(a1, a2);
     case YOUSJ_SYS_sigaltstack:
-        return -YOUSJ_ENOSYS; /* no alternate stacks yet (M7 note) */
+        return sys_sigaltstack(a1, a2);
     case YOUSJ_SYS_exit:
     case YOUSJ_SYS_exit_group:
         process_exit((long)a1, 0);
