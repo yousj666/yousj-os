@@ -379,6 +379,8 @@ extern const uint8_t _binary_yousj_init_elf_start[];
 extern const uint8_t _binary_yousj_init_elf_end[];
 extern const uint8_t _binary_hello_elf_start[];
 extern const uint8_t _binary_hello_elf_end[];
+extern const uint8_t _binary_sh_elf_start[];
+extern const uint8_t _binary_sh_elf_end[];
 
 struct exec_image {
     const char   *path;
@@ -389,6 +391,7 @@ struct exec_image {
 static const struct exec_image g_exec_images[] = {
     { "/init",      _binary_yousj_init_elf_start, _binary_yousj_init_elf_end },
     { "/bin/hello", _binary_hello_elf_start,      _binary_hello_elf_end },
+    { "/bin/sh",    _binary_sh_elf_start,         _binary_sh_elf_end },
 };
 
 static int kstreq(const char *a, const char *b)
@@ -798,6 +801,8 @@ long yousj_syscall_dispatch(long no, long a1, long a2, long a3,
         __builtin_unreachable();
     case YOUSJ_SYS_NATIVE_PS_SNAPSHOT:
         return sys_ps_snapshot((uint64_t)a1, (uint64_t)a2);
+    case YOUSJ_SYS_NATIVE_PMM_FREE:
+        return (long)pmm_free_page_count();
     default:
         (void)a4;
         (void)a5;

@@ -26,6 +26,9 @@
  *
  * Push count is 9, which with kernel_rsp 8-mod-16 aligned leaves
  * the stack 16-byte aligned at the `call`, as the SysV ABI wants.
+ * The 9th push saves the user RSP on the kernel stack: it is the
+ * one piece of per-task syscall state that must survive a
+ * context switch taken inside a blocking syscall.
  */
 
     .section .text
@@ -38,19 +41,28 @@ syscall_entry:
 
 
     push %r11               /* user RFLAGS */
+    mov %gs:8, %r11         /* r11 is saved now: borrow it for the
+                             * user RSP, which must live on THIS
+                             * task's kernel stack -- the cpu_local
+                             * slot alone does not survive a context
+                             * switch inside a blocking syscall
+                             * (another task's entry would overwrite
+                             * it, and this task would resume on the
+                             * other task's stack pointer) */
     push %rcx               /* user RIP */
     push %rdi
     push %rsi
     push %rdx
     push %r10
     push %r8
-    push $0                 /* alignment pad (9th push, see header) */
+    push %r11               /* user RSP (9th push, see header) */
     push %r9                /* a6: dispatcher's stack argument */
     mov %rsp, %gs:24        /* cpu_local.syscall_frame: the pushed
                              * user frame, clone's snapshot source.
-                             * Slots from here: +0 r9, +8 pad, +16 r8,
-                             * +24 r10, +32 rdx, +40 rsi, +48 rdi,
-                             * +56 rcx (user RIP), +64 r11 (RFLAGS) */
+                             * Slots from here: +0 r9, +8 user RSP,
+                             * +16 r8, +24 r10, +32 rdx, +40 rsi,
+                             * +48 rdi, +56 rcx (user RIP),
+                             * +64 r11 (RFLAGS) */
 
     mov %r8, %r9            /* a5 */
     mov %r10, %r8           /* a4 */
@@ -67,13 +79,17 @@ syscall_entry:
                              * normal register (arg 6), NOT a
                              * scratch: user code may keep live
                              * state in it across a syscall */
-    add $8, %rsp            /* drop the alignment pad */
+    pop %r11                /* the user RSP, off this task's own
+                             * kernel stack (see the entry) */
     pop %r8
     pop %r10
     pop %rdx
     pop %rsi
     pop %rdi
     pop %rcx                /* user RIP */
+    mov %r11, %gs:8         /* park the user RSP for the final
+                             * load; no switch can intervene (IF
+                             * is off on this whole unwind) */
     pop %r11                /* user RFLAGS */
 
     mov %gs:8, %rsp         /* back to the user stack */

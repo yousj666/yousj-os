@@ -9,7 +9,7 @@ CFLAGS  := -DYOUSJ_KERNEL -ffreestanding -fno-stack-protector -fno-pic -m64 -mno
 HOSTCFLAGS := -Wall -Wextra -I kernel/include
 BUILD   := build
 
-KERNEL_OBJS := $(BUILD)/kmain.o $(BUILD)/pmm.o $(BUILD)/vmm.o $(BUILD)/vmm_arch.o $(BUILD)/syscall.o $(BUILD)/syscall_entry.o $(BUILD)/m3_user_bin.o $(BUILD)/elf.o $(BUILD)/init_elf_bin.o $(BUILD)/hello_elf_bin.o $(BUILD)/serial.o $(BUILD)/sched.o $(BUILD)/context_switch.o $(BUILD)/interrupts.o $(BUILD)/isr.o $(BUILD)/gdt.o
+KERNEL_OBJS := $(BUILD)/kmain.o $(BUILD)/pmm.o $(BUILD)/vmm.o $(BUILD)/vmm_arch.o $(BUILD)/syscall.o $(BUILD)/syscall_entry.o $(BUILD)/m3_user_bin.o $(BUILD)/elf.o $(BUILD)/init_elf_bin.o $(BUILD)/hello_elf_bin.o $(BUILD)/sh_elf_bin.o $(BUILD)/serial.o $(BUILD)/sched.o $(BUILD)/context_switch.o $(BUILD)/interrupts.o $(BUILD)/isr.o $(BUILD)/gdt.o
 
 .PHONY: check test clean
 check: $(KERNEL_OBJS)
@@ -91,17 +91,24 @@ $(BUILD)/elf.o: kernel/exec/elf.c kernel/include/yousj/*.h
 # SCHED_DESIGN sec. 7.1 transition option (b)).
 $(BUILD)/yousj-init.elf: userland/yousj_init.c userland/crt0.S userland/init.ld
 	mkdir -p $(BUILD)
-	gcc -ffreestanding -fno-stack-protector -fno-pie -static -nostdlib -mcmodel=large -O2 -Wall -Wextra -Wl,-T,userland/init.ld -Wl,--build-id=none -o $@ userland/crt0.S userland/yousj_init.c
+	gcc -ffreestanding -fno-stack-protector -fno-pie -static -nostdlib -mno-sse -mno-sse2 -mno-mmx -mcmodel=large -O2 -Wall -Wextra -Wl,-T,userland/init.ld -Wl,--build-id=none -o $@ userland/crt0.S userland/yousj_init.c
 
 $(BUILD)/init_elf_bin.o: $(BUILD)/yousj-init.elf
 	cd $(BUILD) && objcopy -I binary -O elf64-x86-64 yousj-init.elf init_elf_bin.o
 
 $(BUILD)/hello.elf: userland/hello.c userland/crt0.S userland/init.ld
 	mkdir -p $(BUILD)
-	gcc -ffreestanding -fno-stack-protector -fno-pie -static -nostdlib -mcmodel=large -O2 -Wall -Wextra -Wl,-T,userland/init.ld -Wl,--build-id=none -o $@ userland/crt0.S userland/hello.c
+	gcc -ffreestanding -fno-stack-protector -fno-pie -static -nostdlib -mno-sse -mno-sse2 -mno-mmx -mcmodel=large -O2 -Wall -Wextra -Wl,-T,userland/init.ld -Wl,--build-id=none -o $@ userland/crt0.S userland/hello.c
 
 $(BUILD)/hello_elf_bin.o: $(BUILD)/hello.elf
 	cd $(BUILD) && objcopy -I binary -O elf64-x86-64 hello.elf hello_elf_bin.o
+
+$(BUILD)/sh.elf: userland/sh.c userland/crt0.S userland/init.ld
+	mkdir -p $(BUILD)
+	gcc -ffreestanding -fno-stack-protector -fno-pie -static -nostdlib -mno-sse -mno-sse2 -mno-mmx -mcmodel=large -O2 -Wall -Wextra -Wl,-T,userland/init.ld -Wl,--build-id=none -o $@ userland/crt0.S userland/sh.c
+
+$(BUILD)/sh_elf_bin.o: $(BUILD)/sh.elf
+	cd $(BUILD) && objcopy -I binary -O elf64-x86-64 sh.elf sh_elf_bin.o
 
 $(BUILD)/isr.o: kernel/arch/x86_64/isr.S
 	mkdir -p $(BUILD)
@@ -124,7 +131,7 @@ STUB := $(BUILD)/yousj-stub.elf
 CFLAGS32 := -m32 -ffreestanding -fno-stack-protector -fno-pic -mno-red-zone \
             -Wall -Wextra -I kernel/include -I kernel
 KERNEL_LINK_OBJS := $(BUILD)/entry64.o $(BUILD)/kmain.o \
-                    $(BUILD)/serial.o $(BUILD)/pmm.o $(BUILD)/vmm.o $(BUILD)/vmm_arch.o $(BUILD)/syscall.o $(BUILD)/syscall_entry.o $(BUILD)/m3_user_bin.o $(BUILD)/elf.o $(BUILD)/init_elf_bin.o $(BUILD)/hello_elf_bin.o \
+                    $(BUILD)/serial.o $(BUILD)/pmm.o $(BUILD)/vmm.o $(BUILD)/vmm_arch.o $(BUILD)/syscall.o $(BUILD)/syscall_entry.o $(BUILD)/m3_user_bin.o $(BUILD)/elf.o $(BUILD)/init_elf_bin.o $(BUILD)/hello_elf_bin.o $(BUILD)/sh_elf_bin.o \
                     $(BUILD)/sched.o $(BUILD)/context_switch.o $(BUILD)/interrupts.o $(BUILD)/isr.o $(BUILD)/gdt.o
 STUB_LINK_OBJS := $(BUILD)/stub.o $(BUILD)/stub_main.o $(BUILD)/stub_bootinfo.o
 
