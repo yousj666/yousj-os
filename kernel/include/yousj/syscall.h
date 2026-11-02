@@ -55,5 +55,6 @@
  * built-in sees the task table. Deliberately text, deliberately
  * simple; it goes away when /proc arrives. */
 #define YOUSJ_SYS_NATIVE_PS_SNAPSHOT (YOUSJ_SYS_NATIVE_BASE + 0)
+#define YOUSJ_SYS_NATIVE_PMM_FREE    (YOUSJ_SYS_NATIVE_BASE + 1)
 
 #endif /* YOUSJ_SYSCALL_H */

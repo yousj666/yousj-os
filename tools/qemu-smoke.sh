@@ -105,8 +105,8 @@ for pat in \
     "Yousj OS: ring3 alive, getpid=" \
     "Yousj OS: sched M3 self-test PASS" \
     "Yousj OS: boot self-tests done, init started" \
-    "yousj-init: INIT_SMOKE_OK" \
-    "init> " \
+    "yousj-sh: shell ready" \
+    "sh> " \
     "$@"
 do
     if grep -Fq -- "$pat" "$LOG_FILE"; then
