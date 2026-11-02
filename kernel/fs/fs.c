@@ -894,6 +894,7 @@ static long yfs_open_path_fs(const char *rel, long flags,
 #define PROC_ID_PIDDIR  4 /* M28 */
 #define PROC_ID_PSTATUS 5 /* M28 */
 #define PROC_ID_PSTAT   6 /* M28 */
+#define PROC_ID_PCMDLINE 7 /* M31 */
 static const char *const g_proc_names[3] = {
     "uptime", "meminfo", "version"
 };
@@ -920,6 +921,8 @@ static uint64_t proc_ino_for(int id, uint32_t pid)
         return 10000 + (uint64_t)pid * 4 + 1;
     if (id == PROC_ID_PSTAT)
         return 10000 + (uint64_t)pid * 4 + 2;
+    if (id == PROC_ID_PCMDLINE)
+        return 10000 + (uint64_t)pid * 4 + 3;
     return 9000 + (uint64_t)id;
 }
 
@@ -970,6 +973,11 @@ static int proc_find(const char *rel, uint32_t *pid_out)
                 leaf[2] == 'a' && leaf[3] == 't' &&
                 leaf[4] == '\0')
                 return PROC_ID_PSTAT;
+            if (leaf[0] == 'c' && leaf[1] == 'm' &&
+                leaf[2] == 'd' && leaf[3] == 'l' &&
+                leaf[4] == 'i' && leaf[5] == 'n' &&
+                leaf[6] == 'e' && leaf[7] == '\0')
+                return PROC_ID_PCMDLINE;
         }
         return -1;
     }
@@ -1072,8 +1080,22 @@ static uint32_t proc_generate(int id, uint32_t pid, char *buf,
         pb_puts(&b, " kB\n");
         break;
     case PROC_ID_VERSION:
-        pb_puts(&b, "Yousj OS version 0.9 (M28) x86_64 #1\n");
+        pb_puts(&b, "Yousj OS version 0.9 (M31) x86_64 #1\n");
         break;
+    case PROC_ID_PCMDLINE: {
+        /* Raw bytes, not text: the argv is NUL-joined, so
+         * this case copies instead of pb_puts-ing. */
+        struct task *t = sched_find_task((int)pid);
+        uint32_t i, n;
+        if (t == NULL)
+            break;
+        n = t->cmdline_len;
+        if (n > b.cap)
+            n = b.cap;
+        for (i = 0; i < n; i++)
+            b.buf[b.len++] = t->cmdline[i];
+        break;
+    }
     case PROC_ID_PSTATUS: {
         struct task *t = sched_find_task((int)pid);
         char c;
@@ -1901,14 +1923,14 @@ long file_getdents(struct yousj_file *f, uint8_t *buf, uint64_t count)
     if (f != NULL && f->backend == 2) {
         /* The root lists the three flat files plus one
          * directory per live task (M28); a pid directory
-         * lists status and stat. The live set is re-read
+         * lists status, stat and cmdline. The live set is re-read
          * on every call -- entries may shift under a
          * concurrent exit, the same race Linux has. */
         static const char *const root_names[5] = {
             ".", "..", "uptime", "meminfo", "version"
         };
-        static const char *const pid_names[4] = {
-            ".", "..", "status", "stat"
+        static const char *const pid_names[5] = {
+            ".", "..", "status", "stat", "cmdline"
         };
         uint64_t tids[YOUSJ_SCHED_MAX_TASKS];
         uint32_t ntids = 0;
@@ -1920,7 +1942,7 @@ long file_getdents(struct yousj_file *f, uint8_t *buf, uint64_t count)
                                     YOUSJ_SCHED_MAX_TASKS);
             total = 5 + ntids;
         } else {
-            total = 4;
+            total = 5;
         }
         for (i = f->offset; i < total; i++) {
             const char *nm;
@@ -1940,8 +1962,11 @@ long file_getdents(struct yousj_file *f, uint8_t *buf, uint64_t count)
                 else if (i == 2)
                     ino = proc_ino_for(PROC_ID_PSTATUS,
                                        f->proc_pid);
-                else
+                else if (i == 3)
                     ino = proc_ino_for(PROC_ID_PSTAT,
+                                       f->proc_pid);
+                else
+                    ino = proc_ino_for(PROC_ID_PCMDLINE,
                                        f->proc_pid);
             } else if (i < 5) {
                 nm = root_names[i];

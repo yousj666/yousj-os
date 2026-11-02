@@ -372,6 +372,7 @@ int main(void)
             report("piddir-dents", got > 0 &&
                    dent_type(db, got, "status") == 8 &&
                    dent_type(db, got, "stat") == 8 &&
+                   dent_type(db, got, "cmdline") == 8 &&
                    dent_type(db, got, ".") == 4);
         }
     }
@@ -393,6 +394,45 @@ int main(void)
              (sb.mode & 0777u) == 0444u &&
              (long)sb.size == n;
         report("stat-modes", ok);
+    }
+
+    /* M31: /proc/self resolves to the caller */
+    n = read_file("/proc/self/status", buf, sizeof(buf) - 1);
+    if (n > 0)
+        buf[n] = '\0';
+    fmt_pid_line(key, "Pid", me);
+    {
+        char db[512];
+        long got = read_dents("/proc/self", db, sizeof(db));
+        report("self-link", n > 0 && contains(buf, n, key) &&
+               got > 0 && dent_type(db, got, "status") == 8);
+    }
+
+    /* M31: cmdline is the exec argv, NUL-joined */
+    n = read_file("/proc/self/cmdline", buf, sizeof(buf));
+    report("cmdline-self", n == 8 &&
+           buf[0] == 'p' && buf[1] == 'i' && buf[2] == 'd' &&
+           buf[3] == 't' && buf[4] == 'e' && buf[5] == 's' &&
+           buf[6] == 't' && buf[7] == '\0');
+
+    /* M31: a forked child inherits the cmdline */
+    {
+        long c = sys_call4(SYS_clone, 17, 0, 0, 0);
+        int ok = 0;
+        if (c == 0) {
+            sleep_ms(600);
+            die(0);
+        }
+        sleep_ms(200);
+        pid_path(path, c, "/cmdline");
+        n = read_file(path, buf, sizeof(buf));
+        ok = n == 8 && buf[0] == 'p' && buf[6] == 't' &&
+             buf[7] == '\0';
+        {
+            long st = 0;
+            sys_call4(SYS_wait4, c, (long)(uintptr_t)&st, 0, 0);
+        }
+        report("cmdline-child", ok);
     }
 
     out("PIDTEST DONE\n");

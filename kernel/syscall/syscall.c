@@ -522,6 +522,15 @@ static long sys_clone(struct yousj_syscall_ctx *ctx, long flags,
          * /proc/<pid>/status would forever show for
          * not-yet-exec'd children. */
         sched_set_name(child, me->name);
+        /* M31: cmdline is inherited too (a forked child
+         * that has not exec'd shows its parent's argv in
+         * /proc, as on Linux). */
+        {
+            uint32_t i;
+            for (i = 0; i < me->cmdline_len; i++)
+                child->cmdline[i] = me->cmdline[i];
+            child->cmdline_len = me->cmdline_len;
+        }
         /* M9: the fd table is copied and every open-file object
          * shared (refcount++), so offsets are shared with the
          * parent exactly like Linux. cwd is a value copy. */
@@ -726,6 +735,25 @@ static long sys_execve(uint64_t path_ptr, uint64_t argv_ptr,
         }
         sched_set_name(me, base);
     }
+    /* M31: retain the argv for /proc/<pid>/cmdline,
+     * NUL-joined like Linux; truncated at the field size. */
+    {
+        uint32_t w = 0;
+        int ai;
+        for (ai = 0; argv_k[ai] != NULL; ai++) {
+            const char *a = argv_k[ai];
+            uint32_t j;
+            for (j = 0; a[j] != '\0' && w + 1 < sizeof(me->cmdline); j++)
+                me->cmdline[w++] = a[j];
+            if (w + 1 < sizeof(me->cmdline))
+                me->cmdline[w++] = '\0';
+            else
+                break;
+        }
+        if (w == 0 && sizeof(me->cmdline) > 1)
+            me->cmdline[w++] = '\0';
+        me->cmdline_len = w;
+    }
     /* M14: release the old image's VMAs (shared file regions
      * write back against the old space before it dies). */
     vmas_release_all(me, old != NULL ? old : me->mm);
@@ -773,6 +801,47 @@ static struct yousj_file *fd_file_of(struct task *t, long fd)
 
 /* Resolve `path` (kernel memory) against the task's cwd into
  * `out` (at least 256 bytes). */
+/* M31: /proc/self names the CALLER. The fs layer is
+ * caller-agnostic, so the substitution happens in the
+ * syscall layer, the one place that knows the task:
+ * "/proc/self[/...]" becomes "/proc/<tid>[/...]" before
+ * the fs ever sees the path. A real file cannot be
+ * shadowed -- the generated /proc owns that prefix. */
+static void proc_self_rewrite(struct task *t, char *out)
+{
+    uint64_t j, k = 0, tid;
+    char tmp[256];
+    const char *pfx = "/proc/";
+    char digits[20];
+    int nd = 0;
+    if (t == NULL)
+        return;
+    if (!(out[0] == '/' && out[1] == 'p' && out[2] == 'r' &&
+          out[3] == 'o' && out[4] == 'c' && out[5] == '/' &&
+          out[6] == 's' && out[7] == 'e' && out[8] == 'l' &&
+          out[9] == 'f' &&
+          (out[10] == '\0' || out[10] == '/')))
+        return;
+    tid = t->tid;
+    while (pfx[k] != '\0') {
+        tmp[k] = pfx[k];
+        k++;
+    }
+    if (tid == 0)
+        digits[nd++] = '0';
+    while (tid > 0) {
+        digits[nd++] = (char)('0' + (tid % 10));
+        tid /= 10;
+    }
+    while (nd > 0)
+        tmp[k++] = digits[--nd];
+    for (j = 10; out[j] != '\0' && k < 255; j++)
+        tmp[k++] = out[j];
+    tmp[k] = '\0';
+    for (j = 0; j <= k; j++)
+        out[j] = tmp[j];
+}
+
 static void resolve_path(struct task *t, const char *path, char *out)
 {
     uint64_t i = 0, j;
@@ -788,6 +857,7 @@ static void resolve_path(struct task *t, const char *path, char *out)
     for (j = 0; path[j] != '\0' && i < 255; j++)
         out[i++] = path[j];
     out[i] = '\0';
+    proc_self_rewrite(t, out);
 }
 
 /* M30: resolve a possibly dirfd-relative path to an
@@ -809,6 +879,7 @@ static long resolve_at(struct task *me, long dirfd,
         for (j = 0; path[j] != '\0' && i < 255; j++)
             out[i++] = path[j];
         out[i] = '\0';
+        proc_self_rewrite(me, out);
         return 0;
     }
     if (dirfd == YOUSJ_AT_FDCWD) {
@@ -830,6 +901,7 @@ static long resolve_at(struct task *me, long dirfd,
     for (j = 0; path[j] != '\0' && i < 255; j++)
         out[i++] = path[j];
     out[i] = '\0';
+    proc_self_rewrite(me, out);
     return 0;
 }
 

@@ -491,9 +491,18 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   制的）。utimens 的旧 ENOSYS 期望改 EBADF。验
   收：新套件 dirfdtest 十场景 ramfs 两轮＋disk
   p2 在 yfs 上同跑；其余二十一链不回归。
-- ⏳ 下一步候选：/proc/self 与 cmdline 等更多生
-  成项、sigaltstack、renameat 与 faccessat 等其
-  余 *at 补齐。
+- ✅ /proc/self 与 cmdline M31（2026-11-03）：
+  self 由系统调用层在路径解析时按调用者改写成
+  /proc/<tid>（fs 层不感知调用者，改写点在
+  resolve_path/resolve_at 汇合处）；任务新增
+  cmdline 存储——execve 提交时把 argv 以 NUL 连
+  接存入（上限 128B）、clone 继承，/proc/<pid>/
+  cmdline 按原始字节生成（内核线程为空）。验收：
+  pidtest 扩 self-link/cmdline-self/cmdline-
+  child 三场景两轮；其余二十二链不回归。
+- ⏳ 下一步候选：sigaltstack、renameat 与
+  faccessat 等其余 *at 补齐、更多 /proc 生成项
+  （如 maps 示意/环境 environ)。
 
 ## 从零构建
 

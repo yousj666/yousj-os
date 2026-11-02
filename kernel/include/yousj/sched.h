@@ -51,6 +51,12 @@ struct task {
     uint64_t        parent_tid;
     enum task_state state;
     char            name[16];
+    char            cmdline[128]; /* M31: exec argv joined
+                                     by NULs (cmdline_len
+                                     bytes incl. final NUL);
+                                     inherited across clone,
+                                     empty for kernel tasks */
+    uint32_t        cmdline_len;
     uint64_t        timeslice_left; /* ticks; unused until M2 preemption */
     uint64_t        total_ticks;
     struct task    *rq_next;
