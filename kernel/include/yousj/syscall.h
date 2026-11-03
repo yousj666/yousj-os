@@ -91,6 +91,9 @@
 #define YOUSJ_SYS_splice      275   /* M42 */
 #define YOUSJ_SYS_tee         276   /* M49 */
 #define YOUSJ_SYS_vmsplice    278   /* M49 */
+#define YOUSJ_SYS_futex       202   /* M50 */
+#define YOUSJ_SYS_getppid     110   /* M50: surfaced by the
+                                     * futex signal test */
 #define YOUSJ_SYS_copy_file_range 326 /* M43 */
 #define YOUSJ_SYS_dup3        292  /* M10 */
 #define YOUSJ_SYS_pipe2       293  /* M10 */

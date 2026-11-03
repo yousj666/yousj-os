@@ -738,10 +738,36 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   fd-dir 加控制台链接打开、inotifytest
   加 utimens 场景、pipetest 加 splice-
   nonblock/tee/vmsplice 三场景。
-- ⏳ 下一步候选：inotify 事件补完
-  （ftruncate 的 MODIFY、exchange 的
-  MOVE_SELF），或 /proc/self/fd 管道
-  链接按 dup 语义打开。
+- ✅ futex M50（2026-11-04）：FUTEX_WAIT/
+  WAKE 转正（202 号）。等待队列按 futex
+  字的**物理地址**键入——映射同一帧的
+  任务天然相遇，fork 的私有拷贝（每帧
+  深拷贝）则正确地永不相遇。真阻塞
+  （sched_block_current），非轮询；
+  等待方按 wait4 的次序复查：被唤醒→
+  值已变→可交付信号→超时（timespec→
+  wake_tick 截止）。WAKE 只标记槽位并
+  sched_wake，槽位由等待方自释，免在
+  睡者身下被复用；阻塞中被杀死的等待
+  者槽位在分配时按 tid 复核惰性回收。
+  PRIVATE/CLOCK_REALTIME 标志接受并
+  忽略（物理键入使私有命名空间无义）。
+  顺手补 getppid（110）——futex 信号
+  场景的子进程需要它，此前竟一直缺。
+  已知简化：值检查与阻塞非单步原子
+  （残余竞态与 wait4 同级）；跨任务
+  WAKE 须待真共享帧（CLONE_VM）落地
+  才能验收，代码路径按物理键已就绪。
+  验收：futextest 五场景（mismatch 的
+  EAGAIN、wake-none、bad-op、120ms
+  超时 ETIMEDOUT、子进程信号释放无
+  超时等待得 EINTR）＋新套件
+  qemu-futex-test.py。
+- ⏳ 下一步候选：CLONE_VM 共享地址
+  空间（线程语义第一步，顺带解锁
+  futex 跨任务 WAKE 验收）；或 inotify
+  事件补完（ftruncate 的 MODIFY、
+  exchange 的 MOVE_SELF）。
 
 ## 从零构建
 

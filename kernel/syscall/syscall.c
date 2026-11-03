@@ -165,6 +165,7 @@ void syscall_init(void)
 #define YOUSJ_EPIPE 32   /* M10 */
 #define YOUSJ_ERANGE 34  /* M9 */
 #define YOUSJ_ENOSYS 38
+#define YOUSJ_ETIMEDOUT 110 /* M50 */
 #define YOUSJ_ERESTARTSYS 512 /* internal: interrupted blocking call;
                                  converted by the signal gate, never
                                  a user-visible return (signal.c) */
@@ -1432,6 +1433,172 @@ static long sys_vmsplice(long fd, uint64_t iov_ptr,
         }
     }
     return (long)done;
+}
+
+/* --- M50: futex --------------------------------------
+ * The synchronization primitive the whole threading
+ * story stands on. Waiters are keyed by the PHYSICAL
+ * address of the futex word: two tasks mapping the same
+ * frame (a shared page today, a shared address space
+ * once CLONE_VM lands) collide on the same key, while
+ * private copies (fork deep-copies every frame) rightly
+ * never meet. Blocking is real (sched_block_current),
+ * not a poll; the waiter re-checks its conditions in
+ * wait4's order -- woken first, then the value, then
+ * deliverable signals, then the deadline. WAKE only
+ * marks slots and sched_wake()s; the waiter frees its
+ * own slot, so
+ * a slot is never reused under a sleeper. Slots whose
+ * task died while blocked (the stage-1 kill can take a
+ * BLOCKED victim) are reaped lazily at allocation time
+ * by tid revalidation.
+ *
+ * v1 scope: FUTEX_WAIT and FUTEX_WAKE. The PRIVATE and
+ * CLOCK_REALTIME flag bits are accepted and ignored
+ * (physical keying makes the private namespace moot).
+ * The value check and the block are not one atomic
+ * step; the residual race matches wait4's accepted
+ * pattern at this scale -- the woken flag closes every
+ * interleaving except a WAKE landing entirely between
+ * the final check and the BLOCKED store. */
+#define FUTEX_WAITERS 32
+
+struct futex_waiter {
+    bool in_use;
+    bool woken;
+    uint64_t key; /* physical address of the word */
+    struct task *task;
+    int tid;
+};
+
+static struct futex_waiter g_futex[FUTEX_WAITERS];
+
+static struct futex_waiter *futex_slot_alloc(struct task *me,
+                                             uint64_t key)
+{
+    int i;
+    for (i = 0; i < FUTEX_WAITERS; i++) {
+        struct futex_waiter *w = &g_futex[i];
+        if (w->in_use && !w->woken &&
+            sched_find_task(w->tid) != w->task)
+            w->in_use = false; /* its waiter died blocked */
+        if (!w->in_use) {
+            w->in_use = true;
+            w->woken = false;
+            w->key = key;
+            w->task = me;
+            w->tid = me->tid;
+            return w;
+        }
+    }
+    return NULL;
+}
+
+static long futex_key(struct task *me, uint64_t uaddr,
+                      uint64_t *key_out)
+{
+    uint64_t phys;
+    if (vmm_translate(me->mm, uaddr, &phys, NULL) != 0)
+        return -YOUSJ_EFAULT;
+    *key_out = phys;
+    return 0;
+}
+
+static long sys_futex(uint64_t uaddr, long op, long val,
+                      uint64_t timeout_ptr, uint64_t uaddr2,
+                      long val3)
+{
+    struct task *me = sched_current();
+    long cmd = op & ~(0x80L | 0x100L); /* PRIVATE, CLOCK_RT */
+    (void)uaddr2;
+    (void)val3;
+
+    if ((uaddr & 3) != 0)
+        return -YOUSJ_EINVAL; /* words are 4-aligned */
+    if (!user_range_ok(uaddr, 4))
+        return -YOUSJ_EFAULT;
+
+    if (cmd == 1) { /* FUTEX_WAKE */
+        uint64_t key;
+        long rc = futex_key(me, uaddr, &key);
+        long woken = 0;
+        int i;
+        if (rc != 0)
+            return 0; /* unmapped: nobody can be waiting */
+        if (val <= 0)
+            return 0;
+        for (i = 0; i < FUTEX_WAITERS && woken < val; i++) {
+            struct futex_waiter *w = &g_futex[i];
+            if (!w->in_use || w->woken || w->key != key)
+                continue;
+            w->woken = true;
+            woken++;
+            if (sched_find_task(w->tid) == w->task)
+                sched_wake(w->task);
+        }
+        return woken;
+    }
+    if (cmd != 0) /* FUTEX_WAIT is 0; the rest is future work */
+        return -YOUSJ_ENOSYS;
+
+    /* FUTEX_WAIT */
+    {
+        uint64_t deadline = 0;
+        bool has_to = false;
+        uint64_t key;
+        long rc;
+        struct futex_waiter *w;
+
+        if (timeout_ptr != 0) {
+            const int64_t *ts =
+                (const int64_t *)(uintptr_t)timeout_ptr;
+            int64_t sec, nsec;
+            uint64_t ticks;
+            if (!user_range_ok(timeout_ptr, 16))
+                return -YOUSJ_EFAULT;
+            sec = ts[0];
+            nsec = ts[1];
+            if (sec < 0 || nsec < 0 || nsec >= 1000000000)
+                return -YOUSJ_EINVAL;
+            ticks = (uint64_t)sec * 100 +
+                    ((uint64_t)nsec + 9999999) / 10000000;
+            has_to = true;
+            deadline = sched_uptime_ticks() + ticks;
+        }
+        if (*(const int32_t *)(uintptr_t)uaddr != (int32_t)val)
+            return -YOUSJ_EAGAIN; /* the value already moved */
+        rc = futex_key(me, uaddr, &key);
+        if (rc != 0)
+            return rc;
+        w = futex_slot_alloc(me, key);
+        if (w == NULL)
+            return -YOUSJ_ENOMEM;
+        for (;;) {
+            long out;
+            if (w->woken)
+                out = 0;
+            else if (*(const int32_t *)(uintptr_t)uaddr !=
+                     (int32_t)val)
+                out = -YOUSJ_EAGAIN;
+            else if (signal_deliverable_pending(me)) {
+                /* Covers both wakes signal_send caused and
+                 * signals that landed before we blocked. */
+                me->sig_wake = false;
+                out = -YOUSJ_ERESTARTSYS;
+            } else if (has_to &&
+                       sched_uptime_ticks() >= deadline)
+                out = -YOUSJ_ETIMEDOUT;
+            else {
+                me->wake_tick = has_to ? deadline : 0;
+                sched_block_current();
+                me->wake_tick = 0;
+                continue;
+            }
+            w->in_use = false;
+            me->wake_tick = 0;
+            return out;
+        }
+    }
 }
 
 /* --- M43: copy_file_range ------------------------------
@@ -3595,6 +3762,9 @@ static long dispatch_inner(struct yousj_syscall_ctx *ctx)
         return sys_tee((long)a1, (long)a2, a3, (long)a4);
     case YOUSJ_SYS_vmsplice:
         return sys_vmsplice((long)a1, a2, a3, (long)a4);
+    case YOUSJ_SYS_futex:
+        return sys_futex(a1, (long)a2, (long)a3, a4, a5,
+                         (long)ctx->a6);
     case YOUSJ_SYS_copy_file_range:
         return sys_copy_file_range((long)a1, a2, (long)a3,
                                    a4, a5, (long)ctx->a6);
@@ -3674,6 +3844,8 @@ static long dispatch_inner(struct yousj_syscall_ctx *ctx)
         return sys_nanosleep(a1);
     case YOUSJ_SYS_getpid:
         return (long)sched_current()->tid;
+    case YOUSJ_SYS_getppid:
+        return (long)sched_current()->parent_tid;
     case YOUSJ_SYS_kill:
         return sys_kill((long)a1, (long)a2);
     case YOUSJ_SYS_uname:

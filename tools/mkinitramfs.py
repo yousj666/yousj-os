@@ -21,7 +21,7 @@ ROOTFS = os.path.join(REPO, "rootfs")
 OUT = os.path.join(BUILD, "initramfs.cpio")
 
 PROGRAMS = ["hello", "sh", "sigtest", "fxtest", "fstest",
-            "cat", "pipetest", "mkdir", "ls", "rm", "rmdir", "mv", "bigfile", "mmtest", "polltest", "ln", "readlink", "epolltest", "churn", "stattest", "brktest", "timetest", "faulttest", "proctest", "utimetest", "orphantest", "pidtest", "dirfdtest", "inotifytest"]
+            "cat", "pipetest", "mkdir", "ls", "rm", "rmdir", "mv", "bigfile", "mmtest", "polltest", "ln", "readlink", "epolltest", "churn", "stattest", "brktest", "timetest", "faulttest", "proctest", "utimetest", "orphantest", "pidtest", "dirfdtest", "inotifytest", "futextest"]
 
 DIR_MODE = 0o040755
 FILE_MODE = 0o100644
