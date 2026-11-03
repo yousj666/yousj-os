@@ -104,6 +104,11 @@ struct task {
     uint64_t        brk_end;      /* user tasks: current break */
     uint64_t        fs_base;      /* user tasks: TLS FS base
                                      (arch_prctl ARCH_SET_FS) */
+    uint64_t        robust_head;    /* M61: user address of the
+                                     * robust futex list head
+                                     * (set_robust_list), 0 = none;
+                                     * walked at exit to mark
+                                     * owner-died mutexes */
     uint64_t        clear_child_tid; /* M52: user address the exit
                                      path zeroes + futex-wakes
                                      (set_tid_address / clone

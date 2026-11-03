@@ -141,5 +141,6 @@
 #define YOUSJ_SYS_setresgid   119   /* M59 */
 #define YOUSJ_SYS_getresgid   120   /* M59 */
 #define YOUSJ_SYS_fcntl       72    /* M59 */
+#define YOUSJ_SYS_get_robust_list 274 /* M61 */
 
 #endif /* YOUSJ_SYSCALL_H */

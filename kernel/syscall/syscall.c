@@ -336,6 +336,62 @@ static void space_drop(struct vmm_space *sp)
     vmm_space_release(sp);
 }
 
+/* M61: robust futex exit walk. The exiting task's robust
+ * list (registered with set_robust_list) is a circular user
+ * list anchored at the head: head+0 = first entry (or the
+ * head itself when empty), head+8 = futex_offset (signed,
+ * from a list entry to its futex word), head+16 = the
+ * pending entry (mid lock/unlock when death struck). Every
+ * entry whose futex word still names this task as owner
+ * gets FUTEX_OWNER_DIED set, its tid bits cleared, and one
+ * waiter woken -- the survivor's lock call then returns
+ * EOWNERDEAD instead of blocking forever. Runs while the
+ * space is intact and loaded, like the clear_child_tid
+ * handshake; every dereference is range-checked first and
+ * the walk is iteration-bounded against corrupt lists. */
+#define ROBUST_OWNER_DIED 0x40000000u
+#define ROBUST_TID_MASK   0x1fffffffu
+
+static void robust_handle_entry(struct task *me, uint64_t entry,
+                                int64_t futex_offset)
+{
+    uint64_t waddr = (uint64_t)((int64_t)entry + futex_offset);
+    uint32_t w;
+
+    if ((waddr & 3) != 0 || !user_range_ok(waddr, 4))
+        return;
+    w = *(uint32_t *)(uintptr_t)waddr;
+    if ((w & ROBUST_TID_MASK) != (uint32_t)me->tid)
+        return;
+    *(uint32_t *)(uintptr_t)waddr =
+        (w & ~ROBUST_TID_MASK) | ROBUST_OWNER_DIED;
+    futex_wake_at(me, waddr, 1);
+}
+
+static void robust_list_exit_walk(struct task *me)
+{
+    uint64_t head = me->robust_head;
+    uint64_t entry, pending;
+    int64_t futex_offset;
+    int iters = 0;
+
+    if (head == 0 || (head & 7) != 0 || !user_range_ok(head, 24))
+        return;
+    entry = *(uint64_t *)(uintptr_t)head;
+    futex_offset = *(int64_t *)(uintptr_t)(head + 8);
+    pending = *(uint64_t *)(uintptr_t)(head + 16);
+    while (entry != head && iters++ < 2048) {
+        uint64_t next;
+        if ((entry & 7) != 0 || !user_range_ok(entry, 8))
+            break;
+        next = *(uint64_t *)(uintptr_t)entry;
+        robust_handle_entry(me, entry, futex_offset);
+        entry = next;
+    }
+    if (pending != 0 && pending != head)
+        robust_handle_entry(me, pending, futex_offset);
+}
+
 void process_exit(long status, int sig)
 {
     struct task *me = sched_current();
@@ -375,6 +431,12 @@ void process_exit(long status, int sig)
             futex_wake_at(me, addr, 1);
         }
     }
+
+    /* M61: mark this task's robust mutexes owner-died and
+     * wake their waiters, in the same still-intact-space
+     * window as the handshake above. */
+    robust_list_exit_walk(me);
+    me->robust_head = 0;
 
     /* M53: drop this task's sighand reference; a shared
      * table outlives us for the rest of the group. */
@@ -1903,6 +1965,39 @@ static long sys_futex(uint64_t uaddr, long op, long val,
             return out;
         }
     }
+}
+
+/* M61: robust list registration. The head layout is the
+ * kernel ABI's: { struct robust_list list; long
+ * futex_offset; struct robust_list *list_op_pending; } =
+ * 24 bytes; any other length is EINVAL, as on Linux. The
+ * list itself is walked at exit (robust_list_exit_walk). */
+static long sys_set_robust_list(uint64_t head, uint64_t len)
+{
+    if (len != 24)
+        return -YOUSJ_EINVAL;
+    if (head != 0 && ((head & 7) != 0 || !user_range_ok(head, 24)))
+        return -YOUSJ_EFAULT;
+    sched_current()->robust_head = head;
+    return 0;
+}
+
+static long sys_get_robust_list(long pid, uint64_t head_ptr,
+                                uint64_t len_ptr)
+{
+    struct task *t;
+
+    if (pid == 0)
+        t = sched_current();
+    else
+        t = sched_find_task((int)pid);
+    if (t == NULL)
+        return -YOUSJ_ESRCH;
+    if (!user_range_ok(head_ptr, 8) || !user_range_ok(len_ptr, 8))
+        return -YOUSJ_EFAULT;
+    *(uint64_t *)(uintptr_t)head_ptr = t->robust_head;
+    *(uint64_t *)(uintptr_t)len_ptr = t->robust_head != 0 ? 24 : 0;
+    return 0;
 }
 
 /* --- M43: copy_file_range ------------------------------
@@ -4309,13 +4404,11 @@ static long dispatch_inner(struct yousj_syscall_ctx *ctx)
         sched_yield();
         return 0;
     case YOUSJ_SYS_set_robust_list:
-        /* M56 stub: accepted, not tracked. Robust mutexes
-         * behave as ordinary ones; the owner-death wakeup
-         * (EOWNERDEAD) is not implemented. musl registers
-         * a list for every thread and ignores failure, but
-         * a hard ENOSYS here has bitten other libcs, so the
-         * honest stub returns success. */
-        return 0;
+        /* M61 (was an M56 stub): the list is tracked per
+         * task and walked at exit; see robust_list_exit_walk. */
+        return sys_set_robust_list(a1, a2);
+    case YOUSJ_SYS_get_robust_list:
+        return sys_get_robust_list((long)a1, a2, a3);
     case YOUSJ_SYS_getppid:
         return (long)sched_current()->parent_tid;
     case YOUSJ_SYS_set_tid_address:

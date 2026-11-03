@@ -995,12 +995,26 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   个真实发行版二进制连同它
   的命令全家在 Yousj OS 上
   日常可用。
-- ⏳ 下一步候选：robust futex
-  （set_robust_list 目前是存
-  根，属主死亡的 EOWNERDEAD
-  语义未做），或 inotify 事件
+- ✅ robust futex M61
+  （2026-11-04）：set/get_
+  robust_list 转正——每任务记
+  下 robust 链表头，任务退出时
+  在地址空间还完好的窗口里走
+  查链表（含 pending 项）：凡
+  futex 字仍写着死者 tid 的，
+  置 FUTEX_OWNER_DIED、清 tid
+  并唤醒一个等待者。真 musl
+  pthread 实测：线程持 robust
+  锁退出，后来者的 lock 拿到
+  EOWNERDEAD、consistent 后锁
+  复活（宿主真 Linux 对照同
+  过）。
+- ⏳ 下一步候选：inotify 事件
   补完（ftruncate 的 MODIFY、
-  exchange 的 MOVE_SELF）。
+  exchange 的 MOVE_SELF），
+  或 getrandom/ioctl 终端参数
+  等 busybox 交互式 shell 的
+  剩余拼图。
 
 ## 从零构建
 
