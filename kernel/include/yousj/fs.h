@@ -251,6 +251,16 @@ long fs_utimens_file(struct yousj_file *f,
 void file_get(struct yousj_file *f);
 void file_put(struct yousj_file *f);
 
+/* M54: fd-table objects (struct in sched.h). files_put
+ * closes every open entry when the last reference drops.
+ * files_dup makes a private copy (one file_get per entry)
+ * for plain clone and for exec's detach-from-shared. */
+struct yousj_files;
+struct yousj_files *files_alloc(void);
+void files_get(struct yousj_files *fl);
+void files_put(struct yousj_files *fl);
+struct yousj_files *files_dup(struct yousj_files *fl);
+
 /* Ramfs file I/O. `dst`/`src`/`buf` are addresses in the
  * CALLER's address space (the syscall layer validates ranges;
  * the console never reaches these). Return bytes moved or a

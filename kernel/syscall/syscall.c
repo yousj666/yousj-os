@@ -337,17 +337,11 @@ void process_exit(long status, int sig)
      * below are separate). Pages die with the space. */
     vmas_release_all(me, me->mm);
 
-    /* M9: close every open file (shared objects are refcounted;
-     * the console singleton ignores the put). */
-    {
-        int i;
-        for (i = 0; i < YOUSJ_NR_OPEN; i++) {
-            if (me->fd_file[i] != NULL) {
-                file_put(me->fd_file[i]);
-                me->fd_file[i] = NULL;
-            }
-        }
-    }
+    /* M9/M54: drop the fd table; its files close only when
+     * the LAST task sharing the table exits (files_put does
+     * the closing on the final reference). */
+    files_put(me->files);
+    me->files = NULL;
 
     /* Process teardown (SCHED_DESIGN 6.1): an owned address
      * space reference is dropped here, while this task is
@@ -483,6 +477,7 @@ static long sys_wait4(long pid, uint64_t status_ptr, long options,
 #define CLONE_CHILD_SETTID_K  0x01000000 /* M52 */
 #define CLONE_SIGHAND_K       0x800      /* M53 */
 #define CLONE_THREAD_K        0x10000    /* M53 */
+#define CLONE_FILES_K         0x400      /* M54 */
 
 /* M52: write a 32-bit value into an address space with no
  * chance of faulting -- translate first, then go through
@@ -535,7 +530,7 @@ static long sys_clone(struct yousj_syscall_ctx *ctx, long flags,
                   CLONE_PARENT_SETTID_K |
                   CLONE_CHILD_CLEARTID_K |
                   CLONE_CHILD_SETTID_K | CLONE_SIGHAND_K |
-                  CLONE_THREAD_K)) != 0 ||
+                  CLONE_THREAD_K | CLONE_FILES_K)) != 0 ||
         ((flags & 0xFF) != 0 && (flags & 0xFF) != YOUSJ_SIGCHLD))
         return -YOUSJ_EINVAL;
     if (child_stack != 0 && !share_vm)
@@ -665,17 +660,20 @@ static long sys_clone(struct yousj_syscall_ctx *ctx, long flags,
                 child->env[i] = me->env[i];
             child->env_len = me->env_len;
         }
-        /* M9: the fd table is copied and every open-file object
-         * shared (refcount++), so offsets are shared with the
-         * parent exactly like Linux. cwd is a value copy. */
+        /* M9/M54: the fd table. Plain clone gets a private
+         * copy -- files_dup bumps every open-file object's
+         * refcount, so offsets are shared with the parent
+         * exactly like Linux. CLONE_FILES shares the table
+         * object itself: an open or close in either thread
+         * is visible to both. cwd is a value copy. */
+        if (flags & CLONE_FILES_K) {
+            child->files = me->files;
+            files_get(child->files);
+        } else {
+            child->files = files_dup(me->files);
+        }
         {
             int i;
-            for (i = 0; i < YOUSJ_NR_OPEN; i++) {
-                child->fd_file[i] = me->fd_file[i];
-                file_get(child->fd_file[i]);
-            }
-            child->fd_console_closed = me->fd_console_closed;
-            child->fd_cloexec = me->fd_cloexec;
             /* M14: VMAs copy with the address space (the pages
              * themselves are deep-copied by the window clone);
              * file backings gain a reference per child VMA. */
@@ -848,17 +846,29 @@ static long sys_execve(uint64_t path_ptr, uint64_t argv_ptr,
     me->mm = space;
     me->mm_owned = true;
     signal_exec_reset(me);
+    /* M54: with a shared fd table (CLONE_FILES), exec must
+     * not close descriptors out from under the other threads
+     * -- detach to a private copy first (on Linux the other
+     * threads die at exec; our threads do not, so the copy
+     * is what keeps their fds alive). */
+    if (me->files != NULL && me->files->refs > 1) {
+        struct yousj_files *priv = files_dup(me->files);
+        if (priv != NULL) {
+            files_put(me->files);
+            me->files = priv;
+        }
+    }
     /* M10: close-on-exec descriptors die at the commit point. */
     {
         int i;
         for (i = 0; i < YOUSJ_NR_OPEN; i++) {
-            if ((me->fd_cloexec & (uint16_t)(1u << i)) &&
-                me->fd_file[i] != NULL) {
-                file_put(me->fd_file[i]);
-                me->fd_file[i] = NULL;
+            if ((me->files->fd_cloexec & (uint16_t)(1u << i)) &&
+                me->files->fd_file[i] != NULL) {
+                file_put(me->files->fd_file[i]);
+                me->files->fd_file[i] = NULL;
             }
         }
-        me->fd_cloexec = 0;
+        me->files->fd_cloexec = 0;
     }
     fpu_init_area(me->fx_area); /* FPU state resets on exec (M8) */
     fpu_restore(me->fx_area);   /* the new image starts pristine */
@@ -964,10 +974,11 @@ fail_release:
 static struct yousj_file *fd_file_of(struct task *t, long fd)
 {
     struct yousj_file *f;
-    if (t == NULL || fd < 0 || fd >= YOUSJ_NR_OPEN)
+    if (t == NULL || t->files == NULL || fd < 0 ||
+        fd >= YOUSJ_NR_OPEN)
         return NULL;
-    f = t->fd_file[fd];
-    if (f == NULL && fd < 3 && !(t->fd_console_closed & (uint8_t)(1u << fd)))
+    f = t->files->fd_file[fd];
+    if (f == NULL && fd < 3 && !(t->files->fd_console_closed & (uint8_t)(1u << fd)))
         return fs_console_file();
     return f;
 }
@@ -1145,17 +1156,17 @@ static long fd_alloc(struct task *t, struct yousj_file *f)
 {
     long fd;
     for (fd = 0; fd < YOUSJ_NR_OPEN; fd++) {
-        if (t->fd_file[fd] != NULL)
+        if (t->files->fd_file[fd] != NULL)
             continue;
         /* A NULL stdio slot that was never closed is the
          * implicit console -- occupied, not free. A closed one
          * is fair game. */
-        if (fd < 3 && !(t->fd_console_closed & (uint8_t)(1u << fd)))
+        if (fd < 3 && !(t->files->fd_console_closed & (uint8_t)(1u << fd)))
             continue;
-        t->fd_file[fd] = f;
+        t->files->fd_file[fd] = f;
         if (fd < 3)
-            t->fd_console_closed &= (uint8_t)~(1u << fd);
-        t->fd_cloexec &= (uint16_t)~(1u << fd);
+            t->files->fd_console_closed &= (uint8_t)~(1u << fd);
+        t->files->fd_cloexec &= (uint16_t)~(1u << fd);
         return fd;
     }
     return -YOUSJ_EMFILE;
@@ -1200,7 +1211,7 @@ static long sys_openat(long dirfd, uint64_t path_ptr, long flags,
     if (fd < 0)
         file_put(f);
     else if (flags & YOUSJ_O_CLOEXEC)
-        me->fd_cloexec |= (uint16_t)(1u << fd);
+        me->files->fd_cloexec |= (uint16_t)(1u << fd);
     return fd;
 }
 
@@ -1211,17 +1222,17 @@ static long sys_close(long fd)
 
     if (fd < 0 || fd >= YOUSJ_NR_OPEN)
         return -YOUSJ_EBADF;
-    f = me->fd_file[fd];
+    f = me->files->fd_file[fd];
     if (f == NULL) {
         /* Closing an implicit console slot is legal and final:
          * the fd stops resolving to the console. */
-        if (fd < 3 && !(me->fd_console_closed & (uint8_t)(1u << fd))) {
-            me->fd_console_closed |= (uint8_t)(1u << fd);
+        if (fd < 3 && !(me->files->fd_console_closed & (uint8_t)(1u << fd))) {
+            me->files->fd_console_closed |= (uint8_t)(1u << fd);
             return 0;
         }
         return -YOUSJ_EBADF;
     }
-    me->fd_file[fd] = NULL;
+    me->files->fd_file[fd] = NULL;
     fs_inotify_note_close(f); /* M48: CLOSE_WRITE / NOWRITE */
     file_put(f);
     return 0;
@@ -2146,7 +2157,7 @@ static long sys_inotify_init1(long flags)
         return fd;
     }
     if (flags & YOUSJ_O_CLOEXEC)
-        me->fd_cloexec |= (uint16_t)(1u << fd);
+        me->files->fd_cloexec |= (uint16_t)(1u << fd);
     return fd;
 }
 
@@ -2197,7 +2208,7 @@ static long sys_epoll_create1(long flags)
         return fd;
     }
     if (flags & EPOLL_CLOEXEC_K)
-        me->fd_cloexec |= (uint16_t)(1u << fd);
+        me->files->fd_cloexec |= (uint16_t)(1u << fd);
     return fd;
 }
 
@@ -3093,14 +3104,14 @@ static long sys_pipe2_sys(uint64_t fds_ptr, long flags)
     }
     fdw = fd_alloc(me, wr);
     if (fdw < 0) {
-        me->fd_file[fdr] = NULL;
+        me->files->fd_file[fdr] = NULL;
         file_put(rd);
         file_put(wr);
         return fdw;
     }
     if (flags & YOUSJ_O_CLOEXEC) {
-        me->fd_cloexec |= (uint16_t)(1u << fdr);
-        me->fd_cloexec |= (uint16_t)(1u << fdw);
+        me->files->fd_cloexec |= (uint16_t)(1u << fdr);
+        me->files->fd_cloexec |= (uint16_t)(1u << fdw);
     }
     out = (int32_t *)(uintptr_t)fds_ptr;
     out[0] = (int32_t)fdr;
@@ -3137,17 +3148,17 @@ static long sys_dup3_sys(long oldfd, long newfd, long flags)
         return -YOUSJ_EBADF;
     if (oldfd == newfd)
         return newfd;
-    old = me->fd_file[newfd];
+    old = me->files->fd_file[newfd];
     if (old != NULL)
         file_put(old);
-    me->fd_file[newfd] = f;
+    me->files->fd_file[newfd] = f;
     file_get(f);
     if (newfd < 3)
-        me->fd_console_closed &= (uint8_t)~(1u << newfd);
+        me->files->fd_console_closed &= (uint8_t)~(1u << newfd);
     if (flags & YOUSJ_O_CLOEXEC)
-        me->fd_cloexec |= (uint16_t)(1u << newfd);
+        me->files->fd_cloexec |= (uint16_t)(1u << newfd);
     else
-        me->fd_cloexec &= (uint16_t)~(1u << newfd);
+        me->files->fd_cloexec &= (uint16_t)~(1u << newfd);
     return newfd;
 }
 
@@ -4076,13 +4087,19 @@ void user_task_start(void *arg)
 
     me->user_ip = u->ip;
     me->user_sp = u->sp;
+    /* M54: a boot-created user task is born with its own fd
+     * table (later tasks get theirs through clone). */
+    if (me->files == NULL)
+        me->files = files_alloc();
     /* M9: a boot-created user task starts life with the console
      * on fds 0-2 (later tasks inherit stdio through clone). */
-    if (me->fd_file[0] == NULL && me->fd_file[1] == NULL &&
-        me->fd_file[2] == NULL) {
-        me->fd_file[0] = fs_console_file();
-        me->fd_file[1] = fs_console_file();
-        me->fd_file[2] = fs_console_file();
+    if (me->files != NULL &&
+        me->files->fd_file[0] == NULL &&
+        me->files->fd_file[1] == NULL &&
+        me->files->fd_file[2] == NULL) {
+        me->files->fd_file[0] = fs_console_file();
+        me->files->fd_file[1] = fs_console_file();
+        me->files->fd_file[2] = fs_console_file();
     }
     /* kernel_rsp / TSS.rsp0 were set by arch_on_task_switch when
      * this task was scheduled in. The address space switch also

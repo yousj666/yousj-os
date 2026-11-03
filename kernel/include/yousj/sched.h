@@ -28,6 +28,18 @@ struct yousj_file; /* M9: open-file objects (fs.h) */
 #define YOUSJ_NR_OPEN 16  /* fds per task (M9) */
 #define YOUSJ_CWD_MAX 64  /* cwd path buffer, incl. NUL (M9) */
 
+/* M54: the fd table as a shareable, refcounted object
+ * (CLONE_FILES). Member names match the old per-task
+ * fields so call sites only gain a "files->" hop. The
+ * pool and refcount live in fs.c; fs.h carries the
+ * alloc/get/put/dup prototypes. */
+struct yousj_files {
+    uint32_t refs;
+    struct yousj_file *fd_file[YOUSJ_NR_OPEN];
+    uint8_t fd_console_closed; /* bits for fds 0,1,2 */
+    uint16_t fd_cloexec;       /* per-fd close-on-exec (M10) */
+};
+
 struct vmm_space; /* from <yousj/vmm.h>; tasks only hold the pointer */
 
 enum task_state {
@@ -193,16 +205,17 @@ struct task {
      * restored eagerly by arch_on_task_switch() -- but only
      * for user tasks; the kernel never touches the FPU. */
     _Alignas(16) uint8_t fx_area[YOUSJ_FX_SIZE];
-    /* M9: the fd table. Entries are shared open-file objects
-     * (fork copies the table and bumps each refcount, so the
-     * offset is shared exactly like Linux). NULL = free slot;
-     * for fds 0-2 a NULL slot means the implicit console unless
-     * the matching fd_console_closed bit is set (a task that
-     * never had console fds installed still gets stdio). */
-    struct yousj_file *fd_file[YOUSJ_NR_OPEN];
-    uint8_t         fd_console_closed; /* bits for fds 0,1,2 */
-    uint16_t        fd_cloexec;        /* per-fd close-on-exec
-                                          bits (M10) */
+    /* M9/M54: the fd table, a refcounted object of its own
+     * since M54 (CLONE_FILES shares it). Entries are shared
+     * open-file objects (fork copies the table and bumps
+     * each refcount, so the offset is shared exactly like
+     * Linux). NULL entry = free slot; for fds 0-2 a NULL
+     * entry means the implicit console unless the matching
+     * fd_console_closed bit is set (a task that never had
+     * console fds installed still gets stdio). The table
+     * pointer itself is NULL only for kernel threads, which
+     * never touch fds. Pool + refcount live in fs.c. */
+    struct yousj_files *files;
     char            cwd_path[YOUSJ_CWD_MAX]; /* "" = "/" */
     bool            in_use;
 };

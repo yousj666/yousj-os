@@ -536,6 +536,64 @@ void file_put(struct yousj_file *f)
     }
 }
 
+/* --- M54: fd-table objects --------------------------------
+ * One table per task in the worst case, so the pool is
+ * sized to the task pool. A slot with refs == 0 is free. */
+#define FILES_POOL 32
+static struct yousj_files g_files_pool[FILES_POOL];
+
+struct yousj_files *files_alloc(void)
+{
+    int i;
+    for (i = 0; i < FILES_POOL; i++) {
+        if (g_files_pool[i].refs == 0) {
+            mem_zero((uint8_t *)&g_files_pool[i],
+                     sizeof(g_files_pool[i]));
+            g_files_pool[i].refs = 1;
+            return &g_files_pool[i];
+        }
+    }
+    return NULL;
+}
+
+void files_get(struct yousj_files *fl)
+{
+    if (fl != NULL)
+        fl->refs++;
+}
+
+void files_put(struct yousj_files *fl)
+{
+    int i;
+    if (fl == NULL || fl->refs == 0)
+        return;
+    if (--fl->refs > 0)
+        return;
+    /* Last holder: close everything (file_put on the
+     * console singleton is a no-op, as before). */
+    for (i = 0; i < YOUSJ_NR_OPEN; i++) {
+        if (fl->fd_file[i] != NULL) {
+            file_put(fl->fd_file[i]);
+            fl->fd_file[i] = NULL;
+        }
+    }
+}
+
+struct yousj_files *files_dup(struct yousj_files *fl)
+{
+    struct yousj_files *nf = files_alloc();
+    int i;
+    if (nf == NULL || fl == NULL)
+        return nf;
+    for (i = 0; i < YOUSJ_NR_OPEN; i++) {
+        nf->fd_file[i] = fl->fd_file[i];
+        file_get(nf->fd_file[i]);
+    }
+    nf->fd_console_closed = fl->fd_console_closed;
+    nf->fd_cloexec = fl->fd_cloexec;
+    return nf;
+}
+
 #define MAX_PIPES 16
 static struct yousj_pipe g_pipes[MAX_PIPES];
 
@@ -1578,7 +1636,7 @@ static int proc_find2(const char *rel, uint32_t *pid_out,
                 if (d[j] != '\0')
                     return -1;
                 t = sched_find_task((int)*pid_out);
-                if (t == NULL || t->fd_file[v] == NULL)
+                if (t == NULL || t->files == NULL || t->files->fd_file[v] == NULL)
                     return -1;
                 if (fd_out != NULL)
                     *fd_out = (int)v;
@@ -1602,7 +1660,7 @@ static int proc_find2(const char *rel, uint32_t *pid_out,
                 if (d[j] != '\0')
                     return -1;
                 t = sched_find_task((int)*pid_out);
-                if (t == NULL || t->fd_file[v] == NULL)
+                if (t == NULL || t->files == NULL || t->files->fd_file[v] == NULL)
                     return -1;
                 if (fd_out != NULL)
                     *fd_out = (int)v;
@@ -1681,9 +1739,10 @@ static long proc_fd_target(uint32_t pid, int fd, char *buf,
     struct yousj_file *f;
     char num[12];
     uint64_t i;
-    if (t == NULL || fd < 0 || fd >= YOUSJ_NR_OPEN)
+    if (t == NULL || t->files == NULL || fd < 0 ||
+        fd >= YOUSJ_NR_OPEN)
         return -1;
-    f = t->fd_file[fd];
+    f = t->files->fd_file[fd];
     if (f == NULL)
         return -1;
     buf[0] = '\0';
@@ -1923,8 +1982,9 @@ static uint32_t proc_generate(int id, uint32_t pid, int pfd,
     case PROC_ID_PFDINFO: {
         struct task *t = sched_find_task((int)pid);
         struct yousj_file *tf =
-            (t != NULL && pfd >= 0 && pfd < YOUSJ_NR_OPEN)
-                ? t->fd_file[pfd]
+            (t != NULL && t->files != NULL && pfd >= 0 &&
+             pfd < YOUSJ_NR_OPEN)
+                ? t->files->fd_file[pfd]
                 : NULL;
         struct yousj_stat_info si;
         if (tf == NULL)
@@ -3463,9 +3523,9 @@ long file_getdents(struct yousj_file *f, uint8_t *buf, uint64_t count)
                 (int)f->proc_pid);
             int k;
             total = 2;
-            if (t != NULL) {
+            if (t != NULL && t->files != NULL) {
                 for (k = 0; k < YOUSJ_NR_OPEN; k++)
-                    if (t->fd_file[k] != NULL)
+                    if (t->files->fd_file[k] != NULL)
                         fds[total++ - 2] = k;
             }
         } else {

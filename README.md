@@ -832,12 +832,38 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   孩子装 B 进同一张表、父自发信号
   跑的是 B 而非 A；孩子内 getpid
   ==父 tid、gettid==自身 tid。
-- ⏳ 下一步候选：CLONE_FILES（fd
-  表共享，pthread 旗标面最后一块；
-  之后可尝试接 musl 的 pthread 形
-  式验证），robust futex，或
-  inotify 事件补完（ftruncate 的
-  MODIFY、exchange 的 MOVE_SELF）。
+- ✅ fd 表共享 M54（2026-11-04）：
+  fd 表从 task 内嵌字段改为引用
+  计数的共享对象（yousj_files，
+  fs.c 池 32；task 只留指针，内核
+  线程为 NULL、用户任务在
+  user_task_start 出生时分配）。
+  普通 clone 走 files_dup 私有拷贝
+  （每项 file_get、偏移共享语义
+  不变）；CLONE_FILES(0x400) 转正
+  共享同一张表：一处 open/close
+  全组可见。退出只放引用、最后一
+  个持有者退出时才真关文件；exec
+  若表被共享则先脱离到私有拷贝再
+  关 CLOEXEC（本内核线程不因 exec
+  而死，拷贝保住兄弟们的 fd）。
+  /proc 的 fd 枚举路径对 files==
+  NULL 的内核线程已加守卫。
+  glibc 的 clone 旗标面至此只剩
+  CLONE_FS（cwd/umask 共享）未开。
+  验收：futextest 加 files 场景
+  ——CLONE_FILES 孩子经父的管道写
+  端送字节、再在共享表里关掉读
+  端，父自己的读端随之 EBADF
+  （拷贝语义下父应照常可读）。
+- ⏳ 下一步候选：CLONE_FS 收尾
+  clone 旗标面（cwd 字符串与
+  umask 共享），或 robust futex，
+  或 inotify 事件补完（ftruncate
+  的 MODIFY、exchange 的
+  MOVE_SELF）；再往后可尝试接
+  musl 跑真 pthread 程序作形式
+  验证。
 
 ## 从零构建
 

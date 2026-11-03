@@ -217,6 +217,46 @@ static void handler_b(long sig, void *info, void *uctx)
     flag_b = 1;
 }
 
+/* M54 files: a CLONE_FILES child writes through the
+ * parent's pipe fd, then closes the read end IN THE SHARED
+ * TABLE -- the parent's matching fd must die with it. */
+#define SYS_read 0
+#define SYS_close 3
+#define SYS_pipe 22
+
+static volatile int pipe_rd;
+static volatile int pipe_wr;
+static volatile int files_done1;
+static volatile int files_go2;
+static volatile int files_done2;
+
+__attribute__((used)) void thread_main4(void)
+{
+    char b = 'F';
+    sys_call3(SYS_write, pipe_wr, (long)(uintptr_t)&b, 1);
+    files_done1 = 1;
+    while (!files_go2)
+        sleep_ms(5);
+    sys_call1(SYS_close, pipe_rd);
+    files_done2 = 1;
+    die(0);
+}
+
+extern long clone_files_call(long flags, uint64_t stack);
+__asm__(
+    ".globl clone_files_call\n"
+    "clone_files_call:\n"
+    "    mov $56, %rax\n" /* clone */
+    "    syscall\n"
+    "    test %rax, %rax\n"
+    "    jz 1f\n"
+    "    ret\n"
+    "1:  call thread_main4\n"
+    "    mov $231, %rax\n"
+    "    xor %rdi, %rdi\n"
+    "    syscall\n"
+    "    ud2\n");
+
 /* thread_main3 lives below, after struct k_sigaction. */
 
 extern long clone_thread_call(long flags, uint64_t stack);
@@ -483,6 +523,55 @@ int main(int argc, char **argv)
                      child_pid_seen == mytid &&
                      child_tid_seen == c;
                 report("sighand", ok);
+            }
+        }
+    }
+
+    /* files: CLONE_FILES shares the fd table itself */
+    {
+        int pfds[2];
+        uint64_t top =
+            (uint64_t)(uintptr_t)(cstack + sizeof(cstack)) &
+            ~15ULL;
+        long c;
+        int ok1, ok2, spins;
+        char ch = 0;
+        long n;
+        if (sys_call1(SYS_pipe, (long)(uintptr_t)pfds) != 0) {
+            report("files", 0);
+        } else {
+            pipe_rd = pfds[0];
+            pipe_wr = pfds[1];
+            files_done1 = 0;
+            files_go2 = 0;
+            files_done2 = 0;
+            /* SIGCHLD | VM | FILES(0x400) | THREAD(0x10000) */
+            c = clone_files_call(17 | 0x100 | 0x400 | 0x10000,
+                                 top);
+            if (c <= 0) {
+                report("files", 0);
+            } else {
+                long st = 0;
+                for (spins = 0; spins < 300 && !files_done1;
+                     spins++)
+                    sleep_ms(10);
+                n = sys_call3(SYS_read, pipe_rd,
+                              (long)(uintptr_t)&ch, 1);
+                ok1 = n == 1 && ch == 'F';
+                files_go2 = 1;
+                for (spins = 0; spins < 300 && !files_done2;
+                     spins++)
+                    sleep_ms(10);
+                /* The child closed pipe_rd in the SHARED
+                 * table: our own read end is gone too. A
+                 * copied table would still read fine. */
+                n = sys_call3(SYS_read, pipe_rd,
+                              (long)(uintptr_t)&ch, 1);
+                ok2 = n == -9; /* EBADF */
+                sys_call4(SYS_wait4, c,
+                          (long)(uintptr_t)&st, 0, 0);
+                sys_call1(SYS_close, pipe_wr);
+                report("files", ok1 && ok2);
             }
         }
     }
