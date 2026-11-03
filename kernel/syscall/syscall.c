@@ -533,7 +533,31 @@ void process_exit(long status, int sig)
 /* --- batch 2: the process family (M5) ----------------------------------- */
 
 #define YOUSJ_WNOHANG 1
+#define YOUSJ_WUNTRACED 2  /* M66 */
+#define YOUSJ_WCONTINUED 8 /* M66 */
 #define YOUSJ_RUSAGE_SIZE 144 /* struct rusage, zero-filled */
+
+/* M66: validate and fill a wait4 result (status word plus
+ * a zeroed rusage); shared by the zombie and event paths.
+ * On EFAULT nothing is written and the event/zombie stays
+ * for a corrected retry. */
+static long fill_wait_outputs(uint64_t status_ptr,
+                              uint64_t rusage_ptr, int word)
+{
+    if (status_ptr != 0) {
+        if (!user_range_ok(status_ptr, 4))
+            return -YOUSJ_EFAULT;
+        *(int *)(uintptr_t)status_ptr = word;
+    }
+    if (rusage_ptr != 0) {
+        uint64_t i;
+        if (!user_range_ok(rusage_ptr, YOUSJ_RUSAGE_SIZE))
+            return -YOUSJ_EFAULT;
+        for (i = 0; i < YOUSJ_RUSAGE_SIZE; i++)
+            ((uint8_t *)(uintptr_t)rusage_ptr)[i] = 0;
+    }
+    return 0;
+}
 
 static long sys_wait4(long pid, uint64_t status_ptr, long options,
                       uint64_t rusage_ptr)
@@ -543,7 +567,8 @@ static long sys_wait4(long pid, uint64_t status_ptr, long options,
     /* M65: every pid form is meaningful now -- -1 any
      * child, >0 that child, 0 the caller's process group,
      * <-1 that process group (see wait_matches). */
-    if (options & ~YOUSJ_WNOHANG)
+    if (options & ~(YOUSJ_WNOHANG | YOUSJ_WUNTRACED |
+                    YOUSJ_WCONTINUED))
         return -YOUSJ_EINVAL;
 
     for (;;) {
@@ -558,23 +583,38 @@ static long sys_wait4(long pid, uint64_t status_ptr, long options,
                    (signal_is_core(z->sig_killed) ? 0x80 : 0))
                 : (z->exit_status << 8);
             uint64_t ztid = z->tid;
+            long fr;
 
             /* Validate and fill the outputs BEFORE reaping: on
              * EFAULT the zombie stays for a corrected retry. */
-            if (status_ptr != 0) {
-                if (!user_range_ok(status_ptr, 4))
-                    return -YOUSJ_EFAULT;
-                *(int *)(uintptr_t)status_ptr = word;
-            }
-            if (rusage_ptr != 0) {
-                uint64_t i;
-                if (!user_range_ok(rusage_ptr, YOUSJ_RUSAGE_SIZE))
-                    return -YOUSJ_EFAULT;
-                for (i = 0; i < YOUSJ_RUSAGE_SIZE; i++)
-                    ((uint8_t *)(uintptr_t)rusage_ptr)[i] = 0;
-            }
+            fr = fill_wait_outputs(status_ptr, rusage_ptr,
+                                   word);
+            if (fr != 0)
+                return fr;
             sched_reap_zombie(z);
             return (long)ztid;
+        }
+        /* M66: stop/continue events, oldest first, each
+         * reported at most once. The report stamp commits
+         * only after the outputs are safely written, so
+         * an EFAULT leaves the event for a retry. */
+        if (options & (YOUSJ_WUNTRACED | YOUSJ_WCONTINUED)) {
+            int eword = 0;
+            uint32_t eseq = 0;
+            struct task *ev = sched_find_wait_event(
+                me, (int)pid,
+                (options & YOUSJ_WUNTRACED) != 0,
+                (options & YOUSJ_WCONTINUED) != 0,
+                &eword, &eseq);
+            if (ev != NULL) {
+                long fr = fill_wait_outputs(status_ptr,
+                                            rusage_ptr,
+                                            eword);
+                if (fr != 0)
+                    return fr;
+                sched_mark_wait_reported(ev, eseq);
+                return (long)ev->tid;
+            }
         }
         if (!sched_has_children(me, (int)pid))
             return -YOUSJ_ECHILD;

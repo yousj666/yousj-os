@@ -187,8 +187,10 @@ int signal_send(struct task *t, int sig, int from_tid)
     t->sig_pending |= yousj_sig_bit(sig);
     t->sig_sender[sig] = from_tid;
 
-    if (sig == YOUSJ_SIGCONT)
+    if (sig == YOUSJ_SIGCONT) {
         sched_cont_task(t);
+        sched_note_cont(t); /* M66: WCONTINUED reporting */
+    }
     if (sig == YOUSJ_SIGKILL && t->sig_stopped)
         sched_cont_task(t); /* unstick: it dies at its gate */
 
@@ -410,6 +412,7 @@ static int gate_run(struct task *me, struct sig_snapshot *snap,
             continue;
         case DISP_STOP:
             me->sig_pending &= ~yousj_sig_bit(sig);
+            sched_note_stop(me, sig); /* M66: WUNTRACED */
             sched_self_park();
             if (*result_io == -YOUSJ_ERESTARTSYS)
                 *result_io = -YOUSJ_EINTR;

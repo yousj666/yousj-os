@@ -880,6 +880,42 @@ int main(int argc, char **argv)
         report("groups", ok);
     }
 
+    /* M66: WUNTRACED / WCONTINUED. The child stops
+     * itself with SIGSTOP; the parent's untraced wait
+     * must surface the stop exactly once, then the
+     * SIGCONT release surfaces as 0xFFFF, then the
+     * child exits normally. */
+    {
+        long c, st = 0, r;
+        int ok = 1;
+        c = sys_call4(SYS_clone, 17, 0, 0, 0);
+        if (c == 0) {
+            long self = sys_call1(SYS_getpid, 0);
+            sleep_ms(200);
+            sys_call3(SYS_kill, self, 19, 0); /* SIGSTOP */
+            die(4); /* reached only after SIGCONT */
+        }
+        r = sys_call4(SYS_wait4, c, (long)(uintptr_t)&st, 2,
+                      0); /* WUNTRACED */
+        ok = ok && r == c && (st & 0xFF) == 0x7F &&
+             ((st >> 8) & 0xFF) == 19;
+        /* already reported: a WNOHANG re-check finds none */
+        st = 0;
+        r = sys_call4(SYS_wait4, c, (long)(uintptr_t)&st,
+                      2 | 1, 0); /* WUNTRACED|WNOHANG */
+        ok = ok && r == 0;
+        sys_call3(SYS_kill, c, 18, 0); /* SIGCONT */
+        st = 0;
+        r = sys_call4(SYS_wait4, c, (long)(uintptr_t)&st, 8,
+                      0); /* WCONTINUED */
+        ok = ok && r == c && st == 0xFFFF;
+        st = 0;
+        r = sys_call4(SYS_wait4, c, (long)(uintptr_t)&st, 0,
+                      0);
+        ok = ok && r == c && ((st >> 8) & 0xFF) == 4;
+        report("stopcont", ok);
+    }
+
     out("PIDTEST DONE\n");
     return fails;
 }

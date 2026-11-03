@@ -1084,12 +1084,32 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   后台任务 jobs 可见、shell
   保持响应。pidtest 新增
   groups 场景（共 18）。
-- ⏳ 下一步候选：wait4 的
-  WUNTRACED/WCONTINUED（停
-  止/继续的等待上报，fg/bg
-  的另一半），或把 /bin/sh
-  本身换成 busybox sh 的准
-  备工作。
+- ✅ wait4 停止/继续上报
+  M66（2026-11-04）：
+  WUNTRACED(2)/WCONTINUED(8)
+  转正。每次停止与释放都给
+  子任务盖全局序号戳
+  （sched_note_stop 在信号投
+  递的 DISP_STOP 点、note_
+  cont 在 SIGCONT 释放点），
+  wait4 按戳序回报、每事件
+  只报一次，状态字：停止
+  (sig<<8)|0x7F、继续
+  0xFFFF；戳的提交在输出写
+  成功之后，EFAULT 不吞事
+  件。记注同时唤醒阻塞在匹
+  配 wait4 上的父进程。已知
+  简化：停止/继续不另发
+  SIGCHLD（在 wait 里的父进
+  程靠唤醒即可，不在 wait
+  的父进程下次 wait 时按戳
+  补报）。pidtest 新增
+  stopcont 场景（共 19）。
+- ⏳ 下一步候选：把默认
+  /bin/sh 的体验向 busybox
+  sh 靠拢的准备工作，或
+  sockets 基础（socketpair
+  起步）。
 
 ## 从零构建
 

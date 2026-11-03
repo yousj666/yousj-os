@@ -163,6 +163,17 @@ struct task {
                                      while wait_active (M65:
                                      pid 0 is a real target). */
     bool            wait_active;  /* M65: blocked in wait4 */
+    int             stop_sig;     /* M66: signal that caused
+                                     the current stop */
+    bool            stop_noted;   /* M66: inside a stop
+                                     episode the parent has
+                                     not been told ended */
+    uint32_t        stop_seq;     /* M66: event stamps for
+                                     wait4 WUNTRACED /
+                                     WCONTINUED reporting */
+    uint32_t        cont_seq;
+    uint32_t        wait_reported_seq; /* M66: events up to
+                                     this stamp are reported */
     uint64_t        kernel_stack_base; /* PMM base of the owned
                                      kernel stack (auto-created
                                      tasks); 0 = not owned, never
@@ -328,6 +339,14 @@ void         sched_set_name(struct task *t, const char *name);
  * reaper that frees a zombie's kernel stack and pool slot. */
 struct task *sched_find_zombie_child(struct task *parent, int pid);
 int          sched_has_children(struct task *parent, int pid);
+void         sched_note_stop(struct task *t, int sig); /* M66 */
+void         sched_note_cont(struct task *t);          /* M66 */
+struct task *sched_find_wait_event(struct task *parent, int pid,
+                                   int want_stop, int want_cont,
+                                   int *word_out,
+                                   uint32_t *seq_out); /* M66 */
+void         sched_mark_wait_reported(struct task *child,
+                                      uint32_t seq);   /* M66 */
 int          sched_adopt_children(uint64_t from_tid, uint64_t to_tid);
 int          sched_reap_zombie(struct task *victim);
 

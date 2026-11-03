@@ -481,6 +481,84 @@ int sched_has_children(struct task *parent, int pid)
     return 0;
 }
 
+/* --- M66: stop/continue events for wait4 -------------------
+ * Every stop episode and every release stamps the child
+ * with a global sequence number; wait4 reports events in
+ * stamp order, each at most once (wait_reported_seq).
+ * Noting wakes a parent blocked in a matching wait4. */
+
+static uint32_t g_wait_event_seq;
+
+static void wake_waiting_parent(struct task *child)
+{
+    struct task *parent =
+        sched_find_task((int)child->parent_tid);
+    if (parent != NULL && parent->state == TASK_BLOCKED &&
+        parent->wait_active &&
+        wait_matches(parent, child, (int)parent->wait_target))
+        sched_wake(parent);
+}
+
+void sched_note_stop(struct task *t, int sig)
+{
+    if (t == NULL || t->stop_noted)
+        return;
+    t->stop_noted = true;
+    t->stop_sig = sig;
+    t->stop_seq = ++g_wait_event_seq;
+    wake_waiting_parent(t);
+}
+
+void sched_note_cont(struct task *t)
+{
+    if (t == NULL || !t->stop_noted)
+        return;
+    t->stop_noted = false;
+    t->cont_seq = ++g_wait_event_seq;
+    wake_waiting_parent(t);
+}
+
+struct task *sched_find_wait_event(struct task *parent, int pid,
+                                   int want_stop, int want_cont,
+                                   int *word_out, uint32_t *seq_out)
+{
+    uint64_t i;
+    struct task *best = NULL;
+    uint32_t best_seq = 0xFFFFFFFFu;
+    int best_stop = 0;
+    for (i = 0; i < YOUSJ_SCHED_MAX_TASKS; i++) {
+        struct task *t = &g_tasks[i];
+        if (!t->in_use || t->parent_tid != parent->tid ||
+            t->state == TASK_ZOMBIE ||
+            !wait_matches(parent, t, pid))
+            continue;
+        if (want_stop && t->stop_seq > t->wait_reported_seq &&
+            t->stop_seq < best_seq) {
+            best = t;
+            best_seq = t->stop_seq;
+            best_stop = 1;
+        }
+        if (want_cont && t->cont_seq > t->wait_reported_seq &&
+            t->cont_seq < best_seq) {
+            best = t;
+            best_seq = t->cont_seq;
+            best_stop = 0;
+        }
+    }
+    if (best == NULL)
+        return NULL;
+    *word_out = best_stop ? ((best->stop_sig << 8) | 0x7F)
+                          : 0xFFFF;
+    *seq_out = best_seq;
+    return best;
+}
+
+void sched_mark_wait_reported(struct task *child, uint32_t seq)
+{
+    if (child != NULL && seq > child->wait_reported_seq)
+        child->wait_reported_seq = seq;
+}
+
 int sched_adopt_children(uint64_t from_tid, uint64_t to_tid)
 {
     uint64_t i;
