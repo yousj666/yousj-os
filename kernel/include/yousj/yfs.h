@@ -76,6 +76,7 @@ uint32_t yfs_nlink(uint32_t ino);
 long yfs_unlink(const char *parent_rel, const char *name,
                 bool want_dir);
 long yfs_rename(const char *old_rel, const char *new_rel);
+long yfs_exchange(const char *a_rel, const char *b_rel);
 void yfs_note_open(uint32_t ino);
 void yfs_note_close(uint32_t ino);
 

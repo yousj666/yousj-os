@@ -156,6 +156,7 @@ long fs_read_all_path(const char *path, uint8_t *dst,
 long fs_unlink_path(const char *path);
 long fs_rmdir_path(const char *path);
 long fs_rename_path(const char *old_path, const char *new_path);
+long fs_exchange_path(const char *a_path, const char *b_path);
 /* M16: symlinks. fs_symlink_path creates a link at linkpath
  * holding target (stored verbatim, absolute or relative);
  * fs_readlink_path returns the target's length, or -EINVAL

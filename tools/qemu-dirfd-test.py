@@ -87,7 +87,7 @@ def free_count():
 SCEN = ['openat-rel', 'openat-sub', 'fdcwd', 'statat-rel',
         'utimensat-rel', 'abs-ignores', 'bad-dfd', 'notdir',
         'unlinkat-rel', 'symlinkat-rel', 'mkdirat-rel',
-        'renameat-rel', 'renameat2-noreplace',
+        'renameat-rel', 'renameat2-noreplace', 'renameat2-exchange',
         'readlinkat-rel', 'faccessat-rel', 'hardlink',
         'chmod-family', 'creat-modes', 'seekdir', 'sendfile', 'copy-range']
 

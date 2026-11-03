@@ -1923,6 +1923,81 @@ long fs_link_path(const char *old_path, const char *new_path,
     }
 }
 
+/* M46: RENAME_EXCHANGE. Both paths must exist; the
+ * names trade objects. Exchanging a directory with
+ * its own descendant (or vice versa) is EINVAL,
+ * checked on the resolved path strings; a directory
+ * also may not trade with the root. */
+static bool path_is_ancestor(const char *a, const char *b)
+{
+    uint64_t i = 0;
+    if (a[0] == '/' && a[1] == '\0')
+        return b[0] == '/' && b[1] != '\0';
+    while (a[i] != '\0' && a[i] == b[i])
+        i++;
+    return a[i] == '\0' && b[i] == '/';
+}
+
+long fs_exchange_path(const char *a_path, const char *b_path)
+{
+    char ra[PATH_MAX_LEN + 1], rb[PATH_MAX_LEN + 1];
+    long rc = fs_resolve_links(a_path, ra, false);
+    if (rc != 0)
+        return rc;
+    rc = fs_resolve_links(b_path, rb, false);
+    if (rc != 0)
+        return rc;
+    if (is_proc_path(ra) || is_proc_path(rb))
+        return -YOUSJ_EACCES_L;
+    {
+        bool ad = is_data_path(ra), bd = is_data_path(rb);
+        uint64_t i = 0;
+        bool same = true;
+        while (ra[i] != '\0' || rb[i] != '\0') {
+            if (ra[i] != rb[i]) {
+                same = false;
+                break;
+            }
+            i++;
+        }
+        if (same)
+            return 0;
+        if (path_is_ancestor(ra, rb) ||
+            path_is_ancestor(rb, ra))
+            return -YOUSJ_EINVAL;
+        if (ad != bd)
+            return -YOUSJ_EXDEV_L;
+        if (ad)
+            return yfs_exchange(data_rel(ra), data_rel(rb));
+    }
+    {
+        char abase[NAME_MAX_LEN + 1], bbase[NAME_MAX_LEN + 1];
+        struct yousj_ramfs_node *ap = walk(ra, true, abase);
+        struct yousj_ramfs_node *bp = walk(rb, true, bbase);
+        struct yousj_dent *da, *db;
+        struct yousj_ramfs_node *na, *nb;
+        if (ap == NULL || bp == NULL)
+            return -YOUSJ_ENOENT_L;
+        da = node_find_dent(ap, abase, str_len(abase));
+        db = node_find_dent(bp, bbase, str_len(bbase));
+        if (da == NULL || db == NULL)
+            return -YOUSJ_ENOENT_L;
+        na = da->node;
+        nb = db->node;
+        if (na == g_root || nb == g_root)
+            return -YOUSJ_EINVAL;
+        da->node = nb;
+        db->node = na;
+        if (na->is_dir)
+            na->parent = bp;
+        if (nb->is_dir)
+            nb->parent = ap;
+        na->ctime = (uint32_t)yousj_now_unix();
+        nb->ctime = na->ctime;
+        return 0;
+    }
+}
+
 long fs_symlink_path(const char *target, const char *linkpath)
 {
     char resolved[PATH_MAX_LEN + 1];

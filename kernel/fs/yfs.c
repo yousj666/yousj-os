@@ -1218,6 +1218,59 @@ long yfs_link(const char *old_rel, const char *new_rel)
     return rc;
 }
 
+/* M46: RENAME_EXCHANGE -- swap the inode numbers in
+ * two directory entries. Both must exist; types may
+ * differ (files, dirs, links all swap). */
+static long yfs_exchange_impl(const char *a_rel,
+                              const char *b_rel)
+{
+    char ap[128], an[40], bp[128], bn[40];
+    long apino, bpino, aino, bino;
+    uint32_t aslot, bslot;
+    struct dirent_raw de;
+
+    split_rel(a_rel, ap, an);
+    split_rel(b_rel, bp, bn);
+    apino = yfs_lookup(ap);
+    if (apino < 0)
+        return apino;
+    bpino = yfs_lookup(bp);
+    if (bpino < 0)
+        return bpino;
+    aino = dir_find((uint32_t)apino, an, &aslot);
+    if (aino < 0)
+        return aino;
+    bino = dir_find((uint32_t)bpino, bn, &bslot);
+    if (bino < 0)
+        return bino;
+    if (aino == bino && apino == bpino && aslot == bslot)
+        return 0;
+    mem_zero((uint8_t *)&de, sizeof(de));
+    de.ino = (uint32_t)bino;
+    mem_copy((uint8_t *)de.name, (const uint8_t *)an,
+             str_len(an) + 1);
+    if (dir_write_bytes((uint32_t)apino, aslot * DIRENT_SIZE,
+                        &de, DIRENT_SIZE) != 0)
+        return -E_IO_L;
+    mem_zero((uint8_t *)&de, sizeof(de));
+    de.ino = (uint32_t)aino;
+    mem_copy((uint8_t *)de.name, (const uint8_t *)bn,
+             str_len(bn) + 1);
+    if (dir_write_bytes((uint32_t)bpino, bslot * DIRENT_SIZE,
+                        &de, DIRENT_SIZE) != 0)
+        return -E_IO_L;
+    return 0;
+}
+
+long yfs_exchange(const char *a_rel, const char *b_rel)
+{
+    long rc;
+    txn_begin();
+    rc = yfs_exchange_impl(a_rel, b_rel);
+    txn_finish(rc >= 0);
+    return rc;
+}
+
 long yfs_mknod_t(const char *parent_rel, const char *name,
                  uint8_t type)
 {

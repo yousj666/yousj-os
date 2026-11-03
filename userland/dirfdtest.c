@@ -566,6 +566,65 @@ int main(int argc, char **argv)
         sys_call1(SYS_unlink, (long)(uintptr_t)p);
     }
 
+    /* --- M46: renameat2 RENAME_EXCHANGE --- */
+    {
+        char rb[16];
+        long fd;
+        join(p, dir, "ex-a");
+        mkfile(p, "AAAA");
+        join(p, dir, "ex-b");
+        mkfile(p, "BBBBBB");
+        join(p, dir, "ex-a");
+        {
+            char q[300];
+            uint64_t j = 0;
+            const char *qq = p;
+            while (qq[j] != '\0') {
+                q[j] = qq[j];
+                j++;
+            }
+            q[j] = '\0';
+            join(p, dir, "ex-b");
+            /* exchange contents via the two names */
+            long rc = sys_call5(SYS_renameat2, AT_FDCWD,
+                                (long)(uintptr_t)q, AT_FDCWD,
+                                (long)(uintptr_t)p, 2);
+            int ok = rc == 0;
+            fd = sys_call3(SYS_open, (long)(uintptr_t)q, 0,
+                           0);
+            ok = ok && sys_call3(SYS_read, fd,
+                                 (long)(uintptr_t)rb,
+                                 sizeof(rb)) == 6 &&
+                 rb[0] == 'B';
+            sys_call1(SYS_close, fd);
+            fd = sys_call3(SYS_open, (long)(uintptr_t)p, 0,
+                           0);
+            ok = ok && sys_call3(SYS_read, fd,
+                                 (long)(uintptr_t)rb,
+                                 sizeof(rb)) == 4 &&
+                 rb[0] == 'A';
+            sys_call1(SYS_close, fd);
+            /* both flags together are invalid; a
+             * missing party is ENOENT */
+            ok = ok && sys_call5(SYS_renameat2, AT_FDCWD,
+                                 (long)(uintptr_t)q,
+                                 AT_FDCWD,
+                                 (long)(uintptr_t)p,
+                                 3) == -22;
+            join(p, dir, "ghost");
+            ok = ok && sys_call5(SYS_renameat2, AT_FDCWD,
+                                 (long)(uintptr_t)q,
+                                 AT_FDCWD,
+                                 (long)(uintptr_t)p,
+                                 2) == -2;
+            report("renameat2-exchange", ok);
+        }
+        join(p, dir, "ex-a");
+        sys_call1(SYS_unlink, (long)(uintptr_t)p);
+        join(p, dir, "ex-b");
+        sys_call1(SYS_unlink, (long)(uintptr_t)p);
+    }
+
     /* --- M36: chmod / chown --- */
     {
         struct st sb2;

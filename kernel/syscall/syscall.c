@@ -2240,6 +2240,7 @@ static long sys_readlinkat(long dirfd, uint64_t path_ptr,
 }
 
 #define RENAME_NOREPLACE_K 1
+#define RENAME_EXCHANGE_K 2 /* M46 */
 /* M44: link/linkat -- hard links exist since the dent
  * refactor. AT_SYMLINK_FOLLOW (0x400) resolves the
  * source first; AT_EMPTY_PATH is not supported. */
@@ -2275,8 +2276,11 @@ static long sys_renameat(long odfd, uint64_t op, long ndfd,
     struct task *me = sched_current();
     static char ob[256], nb[256], ro[256], rn[256];
     long rc;
-    if (flags & ~RENAME_NOREPLACE_K)
+    if (flags & ~(RENAME_NOREPLACE_K | RENAME_EXCHANGE_K))
         return -YOUSJ_EINVAL;
+    if ((flags & RENAME_NOREPLACE_K) &&
+        (flags & RENAME_EXCHANGE_K))
+        return -YOUSJ_EINVAL; /* mutually exclusive */
     if (copy_user_string(op, ob, sizeof ob) != 0 ||
         copy_user_string(np, nb, sizeof nb) != 0)
         return -YOUSJ_EFAULT;
@@ -2286,6 +2290,8 @@ static long sys_renameat(long odfd, uint64_t op, long ndfd,
     rc = resolve_at(me, ndfd, nb, rn);
     if (rc != 0)
         return rc;
+    if (flags & RENAME_EXCHANGE_K)
+        return fs_exchange_path(ro, rn);
     if (flags & RENAME_NOREPLACE_K) {
         struct yousj_stat_info info;
         if (fs_path_stat2(rn, false, &info))

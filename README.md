@@ -667,8 +667,16 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   位的值、误关 fd 0——已改为 int[2]。
   验收：pidtest 加 fdinfo（内容四行、目录
   列表类型、pid 目录新项、坏 fd ENOENT）。
-- ⏳ 下一步候选：renameat2 余下 flags
-  （EXCHANGE）、inotify 盘点、/dev 盘点。
+- ✅ renameat2 RENAME_EXCHANGE M46
+  （2026-11-03）：两名互换对象——ramfs 交换
+  两 dent 的节点指向（目录顺带修正 parent），
+  yfs 交换两 dirent 的 inode 号；与 NOREPLACE
+  同置为 EINVAL，互为祖先/后代 EINVAL，跨备
+  EXDEV；RENAME_WHITEOUT 仍 EINVAL（无 union
+  语义）。验收：dirfdtest 加 exchange 场景
+  （内容互换、互斥 flags、缺名 ENOENT），
+  ramfs 与 yfs 各跑一遍。
+- ⏳ 下一步候选：inotify 盘点、/dev 盘点。
 
 ## 从零构建
 
