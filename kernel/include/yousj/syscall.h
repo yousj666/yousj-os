@@ -128,5 +128,18 @@
 #define YOUSJ_SYS_inotify_add_watch 254 /* M48 */
 #define YOUSJ_SYS_inotify_rm_watch 255 /* M48 */
 #define YOUSJ_SYS_inotify_init1    294 /* M48 */
+#define YOUSJ_SYS_getuid      102   /* M59 */
+#define YOUSJ_SYS_getgid      104   /* M59 */
+#define YOUSJ_SYS_setuid      105   /* M59 */
+#define YOUSJ_SYS_setgid      106   /* M59 */
+#define YOUSJ_SYS_geteuid     107   /* M59 */
+#define YOUSJ_SYS_getegid     108   /* M59 */
+#define YOUSJ_SYS_setreuid    113   /* M59 */
+#define YOUSJ_SYS_setregid    114   /* M59 */
+#define YOUSJ_SYS_setresuid   117   /* M59 */
+#define YOUSJ_SYS_getresuid   118   /* M59 */
+#define YOUSJ_SYS_setresgid   119   /* M59 */
+#define YOUSJ_SYS_getresgid   120   /* M59 */
+#define YOUSJ_SYS_fcntl       72    /* M59 */
 
 #endif /* YOUSJ_SYSCALL_H */

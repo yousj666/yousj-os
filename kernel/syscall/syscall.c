@@ -3276,6 +3276,99 @@ static long sys_pipe2_sys(uint64_t fds_ptr, long flags)
     return 0;
 }
 
+/* M59: fcntl -- the descriptor commands real programs
+ * (busybox ash above all) actually use: duplication with a
+ * floor, the close-on-exec bit (backed by fd_cloexec), and
+ * the status-flag read / append-nonblock tweak on the file.
+ * Locking and owner commands report EINVAL: unsupported,
+ * but a defined answer instead of ENOSYS. */
+#define FCNTL_F_DUPFD          0
+#define FCNTL_F_GETFD          1
+#define FCNTL_F_SETFD          2
+#define FCNTL_F_GETFL          3
+#define FCNTL_F_SETFL          4
+#define FCNTL_F_DUPFD_CLOEXEC  1030
+#define FCNTL_FD_CLOEXEC       1
+
+static long sys_fcntl(long fd, long cmd, uint64_t arg)
+{
+    struct task *me = sched_current();
+    struct yousj_file *f = fd_file_of(me, fd);
+
+    if (f == NULL)
+        return -YOUSJ_EBADF;
+    switch (cmd) {
+    case FCNTL_F_DUPFD:
+    case FCNTL_F_DUPFD_CLOEXEC: {
+        long nfd;
+        if (arg >= (uint64_t)YOUSJ_NR_OPEN)
+            return -YOUSJ_EINVAL;
+        for (nfd = (long)arg; nfd < YOUSJ_NR_OPEN; nfd++) {
+            if (me->files->fd_file[nfd] != NULL)
+                continue;
+            if (nfd < 3 &&
+                !(me->files->fd_console_closed &
+                  (uint8_t)(1u << nfd)))
+                continue;
+            file_get(f);
+            me->files->fd_file[nfd] = f;
+            if (nfd < 3)
+                me->files->fd_console_closed &=
+                    (uint8_t)~(1u << nfd);
+            if (cmd == FCNTL_F_DUPFD_CLOEXEC)
+                me->files->fd_cloexec |=
+                    (uint16_t)(1u << nfd);
+            else
+                me->files->fd_cloexec &=
+                    (uint16_t)~(1u << nfd);
+            return nfd;
+        }
+        return -YOUSJ_EMFILE;
+    }
+    case FCNTL_F_GETFD:
+        return (me->files->fd_cloexec & (uint16_t)(1u << fd)) ?
+            FCNTL_FD_CLOEXEC : 0;
+    case FCNTL_F_SETFD:
+        if (arg & FCNTL_FD_CLOEXEC)
+            me->files->fd_cloexec |= (uint16_t)(1u << fd);
+        else
+            me->files->fd_cloexec &= (uint16_t)~(1u << fd);
+        return 0;
+    case FCNTL_F_GETFL:
+        return (long)(f->flags & (YOUSJ_O_ACCMODE |
+                                  YOUSJ_O_APPEND |
+                                  YOUSJ_O_NONBLOCK));
+    case FCNTL_F_SETFL:
+        f->flags = (f->flags & ~(YOUSJ_O_APPEND |
+                                 YOUSJ_O_NONBLOCK)) |
+                   ((uint32_t)arg & (YOUSJ_O_APPEND |
+                                     YOUSJ_O_NONBLOCK));
+        return 0;
+    default:
+        return -YOUSJ_EINVAL;
+    }
+}
+
+/* M59: the uid/gid family. Single-user system: every
+ * credential is 0 (root) and every setter trivially
+ * succeeds, matching the uid-less model /proc already
+ * presents. getres* writes three zeroes. */
+static long sys_getresx(uint64_t r_ptr, uint64_t e_ptr,
+                        uint64_t s_ptr)
+{
+    uint32_t *p;
+    if (!user_range_ok(r_ptr, 4) || !user_range_ok(e_ptr, 4) ||
+        !user_range_ok(s_ptr, 4))
+        return -YOUSJ_EFAULT;
+    p = (uint32_t *)(uintptr_t)r_ptr;
+    *p = 0;
+    p = (uint32_t *)(uintptr_t)e_ptr;
+    *p = 0;
+    p = (uint32_t *)(uintptr_t)s_ptr;
+    *p = 0;
+    return 0;
+}
+
 static long sys_dup_sys(long oldfd)
 {
     struct task *me = sched_current();
@@ -4136,6 +4229,23 @@ static long dispatch_inner(struct yousj_syscall_ctx *ctx)
         return sys_dup3_sys((long)a1, (long)a2, 0);
     case YOUSJ_SYS_dup3:
         return sys_dup3_sys((long)a1, (long)a2, (long)a3);
+    case YOUSJ_SYS_fcntl:
+        return sys_fcntl((long)a1, (long)a2, a3);
+    case YOUSJ_SYS_getuid:
+    case YOUSJ_SYS_getgid:
+    case YOUSJ_SYS_geteuid:
+    case YOUSJ_SYS_getegid:
+        return 0;
+    case YOUSJ_SYS_setuid:
+    case YOUSJ_SYS_setgid:
+    case YOUSJ_SYS_setreuid:
+    case YOUSJ_SYS_setregid:
+    case YOUSJ_SYS_setresuid:
+    case YOUSJ_SYS_setresgid:
+        return 0;
+    case YOUSJ_SYS_getresuid:
+    case YOUSJ_SYS_getresgid:
+        return sys_getresx(a1, a2, a3);
     case YOUSJ_SYS_mmap:
         return sys_mmap(a1, a2, a3, a4, (long)a5, ctx->a6);
     case YOUSJ_SYS_msync:

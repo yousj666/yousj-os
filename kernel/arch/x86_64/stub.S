@@ -26,7 +26,7 @@
  * address) through a memory far-pointer, and the trampoline --
  * already running in 64-bit mode -- loads the entry address
  * stub_main() published and jumps to it. The stub is linked at
- * 4 MiB, inside the range that mb1_build_boot_info() marks
+ * 12 MiB, inside the range mb1_build_boot_info() marks
  * reserved, so the PMM never hands the stub's memory (including
  * the boot_info buffer) to anyone.
  */

@@ -960,11 +960,35 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   口扩至 8MiB（四张 PT）。musl
   包的下载/解压收进 Makefile 戳
   规则，一次取齐 dev＋运行时。
-- ⏳ 下一步候选：robust futex，
-  或 inotify 事件补完（ftruncate
-  的 MODIFY、exchange 的
-  MOVE_SELF），或试跑 Alpine 的
-  真 busybox（动态版）。
+- ✅ 真发行版程序 M59
+  （2026-11-04）：Alpine 的
+  busybox 1.36.1（动态 musl、
+  809KiB）随 initramfs 进系统，
+  echo/ls/uname/脚本执行都跑
+  通——busybox sh 能跑带算术扩
+  展的脚本文件，退出码正确。
+  配套补齐它现场要的三组接口：
+  fcntl（DUPFD/GETFD/SETFD/
+  GETFL/SETFL，走 fd_cloexec
+  位图与文件 flags），uid/gid
+  全家（单用户模型恒 0、set 家
+  族恒成功、getres 写零）。修
+  两处基建：Multiboot 桩链接地
+  址 4MiB→12MiB——内核镜像跨度
+  超过约 4.3MiB 后，桩的段拷贝
+  会踩掉自己（UEFI 路径不受影
+  响、先行验证了内核本身没
+  问题）；构建的镜像跨度守卫
+  2MiB→8MiB（M58 扩窗后旧守卫
+  一直误报失败、靠链接产物已
+  落盘才没断链）。
+- ⏳ 下一步候选：让 busybox 的
+  applet 链接装起来（--install
+  受 ramfs 节点数 128 所限），
+  或 robust futex，或 inotify
+  事件补完（ftruncate 的
+  MODIFY、exchange 的
+  MOVE_SELF）。
 
 ## 从零构建
 

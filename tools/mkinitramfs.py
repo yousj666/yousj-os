@@ -76,6 +76,13 @@ def main():
         arc.add("lib", DIR_MODE)
         arc.add("lib/ld-musl-x86_64.so.1", EXEC_MODE, blob)
 
+    # M59: Alpine's busybox, a real distro binary (dynamic
+    # musl, ~800 KiB, under the ramfs 1 MiB file cap).
+    bb = os.path.join(BUILD, "busybox", "bin", "busybox")
+    if os.path.exists(bb):
+        with open(bb, "rb") as f:
+            arc.add("bin/busybox", EXEC_MODE, f.read())
+
     seen_dirs = {"bin", "etc"}
     for dirpath, dirnames, filenames in os.walk(ROOTFS):
         dirnames.sort()

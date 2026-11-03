@@ -131,7 +131,7 @@ $(BUILD)/ata.o: kernel/drivers/ata.c kernel/include/yousj/*.h
 	mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(BUILD)/initramfs.cpio: $(BUILD)/yousj-init.elf $(BUILD)/hello.elf $(BUILD)/sh.elf $(BUILD)/sigtest.elf $(BUILD)/fxtest.elf $(BUILD)/fstest.elf $(BUILD)/cat.elf $(BUILD)/pipetest.elf $(BUILD)/mkdir.elf $(BUILD)/ls.elf $(BUILD)/rm.elf $(BUILD)/rmdir.elf $(BUILD)/mv.elf $(BUILD)/bigfile.elf $(BUILD)/mmtest.elf $(BUILD)/polltest.elf $(BUILD)/ln.elf $(BUILD)/readlink.elf $(BUILD)/epolltest.elf $(BUILD)/churn.elf $(BUILD)/stattest.elf $(BUILD)/brktest.elf $(BUILD)/timetest.elf $(BUILD)/faulttest.elf $(BUILD)/proctest.elf $(BUILD)/utimetest.elf $(BUILD)/orphantest.elf $(BUILD)/pidtest.elf $(BUILD)/dirfdtest.elf $(BUILD)/inotifytest.elf $(BUILD)/futextest.elf $(BUILD)/musltest.elf $(BUILD)/dyntest.elf $(BUILD)/musl/.stamp tools/mkinitramfs.py $(wildcard rootfs/etc/*)
+$(BUILD)/initramfs.cpio: $(BUILD)/yousj-init.elf $(BUILD)/hello.elf $(BUILD)/sh.elf $(BUILD)/sigtest.elf $(BUILD)/fxtest.elf $(BUILD)/fstest.elf $(BUILD)/cat.elf $(BUILD)/pipetest.elf $(BUILD)/mkdir.elf $(BUILD)/ls.elf $(BUILD)/rm.elf $(BUILD)/rmdir.elf $(BUILD)/mv.elf $(BUILD)/bigfile.elf $(BUILD)/mmtest.elf $(BUILD)/polltest.elf $(BUILD)/ln.elf $(BUILD)/readlink.elf $(BUILD)/epolltest.elf $(BUILD)/churn.elf $(BUILD)/stattest.elf $(BUILD)/brktest.elf $(BUILD)/timetest.elf $(BUILD)/faulttest.elf $(BUILD)/proctest.elf $(BUILD)/utimetest.elf $(BUILD)/orphantest.elf $(BUILD)/pidtest.elf $(BUILD)/dirfdtest.elf $(BUILD)/inotifytest.elf $(BUILD)/futextest.elf $(BUILD)/musltest.elf $(BUILD)/dyntest.elf $(BUILD)/musl/.stamp tools/mkinitramfs.py $(wildcard rootfs/etc/*) $(wildcard rootfs/*)
 	python3 tools/mkinitramfs.py $(BUILD)
 
 $(BUILD)/initramfs_bin.o: $(BUILD)/initramfs.cpio
@@ -242,9 +242,11 @@ $(BUILD)/futextest.elf: userland/futextest.c userland/crt0.S userland/init.ld
 $(BUILD)/musl/.stamp:
 	curl -s -o $(BUILD)/musl-dev.apk https://dl-cdn.alpinelinux.org/alpine/v3.20/main/x86_64/musl-dev-1.2.5-r4.apk
 	curl -s -o $(BUILD)/musl-rt.apk https://dl-cdn.alpinelinux.org/alpine/v3.20/main/x86_64/musl-1.2.5-r4.apk
-	mkdir -p $(BUILD)/musl $(BUILD)/muslrt $(BUILD)/musl/lib
+	curl -s -o $(BUILD)/busybox.apk https://dl-cdn.alpinelinux.org/alpine/v3.20/main/x86_64/busybox-1.36.1-r31.apk
+	mkdir -p $(BUILD)/musl $(BUILD)/muslrt $(BUILD)/musl/lib $(BUILD)/busybox
 	tar -xzf $(BUILD)/musl-dev.apk -C $(BUILD)/musl 2>/dev/null || true
 	tar -xzf $(BUILD)/musl-rt.apk -C $(BUILD)/muslrt 2>/dev/null || true
+	tar -xzf $(BUILD)/busybox.apk -C $(BUILD)/busybox 2>/dev/null || true
 	cp $(BUILD)/muslrt/lib/ld-musl-x86_64.so.1 $(BUILD)/musl/lib/
 	touch $@
 
@@ -287,7 +289,7 @@ clean:
 
 # --- QEMU Multiboot smoke boot (bring-up only; product chain is UEFI) ---
 # QEMU's -kernel loader rejects ELF64, so the boot is two pieces:
-# a 32-bit stub (ELF32, linked at 4 MiB) that QEMU loads directly,
+# a 32-bit stub (ELF32, linked at 12 MiB) that QEMU loads directly,
 # and the ELF64 kernel passed as a Multiboot module (-initrd), which
 # the stub's mini ELF loader places at 1 MiB before entering long mode.
 KERNEL := $(BUILD)/yousj-kernel.elf
@@ -305,7 +307,7 @@ kernel: $(KERNEL) $(STUB)
 
 $(KERNEL): $(KERNEL_LINK_OBJS) kernel/arch/x86_64/link.ld
 	ld -T kernel/arch/x86_64/link.ld -o $@ $(KERNEL_LINK_OBJS)
-	@nm $@ | python3 -c "import sys; d={p[2]:int(p[0],16) for p in (l.split() for l in sys.stdin) if len(p)==3}; s=d['__kernel_end']-d['__kernel_start']; print(f'kernel image span: {s} bytes'); sys.exit('span exceeds the Multiboot stub 2 MiB early-map window' if s>2097152 else None)"
+	@nm $@ | python3 -c "import sys; d={p[2]:int(p[0],16) for p in (l.split() for l in sys.stdin) if len(p)==3}; s=d['__kernel_end']-d['__kernel_start']; print(f'kernel image span: {s} bytes'); sys.exit('span exceeds the 8 MiB early-map window (stub + UEFI handoff, M58)' if s>8388608 else None)"
 
 $(STUB): $(STUB_LINK_OBJS) kernel/arch/x86_64/stub.ld
 	ld -m elf_i386 -T kernel/arch/x86_64/stub.ld -o $@ $(STUB_LINK_OBJS)
