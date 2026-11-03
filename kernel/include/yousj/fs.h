@@ -34,6 +34,7 @@
 
 #define YOUSJ_DT_DIR 4
 #define YOUSJ_DT_REG 8
+#define YOUSJ_DT_SOCK 12
 
 #define YOUSJ_AT_FDCWD (-100)
 
@@ -66,6 +67,23 @@ struct yousj_sockpair {
     bool in_use;
 };
 
+/* M68: a named AF_UNIX stream socket endpoint that is not
+ * (yet) a connected pair end: freshly created, bound to a
+ * ramfs socket node, or listening. A successful connect()
+ * converts the caller's file in place into an M67 spair end
+ * and queues the peer half here for accept(). pend[] holds
+ * sockpairs whose end 1 awaits accept; their ends[1] count
+ * is the queue's hold, transferred to the accepted file. */
+#define YOUSJ_USOCK_BACKLOG_MAX 4
+struct yousj_usock {
+    bool in_use;
+    uint8_t state; /* 0 fresh, 1 bound, 2 listening */
+    int backlog;
+    int pend_count;
+    struct yousj_sockpair *pend[YOUSJ_USOCK_BACKLOG_MAX];
+    struct yousj_ramfs_node *node; /* bound node, if any */
+};
+
 struct yousj_epoll; /* M18: defined in fs.c */
 struct yousj_inotify; /* M48: defined in fs.c */
 
@@ -75,6 +93,9 @@ struct yousj_file {
     struct yousj_sockpair *spair;  /* non-NULL: a socketpair
                                       end (M67) */
     int spair_end;                 /* M67: 0 or 1 */
+    struct yousj_usock *usock;    /* non-NULL: an unconnected
+                                      or listening named-socket
+                                      endpoint (M68) */
     struct yousj_epoll *epoll;     /* non-NULL: an epoll set (M18) */
     struct yousj_inotify *inotify; /* non-NULL: an inotify
                                       instance (M48) */
@@ -148,6 +169,15 @@ long fs_pipe_create(struct yousj_file **rd_out,
  * refcount 1, both O_RDWR). 0 or a negative errno. */
 long fs_sockpair_create(struct yousj_file **a_out,
                         struct yousj_file **b_out);
+
+/* M68: named AF_UNIX stream sockets. All take an absolute,
+ * link-resolved path. 0 or a negative errno. */
+long fs_usock_create(struct yousj_file **out);
+long fs_usock_bind(struct yousj_file *f, const char *path);
+long fs_usock_listen(struct yousj_file *f, long backlog);
+long fs_usock_connect(struct yousj_file *f, const char *path);
+long fs_usock_accept_try(struct yousj_file *f,
+                         struct yousj_file **out);
 
 /* M18: epoll instances. ctl ops mirror Linux: ADD 1, DEL 2,
  * MOD 3. Entries pin their target file (a reference is

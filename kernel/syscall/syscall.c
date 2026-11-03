@@ -170,6 +170,11 @@ void syscall_init(void)
 #define YOUSJ_ENOTSOCK 88      /* M67 */
 #define YOUSJ_EPROTONOSUPPORT 93 /* M67 */
 #define YOUSJ_EAFNOSUPPORT 97  /* M67 */
+#define YOUSJ_EOPNOTSUPP 95    /* M68 */
+#define YOUSJ_EADDRINUSE 98    /* M68 */
+#define YOUSJ_EISCONN 106      /* M68 */
+#define YOUSJ_ENOTCONN 107     /* M68 */
+#define YOUSJ_ECONNREFUSED 111 /* M68 */
 #define YOUSJ_ERANGE 34  /* M9 */
 #define YOUSJ_ENOSYS 38
 #define YOUSJ_ETIMEDOUT 110 /* M50 */
@@ -258,6 +263,8 @@ static long sys_write(long fd, uint64_t buf, uint64_t len)
         return sys_write_pipe(f, buf, len);
     if (f->spair != NULL) /* M67 */
         return sys_write_sock(f, buf, len);
+    if (f->usock != NULL) /* M68: not connected */
+        return -YOUSJ_ENOTCONN;
     if (f->backend == 0 && f->node == NULL)
         return sys_write_console(buf, len);
     if (len == 0)
@@ -1472,6 +1479,8 @@ static long sys_read(long fd, uint64_t buf, uint64_t count)
         return sys_read_pipe(f, buf, count);
     if (f->spair != NULL) /* M67 */
         return sys_read_sock(f, buf, count);
+    if (f->usock != NULL) /* M68: not connected */
+        return -YOUSJ_ENOTCONN;
     if (f->inotify != NULL) { /* M48 */
         if (count == 0)
             return 0;
@@ -2748,8 +2757,8 @@ static short fd_ready_file(struct yousj_file *f, long fd,
             rev |= POLLIN_K;
         return rev;
     }
-    if (f->pipe == NULL && f->spair == NULL && f->backend == 0 &&
-        f->node == NULL) {
+    if (f->pipe == NULL && f->spair == NULL && f->usock == NULL &&
+        f->backend == 0 && f->node == NULL) {
         /* the console: fd 0 is the readable side */
         if (fd == 0) {
             if ((events & POLLIN_K) && serial_rx_ready())
@@ -2793,6 +2802,14 @@ static short fd_ready_file(struct yousj_file *f, long fd,
             rev |= POLLOUT_K;
         return (short)((rev & (POLLERR_K | POLLHUP_K)) |
                        (rev & events));
+    }
+    if (f->usock != NULL) { /* M68: a listening socket is
+                             * readable with a pending
+                             * connection; other endpoint states
+                             * are never ready */
+        if (f->usock->state == 2 && f->usock->pend_count > 0)
+            rev |= POLLIN_K;
+        return (short)(rev & events);
     }
     /* regular file on either backend */
     return (short)(events & (POLLIN_K | POLLOUT_K));
@@ -3698,6 +3715,164 @@ static long sys_socketpair(long domain, long type,
     return 0;
 }
 
+/* --- M68: named AF_UNIX stream sockets -------------------- */
+
+/* Copy a sockaddr_un in and pull the path out of it. The path
+ * runs to the first NUL or to addrlen; an empty path (the
+ * abstract namespace) is not supported. */
+static long fetch_unix_path(uint64_t addr_ptr, long addrlen,
+                            char *out, uint64_t cap)
+{
+    uint8_t raw[110];
+    uint64_t i, n;
+
+    if (addrlen < 2 || addrlen > 110)
+        return -YOUSJ_EINVAL;
+    if (!user_range_ok(addr_ptr, (uint64_t)addrlen))
+        return -YOUSJ_EFAULT;
+    for (i = 0; i < (uint64_t)addrlen; i++)
+        raw[i] = ((const uint8_t *)(uintptr_t)addr_ptr)[i];
+    if (raw[0] != 1 || raw[1] != 0)
+        return -YOUSJ_EAFNOSUPPORT; /* sun_family != AF_UNIX */
+    n = 0;
+    for (i = 2; i < (uint64_t)addrlen && raw[i] != 0; i++) {
+        if (n + 1 >= cap)
+            return -YOUSJ_EINVAL; /* path too long for us */
+        out[n++] = (char)raw[i];
+    }
+    out[n] = '\0';
+    if (n == 0)
+        return -YOUSJ_EINVAL; /* abstract sockets unsupported */
+    return 0;
+}
+
+static long sock_resolve(struct task *me, uint64_t addr_ptr,
+                         long addrlen, char *resolved)
+{
+    static char path_buf[128];
+    long rc = fetch_unix_path(addr_ptr, addrlen, path_buf,
+                              sizeof(path_buf));
+    if (rc != 0)
+        return rc;
+    return resolve_at(me, -100, path_buf, resolved);
+}
+
+static long sys_socket(long domain, long type, long protocol)
+{
+    struct task *me = sched_current();
+    struct yousj_file *f;
+    long rc, fd;
+
+    if (domain != 1) /* AF_UNIX only */
+        return -YOUSJ_EAFNOSUPPORT;
+    if ((type & ~(0x800L | 0x80000L)) != 1 || protocol != 0)
+        return -YOUSJ_EPROTONOSUPPORT; /* SOCK_STREAM only */
+    rc = fs_usock_create(&f);
+    if (rc != 0)
+        return rc;
+    if (type & 0x800L) /* SOCK_NONBLOCK */
+        f->flags |= YOUSJ_O_NONBLOCK;
+    fd = fd_alloc(me, f);
+    if (fd < 0) {
+        file_put(f);
+        return fd;
+    }
+    if (type & 0x80000L) /* SOCK_CLOEXEC */
+        me->files->fd_cloexec |= (uint16_t)(1u << fd);
+    return fd;
+}
+
+static long sys_bind(long fd, uint64_t addr_ptr, long addrlen)
+{
+    struct task *me = sched_current();
+    static char resolved[256];
+    struct yousj_file *f = fd_file_of(me, fd);
+    long rc;
+
+    if (f == NULL)
+        return -YOUSJ_EBADF;
+    if (f->usock == NULL)
+        return -YOUSJ_ENOTSOCK;
+    rc = sock_resolve(me, addr_ptr, addrlen, resolved);
+    if (rc != 0)
+        return rc;
+    return fs_usock_bind(f, resolved);
+}
+
+static long sys_listen(long fd, long backlog)
+{
+    struct yousj_file *f = fd_file_of(sched_current(), fd);
+
+    if (f == NULL)
+        return -YOUSJ_EBADF;
+    if (f->usock == NULL)
+        return -YOUSJ_ENOTSOCK;
+    return fs_usock_listen(f, backlog);
+}
+
+static long sys_connect(long fd, uint64_t addr_ptr, long addrlen)
+{
+    struct task *me = sched_current();
+    static char resolved[256];
+    struct yousj_file *f = fd_file_of(me, fd);
+    long rc;
+
+    if (f == NULL)
+        return -YOUSJ_EBADF;
+    if (f->spair != NULL)
+        return -YOUSJ_EISCONN;
+    if (f->usock == NULL)
+        return -YOUSJ_ENOTSOCK;
+    rc = sock_resolve(me, addr_ptr, addrlen, resolved);
+    if (rc != 0)
+        return rc;
+    return fs_usock_connect(f, resolved);
+}
+
+static long sys_accept(long fd, uint64_t addr_ptr,
+                       uint64_t addrlen_ptr)
+{
+    struct task *me = sched_current();
+    struct yousj_file *f = fd_file_of(me, fd);
+    struct yousj_file *nf;
+    long rc, nfd;
+
+    if (f == NULL)
+        return -YOUSJ_EBADF;
+    if (f->usock == NULL)
+        return -YOUSJ_ENOTSOCK;
+    if (f->usock->state != 2)
+        return -YOUSJ_EINVAL; /* not listening */
+    for (;;) {
+        rc = fs_usock_accept_try(f, &nf);
+        if (rc != -YOUSJ_EAGAIN)
+            break;
+        if (f->flags & YOUSJ_O_NONBLOCK)
+            return -YOUSJ_EAGAIN;
+        if (signal_deliverable_pending(me)) {
+            me->sig_wake = false;
+            return -YOUSJ_ERESTARTSYS;
+        }
+        sched_sleep_ticks(2);
+    }
+    if (rc != 0)
+        return rc;
+    nfd = fd_alloc(me, nf);
+    if (nfd < 0) {
+        file_put(nf);
+        return nfd;
+    }
+    if (addr_ptr != 0 && user_range_ok(addr_ptr, 2)) {
+        /* The peer is anonymous: family and an empty path. */
+        ((uint8_t *)(uintptr_t)addr_ptr)[0] = 1;
+        ((uint8_t *)(uintptr_t)addr_ptr)[1] = 0;
+        if (addrlen_ptr != 0 &&
+            user_range_ok(addrlen_ptr, 4))
+            *(uint32_t *)(uintptr_t)addrlen_ptr = 2;
+    }
+    return nfd;
+}
+
 static long sys_shutdown(long fd, long how)
 {
     struct yousj_file *f = fd_file_of(sched_current(), fd);
@@ -3705,7 +3880,8 @@ static long sys_shutdown(long fd, long how)
     if (f == NULL)
         return -YOUSJ_EBADF;
     if (f->spair == NULL)
-        return -YOUSJ_ENOTSOCK;
+        return f->usock != NULL ? -YOUSJ_ENOTCONN
+                                : -YOUSJ_ENOTSOCK;
     if (how < 0 || how > 2)
         return -YOUSJ_EINVAL;
     if (how == 0)
@@ -4828,6 +5004,16 @@ static long dispatch_inner(struct yousj_syscall_ctx *ctx)
                               a4);
     case YOUSJ_SYS_shutdown:
         return sys_shutdown((long)a1, (long)a2);
+    case YOUSJ_SYS_socket:
+        return sys_socket((long)a1, (long)a2, (long)a3);
+    case YOUSJ_SYS_bind:
+        return sys_bind((long)a1, a2, (long)a3);
+    case YOUSJ_SYS_listen:
+        return sys_listen((long)a1, (long)a2);
+    case YOUSJ_SYS_connect:
+        return sys_connect((long)a1, a2, (long)a3);
+    case YOUSJ_SYS_accept:
+        return sys_accept((long)a1, a2, a3);
     case YOUSJ_SYS_pipe:
         return sys_pipe2_sys(a1, 0);
     case YOUSJ_SYS_pipe2:

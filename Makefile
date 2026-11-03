@@ -131,7 +131,7 @@ $(BUILD)/ata.o: kernel/drivers/ata.c kernel/include/yousj/*.h
 	mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(BUILD)/initramfs.cpio: $(BUILD)/yousj-init.elf $(BUILD)/hello.elf $(BUILD)/sh.elf $(BUILD)/sigtest.elf $(BUILD)/fxtest.elf $(BUILD)/fstest.elf $(BUILD)/cat.elf $(BUILD)/pipetest.elf $(BUILD)/mkdir.elf $(BUILD)/ls.elf $(BUILD)/rm.elf $(BUILD)/rmdir.elf $(BUILD)/mv.elf $(BUILD)/bigfile.elf $(BUILD)/mmtest.elf $(BUILD)/polltest.elf $(BUILD)/ln.elf $(BUILD)/readlink.elf $(BUILD)/epolltest.elf $(BUILD)/churn.elf $(BUILD)/stattest.elf $(BUILD)/brktest.elf $(BUILD)/timetest.elf $(BUILD)/faulttest.elf $(BUILD)/proctest.elf $(BUILD)/utimetest.elf $(BUILD)/orphantest.elf $(BUILD)/pidtest.elf $(BUILD)/dirfdtest.elf $(BUILD)/inotifytest.elf $(BUILD)/futextest.elf $(BUILD)/musltest.elf $(BUILD)/dyntest.elf $(BUILD)/musl/.stamp tools/mkinitramfs.py $(wildcard rootfs/etc/*) $(wildcard rootfs/*)
+$(BUILD)/initramfs.cpio: $(BUILD)/yousj-init.elf $(BUILD)/hello.elf $(BUILD)/sh.elf $(BUILD)/sigtest.elf $(BUILD)/fxtest.elf $(BUILD)/fstest.elf $(BUILD)/cat.elf $(BUILD)/pipetest.elf $(BUILD)/socktest.elf $(BUILD)/mkdir.elf $(BUILD)/ls.elf $(BUILD)/rm.elf $(BUILD)/rmdir.elf $(BUILD)/mv.elf $(BUILD)/bigfile.elf $(BUILD)/mmtest.elf $(BUILD)/polltest.elf $(BUILD)/ln.elf $(BUILD)/readlink.elf $(BUILD)/epolltest.elf $(BUILD)/churn.elf $(BUILD)/stattest.elf $(BUILD)/brktest.elf $(BUILD)/timetest.elf $(BUILD)/faulttest.elf $(BUILD)/proctest.elf $(BUILD)/utimetest.elf $(BUILD)/orphantest.elf $(BUILD)/pidtest.elf $(BUILD)/dirfdtest.elf $(BUILD)/inotifytest.elf $(BUILD)/futextest.elf $(BUILD)/musltest.elf $(BUILD)/dyntest.elf $(BUILD)/musl/.stamp tools/mkinitramfs.py $(wildcard rootfs/etc/*) $(wildcard rootfs/*)
 	python3 tools/mkinitramfs.py $(BUILD)
 
 $(BUILD)/initramfs_bin.o: $(BUILD)/initramfs.cpio
@@ -148,6 +148,10 @@ $(BUILD)/cat.elf: userland/cat.c userland/crt0.S userland/init.ld
 $(BUILD)/pipetest.elf: userland/pipetest.c userland/crt0.S userland/init.ld
 	mkdir -p $(BUILD)
 	gcc -ffreestanding -fno-stack-protector -fno-pie -static -nostdlib -mno-sse -mno-sse2 -mno-mmx -mcmodel=large -O2 -Wall -Wextra -Wl,-T,userland/init.ld -Wl,--build-id=none -o $@ userland/crt0.S userland/pipetest.c
+
+$(BUILD)/socktest.elf: userland/socktest.c userland/crt0.S userland/init.ld
+	mkdir -p $(BUILD)
+	gcc -ffreestanding -fno-stack-protector -fno-pie -static -nostdlib -mno-sse -mno-sse2 -mno-mmx -mcmodel=large -O2 -Wall -Wextra -Wl,-T,userland/init.ld -Wl,--build-id=none -o $@ userland/crt0.S userland/socktest.c
 
 $(BUILD)/mkdir.elf: userland/mkdir.c userland/crt0.S userland/init.ld
 	mkdir -p $(BUILD)

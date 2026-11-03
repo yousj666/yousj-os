@@ -149,6 +149,11 @@
 #define YOUSJ_SYS_fork        57    /* M65: = clone(SIGCHLD) */
 #define YOUSJ_SYS_shutdown    52    /* M67 */
 #define YOUSJ_SYS_socketpair  53    /* M67 */
+#define YOUSJ_SYS_socket      41    /* M68 */
+#define YOUSJ_SYS_connect     42    /* M68 */
+#define YOUSJ_SYS_accept      43    /* M68 */
+#define YOUSJ_SYS_bind        49    /* M68 */
+#define YOUSJ_SYS_listen      50    /* M68 */
 #define YOUSJ_SYS_setpgid     109   /* M65 */
 #define YOUSJ_SYS_getpgrp     111   /* M65 */
 #define YOUSJ_SYS_setsid      112   /* M65 */

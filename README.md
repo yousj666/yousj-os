@@ -1136,11 +1136,46 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   字、send/recv 的 MSG 语
   义。pipetest 新增 sockpair
   场景（共 12）。
-- ⏳ 下一步候选：命名
-  AF_UNIX 套接字（socket/
-  bind/listen/accept/
-  connect），或 send/recv
-  与 MSG 语义。
+- ✅ 命名 AF_UNIX 套接字
+  M68（2026-11-04）：
+  socket(41)/bind(49)/
+  listen(50)/connect(42)/
+  accept(43) 主干落地。端点
+  对象（usock）三态：未绑
+  定、已绑定、监听中；bind
+  在 ramfs 建 S_IFSOCK 节点
+  （stat/getdents 均报
+  socket 类型、open 回
+  ENXIO、重绑 EADDRINUSE）。
+  connect 按路径找到监听者
+  后就地把调用方文件转成
+  M67 的 spair 0 号端、把
+  1 号端排进监听队列（上限
+  即 backlog，满了回
+  EAGAIN）——数据面零新代
+  码，读写/shutdown/poll
+  全走 M67 语义。accept 队
+  列空时按 2-tick 轮询＋
+  ERESTARTSYS 阻塞，非阻塞
+  回 EAGAIN。未监听/节点是
+  普通文件/监听者已关闭一
+  律 ECONNREFUSED；节点被
+  unlink 后监听者成孤儿、
+  新连接 ENOENT。已知限
+  制：仅 ramfs 路径（yfs 磁
+  盘格式尚无 socket inode
+  类型，bind 到 /data 回
+  EOPNOTSUPP）；SOCK_DGRAM
+  与抽象地址未做；已 bind
+  的客户端再 connect 未支
+  持；accept4 未做。新增
+  socktest（8 场景）与
+  qemu-sock-test 套件。
+- ⏳ 下一步候选：send/
+  recv 与 MSG 语义，或
+  SOCK_DGRAM 数据报，或
+  socket 面的 getsockopt
+  常用项。
 
 ## 从零构建
 

@@ -33,6 +33,12 @@
 #define YOUSJ_ELOOP_L 40
 #define YOUSJ_EACCES_L 13
 #define YOUSJ_ENOENT_L 2
+#define YOUSJ_EINVAL_L 22
+#define YOUSJ_EADDRINUSE_L 98  /* M68 */
+#define YOUSJ_ENXIO_L 6        /* M68 */
+#define YOUSJ_EOPNOTSUPP_L 95  /* M68 */
+#define YOUSJ_ECONNREFUSED_L 111 /* M68 */
+#define YOUSJ_EAGAIN_L 11      /* M68 */
 
 static uint64_t str_len(const char *s); /* defined below */
 
@@ -106,6 +112,10 @@ struct yousj_ramfs_node {
     bool in_use;
     bool is_dir;
     bool is_link;                       /* M16: content = target */
+    bool is_sock;                       /* M68: a bound socket
+                                           node */
+    struct yousj_usock *sock_owner;     /* M68: the endpoint
+                                           bound here, if any */
     struct yousj_ramfs_node *parent;    /* directories: the
                                            containing dir */
     struct yousj_dent *dents;           /* directories: entries */
@@ -481,6 +491,14 @@ static void node_unname(struct yousj_ramfs_node *n)
         n->nlink--;
     if (n->nlink == 0) {
         n->unlinked = true;
+        /* M68: a socket node losing its last name orphans its
+         * endpoint: the listener keeps existing but is no
+         * longer reachable by path. Break both pointers so
+         * neither side dereferences the other after free. */
+        if (n->is_sock && n->sock_owner != NULL) {
+            n->sock_owner->node = NULL;
+            n->sock_owner = NULL;
+        }
         node_maybe_free(n);
     }
 }
@@ -540,6 +558,13 @@ void file_get(struct yousj_file *f)
 static void epoll_release(struct yousj_epoll *ep);
 static void inotify_release(struct yousj_inotify *in);
 
+static void usock_release(struct yousj_file *f); /* M68, below */
+/* Defined further down (the M16 resolution layer); declared
+ * here because the M68 socket calls resolve paths too. */
+static long fs_resolve_links(const char *path, char *out,
+                             bool follow);
+static bool is_proc_path(const char *path);
+
 void file_put(struct yousj_file *f)
 {
     if (f == NULL || f == &g_console_file)
@@ -567,6 +592,12 @@ void file_put(struct yousj_file *f)
             if (sp->ends[0] <= 0 && sp->ends[1] <= 0)
                 sp->in_use = false;
             f->spair = NULL;
+        }
+        if (f->usock != NULL) {
+            /* M68: an unconnected/listening endpoint dies
+             * with its last file reference. */
+            usock_release(f);
+            f->usock = NULL;
         }
         if (f->node != NULL) {
             node_ref_dec(f->node);
@@ -734,25 +765,32 @@ long fs_pipe_create(struct yousj_file **rd_out,
 #define MAX_SOCKPAIRS 8
 static struct yousj_sockpair g_sockpairs[MAX_SOCKPAIRS];
 
-long fs_sockpair_create(struct yousj_file **a_out,
-                        struct yousj_file **b_out)
+static struct yousj_sockpair *sockpair_alloc(void)
 {
-    struct yousj_sockpair *sp = NULL;
-    struct yousj_file *a, *b;
     int i;
 
     for (i = 0; i < MAX_SOCKPAIRS; i++) {
         if (!g_sockpairs[i].in_use) {
-            sp = &g_sockpairs[i];
-            break;
+            struct yousj_sockpair *sp = &g_sockpairs[i];
+            mem_zero((uint8_t *)sp, sizeof(*sp));
+            sp->in_use = true;
+            sp->ends[0] = 1;
+            sp->ends[1] = 1;
+            return sp;
         }
     }
+    return NULL;
+}
+
+long fs_sockpair_create(struct yousj_file **a_out,
+                        struct yousj_file **b_out)
+{
+    struct yousj_sockpair *sp;
+    struct yousj_file *a, *b;
+
+    sp = sockpair_alloc();
     if (sp == NULL)
         return -YOUSJ_ENFILE;
-    mem_zero((uint8_t *)sp, sizeof(*sp));
-    sp->in_use = true;
-    sp->ends[0] = 1;
-    sp->ends[1] = 1;
     a = file_alloc();
     b = file_alloc();
     if (a == NULL || b == NULL) {
@@ -771,6 +809,182 @@ long fs_sockpair_create(struct yousj_file **a_out,
     b->flags = YOUSJ_O_RDWR;
     *a_out = a;
     *b_out = b;
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* M68: named AF_UNIX stream sockets. The endpoint object lives
+ * here; the syscall layer copies sockaddr_un in and installs
+ * fds. Data movement needs nothing new: connect() converts the
+ * caller's file into an M67 spair end (end 0) and queues the
+ * pair on the listener, where accept() hands out end 1.
+ * Socket files exist only as ramfs nodes -- the yfs on-disk
+ * format has no socket inode type yet. */
+
+#define MAX_USOCKS 8
+static struct yousj_usock g_usocks[MAX_USOCKS];
+
+static void usock_release(struct yousj_file *f)
+{
+    struct yousj_usock *u = f->usock;
+    int i;
+
+    /* Queued, never-accepted connections are reset: dropping
+     * the queue's hold on end 1 gives the client end the
+     * usual EOF/EPIPE treatment. */
+    for (i = 0; i < u->pend_count; i++) {
+        struct yousj_sockpair *sp = u->pend[i];
+        sp->ends[1]--;
+        if (sp->ends[0] <= 0 && sp->ends[1] <= 0)
+            sp->in_use = false;
+    }
+    u->pend_count = 0;
+    /* The bound node outlives the endpoint (as on Linux);
+     * it just stops reaching anyone. */
+    if (u->node != NULL) {
+        if (u->node->sock_owner == u)
+            u->node->sock_owner = NULL;
+        u->node = NULL;
+    }
+    u->in_use = false;
+}
+
+long fs_usock_create(struct yousj_file **out)
+{
+    struct yousj_usock *u = NULL;
+    struct yousj_file *f;
+    int i;
+
+    for (i = 0; i < MAX_USOCKS; i++) {
+        if (!g_usocks[i].in_use) {
+            u = &g_usocks[i];
+            break;
+        }
+    }
+    if (u == NULL)
+        return -YOUSJ_ENFILE;
+    f = file_alloc();
+    if (f == NULL)
+        return -YOUSJ_ENFILE;
+    mem_zero((uint8_t *)u, sizeof(*u));
+    u->in_use = true;
+    u->state = 0;
+    f->usock = u;
+    f->flags = YOUSJ_O_RDWR;
+    *out = f;
+    return 0;
+}
+
+long fs_usock_bind(struct yousj_file *f, const char *path)
+{
+    char resolved[PATH_MAX_LEN + 1];
+    char base[NAME_MAX_LEN + 1];
+    struct yousj_usock *u = f->usock;
+    struct yousj_ramfs_node *parent, *n;
+    long rc;
+
+    if (u == NULL || u->state != 0)
+        return -YOUSJ_EINVAL_L; /* not a socket, or bound */
+    rc = fs_resolve_links(path, resolved, false);
+    if (rc != 0)
+        return rc;
+    if (is_data_path(resolved) || is_proc_path(resolved))
+        return -YOUSJ_EOPNOTSUPP_L; /* ramfs nodes only */
+    parent = walk(resolved, true, base);
+    if (parent == NULL)
+        return -YOUSJ_ENOENT_L;
+    if (!parent->is_dir)
+        return -YOUSJ_ENOTDIR;
+    if (node_find_child(parent, base, str_len(base)) != NULL)
+        return -YOUSJ_EADDRINUSE_L;
+    n = node_create(parent, base, str_len(base), false);
+    if (n == NULL)
+        return -YOUSJ_ENOSPC;
+    n->is_sock = true;
+    n->sock_owner = u;
+    u->node = n;
+    u->state = 1;
+    return 0;
+}
+
+long fs_usock_listen(struct yousj_file *f, long backlog)
+{
+    struct yousj_usock *u = f->usock;
+
+    if (u == NULL || u->state == 0)
+        return -YOUSJ_EINVAL_L; /* no autobind: bind first */
+    if (backlog < 1)
+        backlog = 1;
+    if (backlog > YOUSJ_USOCK_BACKLOG_MAX)
+        backlog = YOUSJ_USOCK_BACKLOG_MAX;
+    u->backlog = (int)backlog;
+    u->state = 2;
+    return 0;
+}
+
+long fs_usock_connect(struct yousj_file *f, const char *path)
+{
+    char resolved[PATH_MAX_LEN + 1];
+    struct yousj_usock *u = f->usock;
+    struct yousj_ramfs_node *n;
+    struct yousj_usock *srv;
+    struct yousj_sockpair *sp;
+    long rc;
+
+    if (u == NULL || u->state != 0)
+        return -YOUSJ_EINVAL_L; /* not a socket, or a bound
+                                 * client (unsupported yet) */
+    rc = fs_resolve_links(path, resolved, false);
+    if (rc != 0)
+        return rc;
+    if (is_data_path(resolved) || is_proc_path(resolved))
+        return -YOUSJ_ECONNREFUSED_L;
+    n = fs_lookup(resolved);
+    if (n == NULL)
+        return -YOUSJ_ENOENT_L;
+    if (!n->is_sock || n->sock_owner == NULL)
+        return -YOUSJ_ECONNREFUSED_L;
+    srv = n->sock_owner;
+    if (srv->state != 2 || srv->pend_count >= srv->backlog)
+        return srv->state != 2 ? -YOUSJ_ECONNREFUSED_L
+                               : -YOUSJ_EAGAIN_L;
+    sp = sockpair_alloc();
+    if (sp == NULL)
+        return -YOUSJ_ENFILE;
+    srv->pend[srv->pend_count++] = sp;
+    /* The caller's endpoint becomes pair end 0 in place; the
+     * usock object dies here (the file may be shared by dup,
+     * and every reference sees the connected socket). */
+    u->in_use = false;
+    f->usock = NULL;
+    f->spair = sp;
+    f->spair_end = 0;
+    return 0;
+}
+
+long fs_usock_accept_try(struct yousj_file *f,
+                         struct yousj_file **out)
+{
+    struct yousj_usock *u = f->usock;
+    struct yousj_sockpair *sp;
+    struct yousj_file *nf;
+    int i;
+
+    if (u == NULL || u->state != 2)
+        return -YOUSJ_EINVAL_L;
+    if (u->pend_count == 0)
+        return -YOUSJ_EAGAIN_L;
+    sp = u->pend[0];
+    nf = file_alloc();
+    if (nf == NULL)
+        return -YOUSJ_ENFILE; /* queue untouched */
+    for (i = 1; i < u->pend_count; i++)
+        u->pend[i - 1] = u->pend[i];
+    u->pend_count--;
+    nf->spair = sp;
+    nf->spair_end = 1;
+    nf->flags = YOUSJ_O_RDWR;
+    *out = nf;
     return 0;
 }
 
@@ -942,11 +1156,6 @@ struct yousj_inotify {
 
 static struct yousj_inotify g_inotifies[MAX_INOTIFY];
 static uint32_t g_inotify_cookie = 1;
-
-/* Defined further down (the M16 resolution layer). */
-static long fs_resolve_links(const char *path, char *out,
-                             bool follow);
-static bool is_proc_path(const char *path);
 
 static void inotify_enqueue(struct yousj_inotify *in,
                             const struct yousj_inotify_event *ev)
@@ -1518,6 +1727,8 @@ static long ramfs_open_path(const char *path, long flags,
     }
     if (n->is_link)
         return -YOUSJ_ELOOP_L; /* resolution missed one */
+    if (n->is_sock)
+        return -YOUSJ_ENXIO_L; /* M68: sockets are not openable */
     if (n->is_dir) {
         if (acc != YOUSJ_O_RDONLY)
             return -YOUSJ_EISDIR;
@@ -2944,6 +3155,9 @@ static void stat_from_ramfs_node(struct yousj_ramfs_node *n,
     if (n->dev != 0) { /* M47 */
         info->mode = S_IFCHR_K | (n->mode & 07777u);
         info->size = 0;
+    } else if (n->is_sock) { /* M68 */
+        info->mode = 0140000u | (n->mode & 07777u); /* S_IFSOCK */
+        info->size = 0;
     } else if (n->is_link) {
         info->mode = S_IFLNK_K | (n->mode & 07777u);
         info->size = n->size;
@@ -3133,7 +3347,7 @@ bool fs_file_stat(struct yousj_file *f,
         info->ino = 0;
         return true;
     }
-    if (f->spair != NULL) { /* M67 */
+    if (f->spair != NULL || f->usock != NULL) { /* M67/M68 */
         info->mode = 0140000u | 0666u; /* S_IFSOCK */
         info->mtime = 0;
         info->atime = 0;
@@ -4122,6 +4336,7 @@ long file_getdents(struct yousj_file *f, uint8_t *buf, uint64_t count)
             *(uint64_t *)(rec + 8) = (uint64_t)(idx + 1);
             *(uint16_t *)(rec + 16) = (uint16_t)reclen;
             rec[18] = c->is_dir ? YOUSJ_DT_DIR : c->is_link ? 10
+                          : c->is_sock ? YOUSJ_DT_SOCK /* M68 */
                           : c->dev != 0 ? 2 /* DT_CHR, M47 */
                           : YOUSJ_DT_REG;
             mem_copy(rec + 19, (const uint8_t *)dwalk->name,
