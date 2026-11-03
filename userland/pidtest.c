@@ -730,6 +730,52 @@ int main(int argc, char **argv)
         report("fdinfo", ok);
     }
 
+    /* M64: vfork. The child borrows this address space
+     * (its writes are our writes) and the parent sleeps
+     * until the child execs or exits -- so when clone
+     * returns here, the flag the child sets just before
+     * exec MUST already be set, deterministically. The
+     * child never returns past the clone call site: it
+     * execs or dies, as vfork children must. */
+    {
+        static volatile long vf_flag;
+        long c, st = 0;
+        int ok;
+        vf_flag = 0;
+        c = sys_call4(SYS_clone,
+                      0x4000 | 0x100 | 17, /* VFORK|VM|SIGCHLD */
+                      0, 0, 0);
+        if (c == 0) {
+            static const char *hav[2];
+            hav[0] = "hello";
+            hav[1] = 0;
+            sleep_ms(300);
+            vf_flag = 1;
+            sys_call3(SYS_execve,
+                      (long)(uintptr_t)"/bin/hello",
+                      (long)(uintptr_t)hav, 0);
+            die(90); /* exec failed */
+        }
+        ok = c > 0 && vf_flag == 1;
+        sys_call4(SYS_wait4, c, (long)(uintptr_t)&st, 0, 0);
+        /* /bin/hello exits 7 by design (its main returns
+         * 7); that constant is the exec-success witness. */
+        ok = ok && ((st >> 8) & 0xFF) == 7;
+        /* part 2: exit without exec also releases us */
+        vf_flag = 0;
+        c = sys_call4(SYS_clone, 0x4000 | 0x100 | 17, 0, 0,
+                      0);
+        if (c == 0) {
+            vf_flag = 7;
+            die(3);
+        }
+        st = 0;
+        sys_call4(SYS_wait4, c, (long)(uintptr_t)&st, 0, 0);
+        ok = ok && c > 0 && vf_flag == 7 &&
+             ((st >> 8) & 0xFF) == 3;
+        report("vfork", ok);
+    }
+
     out("PIDTEST DONE\n");
     return fails;
 }

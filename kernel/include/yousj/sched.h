@@ -142,6 +142,12 @@ struct task {
     uint64_t        wake_tick;    /* nonzero while sleeping: tick at
                                      which sched_tick() wakes the
                                      task (M2). Cleared on wake. */
+    int64_t         vfork_parent; /* M64: tid of the parent
+                                     * blocked in vfork on this
+                                     * child, 0 = not a vfork
+                                     * child */
+    bool            vfork_done;   /* M64: set when this vfork
+                                     * child execs or exits */
     int64_t         wait_target;  /* wait4 (M5): 0 = not waiting,
                                      -1 = any child, >0 = that child
                                      tid. sched_exit_current() wakes

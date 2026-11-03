@@ -317,6 +317,10 @@ static long sys_rw_vector(long fd, uint64_t iov_ptr, long iovcnt,
 static long futex_wake_at(struct task *me, uint64_t uaddr,
                           long val);
 
+/* M64: releases a vfork-blocked parent; defined with the
+ * clone section below. */
+static void vfork_complete(struct task *me);
+
 /* M51: drop one reference to an address space; the last
  * reference destroys it (frames, tables, pool slot).
  * Spaces are born with refs == 1 (vmm_create_space) and
@@ -437,6 +441,11 @@ void process_exit(long status, int sig)
      * window as the handshake above. */
     robust_list_exit_walk(me);
     me->robust_head = 0;
+
+    /* M64: a vfork child that exits without exec releases
+     * its parent here (the exec path released it earlier
+     * if it got that far). */
+    vfork_complete(me);
 
     /* M53: drop this task's sighand reference; a shared
      * table outlives us for the rest of the group. */
@@ -619,6 +628,28 @@ static long sys_wait4(long pid, uint64_t status_ptr, long options,
                                           * our exit
                                           * bookkeeping is
                                           * unaffected) */
+#define CLONE_VFORK_K         0x4000     /* M64: the child
+                                          * borrows the parent's
+                                          * space (VM sharing is
+                                          * forced) and the
+                                          * parent sleeps until
+                                          * the child execs or
+                                          * exits (vfork_complete) */
+
+/* M64: release a vfork-blocked parent. Called from the
+ * exec commit point and from process_exit, whichever
+ * comes first; the flag makes it idempotent. */
+static void vfork_complete(struct task *me)
+{
+    struct task *p;
+    if (me->vfork_parent == 0)
+        return;
+    p = sched_find_task((int)me->vfork_parent);
+    me->vfork_done = true;
+    me->vfork_parent = 0;
+    if (p != NULL)
+        sched_wake(p);
+}
 
 /* M52: write a 32-bit value into an address space with no
  * chance of faulting -- translate first, then go through
@@ -663,7 +694,8 @@ static long sys_clone(struct yousj_syscall_ctx *ctx, long flags,
     struct task *child;
     uint64_t flags_saved;
 
-    bool share_vm = (flags & CLONE_VM_K) != 0;
+    bool vfork = (flags & CLONE_VFORK_K) != 0;
+    bool share_vm = (flags & CLONE_VM_K) != 0 || vfork;
 
     if (me->mm == NULL)
         return -YOUSJ_EINVAL; /* kernel threads cannot fork */
@@ -673,7 +705,7 @@ static long sys_clone(struct yousj_syscall_ctx *ctx, long flags,
                   CLONE_CHILD_SETTID_K | CLONE_SIGHAND_K |
                   CLONE_THREAD_K | CLONE_FILES_K |
                   CLONE_FS_K | CLONE_SYSVSEM_K |
-                  CLONE_DETACHED_K)) != 0 ||
+                  CLONE_DETACHED_K | CLONE_VFORK_K)) != 0 ||
         ((flags & 0xFF) != 0 && (flags & 0xFF) != YOUSJ_SIGCHLD))
         return -YOUSJ_EINVAL;
     if (child_stack != 0 && !share_vm)
@@ -718,6 +750,10 @@ static long sys_clone(struct yousj_syscall_ctx *ctx, long flags,
          * which it replaces. */
         if (flags & CLONE_CHILD_CLEARTID_K)
             child->clear_child_tid = child_tidptr;
+        if (vfork) {
+            child->vfork_parent = (int64_t)me->tid;
+            child->vfork_done = false;
+        }
         if (flags & CLONE_PARENT_SETTID_K)
             mm_write_i32(me->mm, parent_tidptr,
                          (int32_t)child->tid);
@@ -838,10 +874,26 @@ static long sys_clone(struct yousj_syscall_ctx *ctx, long flags,
     __asm__ volatile("push %0; popfq" : : "r"(flags_saved) : "memory");
 
     if (child == NULL) {
-        vmm_free_user_data(space);
-        vmm_destroy_space(space);
-        vmm_space_release(space);
+        /* M64: a shared space is the CALLER's own -- only a
+         * freshly cloned window is ours to destroy here.
+         * (For CLONE_VM this path previously freed the
+         * parent's live space on task-pool exhaustion.) */
+        if (!share_vm) {
+            vmm_free_user_data(space);
+            vmm_destroy_space(space);
+            vmm_space_release(space);
+        }
         return -YOUSJ_ENOMEM;
+    }
+    if (vfork) {
+        /* M64: the parent sleeps until the child execs or
+         * exits (vfork_complete sets the flag and wakes
+         * us). The loop re-checks after every wake, so a
+         * completion that raced ahead of the sleep is not
+         * lost; signals stay pending meanwhile, as on
+         * Linux, because delivery happens at return. */
+        while (!child->vfork_done)
+            sched_block_current();
     }
     return (long)child->tid;
 }
@@ -1061,6 +1113,10 @@ static long sys_execve(uint64_t path_ptr, uint64_t argv_ptr,
     old = me->mm;
     me->mm = space;
     me->mm_owned = true;
+    /* M64: a vfork child releases its parent the moment
+     * it has a space of its own; from here on it touches
+     * only its kernel stack and the new image. */
+    vfork_complete(me);
     signal_exec_reset(me);
     /* M54: with a shared fd table (CLONE_FILES), exec must
      * not close descriptors out from under the other threads
@@ -4507,6 +4563,12 @@ static long dispatch_inner(struct yousj_syscall_ctx *ctx)
         return sys_wait4((long)a1, a2, (long)a3, a4);
     case YOUSJ_SYS_clone:
         return sys_clone(ctx, (long)a1, a2, a3, a4, a5);
+    case YOUSJ_SYS_vfork:
+        /* M64: vfork is clone with the fixed flag set. */
+        return sys_clone(ctx,
+                         CLONE_VFORK_K | CLONE_VM_K |
+                             YOUSJ_SIGCHLD,
+                         0, 0, 0, 0);
     case YOUSJ_SYS_execve:
         return sys_execve(a1, a2, a3);
     case YOUSJ_SYS_rt_sigaction:

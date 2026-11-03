@@ -1042,12 +1042,25 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   跑命令、干净退出（作业控制
   因尚无进程组而关，属预期降
   级）。bb 套件新增交互场景。
-- ⏳ 下一步候选：CLONE_VFORK
-  （ash 与 posix_spawn 的首选
-  路径，目前 EINVAL 后回退
-  fork），或进程组/会话
-  （setpgid/setsid）为作业控
-  制铺路。
+- ✅ CLONE_VFORK M64
+  （2026-11-04）：clone 的
+  CLONE_VFORK(0x4000) 转正——
+  强制共享父地址空间（引用计
+  数），父任务在 clone 内睡到
+  子任务 exec 提交点或退出
+  （process_exit）唤醒，完成
+  标志幂等、信号保持待决；
+  vfork(58) 以固定旗标集包装
+  clone。连带修掉 CLONE_VM 在
+  任务池耗尽时误释放父空间的
+  既存隐患。pidtest 新增
+  vfork 场景（确定性阻塞顺序
+  ＋共享写入可见＋无 exec 退
+  出路径），场景数 17。
+- ⏳ 下一步候选：进程组/会话
+  （setpgid/getpgid/setsid、
+  kill(-pgid)、TCGETPGRP），
+  为 busybox 作业控制铺路。
 
 ## 从零构建
 

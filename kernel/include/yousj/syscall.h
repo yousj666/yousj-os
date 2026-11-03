@@ -145,5 +145,6 @@
 #define YOUSJ_SYS_truncate    76    /* M62 */
 #define YOUSJ_SYS_ftruncate   77    /* M62 */
 #define YOUSJ_SYS_getrandom   318   /* M63 */
+#define YOUSJ_SYS_vfork       58    /* M64 */
 
 #endif /* YOUSJ_SYSCALL_H */
