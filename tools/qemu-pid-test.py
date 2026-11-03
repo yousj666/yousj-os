@@ -87,7 +87,7 @@ SCEN = ['root-list', 'self-status', 'self-stat',
         'piddir-dents', 'stat-modes', 'self-link',
         'cmdline-self', 'cmdline-child', 'environ-self',
         'environ-child', 'cwd-exe', 'maps-self', 'fd-dir', 'fdinfo',
-        'vfork']
+        'vfork', 'groups']
 
 check('shell prompt', until('sh> ', 60))
 free_counts = []

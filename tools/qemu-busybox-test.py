@@ -95,6 +95,22 @@ try:
     s.send(b'echo INBB $((3+4))\n')
     okc = until('INBB 7')
     check('interactive command', okc)
+    # M65: job control is live now (process groups +
+    # tcsetpgrp landed): no "job control turned off"
+    # notice, a background job lists in `jobs`, and the
+    # shell stays responsive while it runs.
+    tseg = buf.decode(errors='replace')
+    check('job control enabled', 'job control' not in tseg)
+    buf = b''
+    s.send(b'/bin/busybox sleep 2 &\n')
+    time.sleep(1)
+    s.send(b'jobs\n')
+    okj = until('[1]')
+    check('background job lists', okj)
+    buf = b''
+    s.send(b'echo AFTERBG $((2+2))\n')
+    okb = until('AFTERBG 4')
+    check('shell responsive during bg job', okb)
     buf = b''
     s.send(b'exit\n')
     okx = until('sh> ')

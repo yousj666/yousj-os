@@ -159,6 +159,9 @@ struct task *kthread_create(const char *name, void (*entry)(void *arg),
      * clone overwrites from the parent. */
     t->tid = g_next_tid++;
     t->tgid = t->tid; /* M53: own group until a THREAD clone */
+    t->pgid = t->tid; /* M65: own process group and session
+                       * until clone inherits the creator's */
+    t->sid = t->tid;
     t->parent_tid = g_current != NULL ? g_current->tid : 0;
     t->state = TASK_READY;
     name_copy(t->name, name);
@@ -360,6 +363,22 @@ void sched_wake(struct task *task)
     rq_enqueue_tail(task);
 }
 
+/* M65: the wait4 pid filter, shared by the zombie scan,
+ * the has-children scan and the exit wake: -1 = any child,
+ * >0 = that tid, 0 = children in the WAITER's process
+ * group, <-1 = children in group -pid. */
+static int wait_matches(struct task *parent, struct task *child,
+                        int pid)
+{
+    if (pid == -1)
+        return 1;
+    if (pid > 0)
+        return child->tid == (uint64_t)pid;
+    if (pid == 0)
+        return child->pgid == parent->pgid;
+    return child->pgid == (uint64_t)(-(int64_t)pid);
+}
+
 void sched_exit_current(int status)
 {
     if (g_current == NULL || g_current == g_idle) {
@@ -370,13 +389,15 @@ void sched_exit_current(int status)
     g_current->exit_status = status;
     g_current->state = TASK_ZOMBIE;
     /* Wake a parent blocked in wait4 on this task (M5): the
-     * parent re-scans for its zombie child when it runs. */
+     * parent re-scans for its zombie child when it runs.
+     * M65: the target is the raw wait4 pid argument, matched
+     * with the same group-aware rule as the child scans. */
     {
         struct task *parent = sched_find_task((int)g_current->parent_tid);
         if (parent != NULL && parent->state == TASK_BLOCKED &&
-            parent->wait_target != 0 &&
-            (parent->wait_target == -1 ||
-             parent->wait_target == (int64_t)g_current->tid))
+            parent->wait_active &&
+            wait_matches(parent, g_current,
+                         (int)parent->wait_target))
             sched_wake(parent);
     }
     sched_schedule();
@@ -435,26 +456,26 @@ void sched_set_name(struct task *t, const char *name)
         name_copy(t->name, name);
 }
 
-struct task *sched_find_zombie_child(uint64_t parent_tid, int pid)
+struct task *sched_find_zombie_child(struct task *parent, int pid)
 {
     uint64_t i;
     for (i = 0; i < YOUSJ_SCHED_MAX_TASKS; i++) {
         struct task *t = &g_tasks[i];
-        if (t->in_use && t->parent_tid == parent_tid &&
+        if (t->in_use && t->parent_tid == parent->tid &&
             t->state == TASK_ZOMBIE &&
-            (pid == -1 || t->tid == (uint64_t)pid))
+            wait_matches(parent, t, pid))
             return t;
     }
     return NULL;
 }
 
-int sched_has_children(uint64_t parent_tid, int pid)
+int sched_has_children(struct task *parent, int pid)
 {
     uint64_t i;
     for (i = 0; i < YOUSJ_SCHED_MAX_TASKS; i++) {
         struct task *t = &g_tasks[i];
-        if (t->in_use && t->parent_tid == parent_tid &&
-            (pid == -1 || t->tid == (uint64_t)pid))
+        if (t->in_use && t->parent_tid == parent->tid &&
+            wait_matches(parent, t, pid))
             return 1;
     }
     return 0;

@@ -195,6 +195,8 @@ bool fs_file_is_dir(struct yousj_file *f);
 long fs_file_truncate(struct yousj_file *f, uint64_t size); /* M62 */
 long fs_truncate_path(const char *path, uint64_t size);     /* M62 */
 void fs_random_fill(uint8_t *dst, uint64_t count);          /* M63 */
+int32_t fs_console_fg_get(void); /* M65 */
+void fs_console_fg_set(int32_t pgid); /* M65 */
 long fs_ioctl(struct yousj_file *f, uint64_t req,
               uint64_t arg);                                /* M63 */
 /* M14: positional I/O on an open file object (the mmap

@@ -72,6 +72,13 @@ struct task {
     struct task_context ctx;      /* offset 0 -- see header note */
     uint64_t        tid;          /* idle = 0, then 1, 2, ... */
     uint64_t        parent_tid;
+    uint64_t        pgid;         /* M65: process-group id --
+                                     * a thread-group-wide
+                                     * attribute (written to
+                                     * every member), inherited
+                                     * across clone */
+    uint64_t        sid;          /* M65: session id, same
+                                     * group-wide treatment */
     uint64_t        tgid;         /* M53: thread-group id --
                                      what getpid() reports. Born
                                      == tid; CLONE_THREAD children
@@ -148,11 +155,14 @@ struct task {
                                      * child */
     bool            vfork_done;   /* M64: set when this vfork
                                      * child execs or exits */
-    int64_t         wait_target;  /* wait4 (M5): 0 = not waiting,
-                                     -1 = any child, >0 = that child
-                                     tid. sched_exit_current() wakes
-                                     a blocked parent whose target
-                                     matches the exiting task. */
+    int64_t         wait_target;  /* wait4 (M5): the raw pid
+                                     argument (-1 = any child,
+                                     >0 = that child, M65: 0 =
+                                     caller's group, <-1 = that
+                                     group). Meaningful only
+                                     while wait_active (M65:
+                                     pid 0 is a real target). */
+    bool            wait_active;  /* M65: blocked in wait4 */
     uint64_t        kernel_stack_base; /* PMM base of the owned
                                      kernel stack (auto-created
                                      tasks); 0 = not owned, never
@@ -316,8 +326,8 @@ void         sched_set_name(struct task *t, const char *name);
  * lookup and child existence under the wait4 pid filter
  * (pid == -1 matches any child), orphan adoption, and the
  * reaper that frees a zombie's kernel stack and pool slot. */
-struct task *sched_find_zombie_child(uint64_t parent_tid, int pid);
-int          sched_has_children(uint64_t parent_tid, int pid);
+struct task *sched_find_zombie_child(struct task *parent, int pid);
+int          sched_has_children(struct task *parent, int pid);
 int          sched_adopt_children(uint64_t from_tid, uint64_t to_tid);
 int          sched_reap_zombie(struct task *victim);
 

@@ -1057,10 +1057,39 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   vfork 场景（确定性阻塞顺序
   ＋共享写入可见＋无 exec 退
   出路径），场景数 17。
-- ⏳ 下一步候选：进程组/会话
-  （setpgid/getpgid/setsid、
-  kill(-pgid)、TCGETPGRP），
-  为 busybox 作业控制铺路。
+- ✅ 进程组与会话 M65
+  （2026-11-04）：task 新增
+  pgid/sid（线程组级属性，写
+  入全体成员；出生为自任组
+  长，clone 继承）。setsid
+  (112)、setpgid(109)、getpgid
+  (121)、getsid(124)、getpgrp
+  (111) 实装（会话与亲子约
+  束按 Linux 口径）；kill 的
+  pid 0 与负数按组投递；wait4
+  的 0 与 -pgid 形式转正（匹
+  配规则 wait_matches 与退出
+  唤醒共用）；fork(57) 独立系
+  统调用补齐（=clone(SIGCHLD)，
+  ash 作业控制路径专用）。
+  控制台前台组：TCGETPGRP
+  (0x540F)/TIOCSPGRP(0x5410)
+  （号码以 musl 头为准）＋
+  TIOCSCTTY(0x540E) 接受；记
+  录的前台组不存在时将来访
+  者所在组扶正，避免首个
+  shell 用 SIGTTIN 把自己永
+  久停住。效果：交互式
+  busybox sh 作业控制开启——
+  后台任务 jobs 可见、shell
+  保持响应。pidtest 新增
+  groups 场景（共 18）。
+- ⏳ 下一步候选：wait4 的
+  WUNTRACED/WCONTINUED（停
+  止/继续的等待上报，fg/bg
+  的另一半），或把 /bin/sh
+  本身换成 busybox sh 的准
+  备工作。
 
 ## 从零构建
 

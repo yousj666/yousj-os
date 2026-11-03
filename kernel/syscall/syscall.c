@@ -321,6 +321,9 @@ static long futex_wake_at(struct task *me, uint64_t uaddr,
  * clone section below. */
 static void vfork_complete(struct task *me);
 
+/* M65: defined with the process-group section below. */
+static int group_exists(uint64_t pgid, uint64_t sid);
+
 /* M51: drop one reference to an address space; the last
  * reference destroys it (frames, tables, pool slot).
  * Spaces are born with refs == 1 (vmm_create_space) and
@@ -537,13 +540,14 @@ static long sys_wait4(long pid, uint64_t status_ptr, long options,
 {
     struct task *me = sched_current();
 
-    if (pid == 0 || pid < -1)
-        return -YOUSJ_EINVAL; /* no process groups in this subset */
+    /* M65: every pid form is meaningful now -- -1 any
+     * child, >0 that child, 0 the caller's process group,
+     * <-1 that process group (see wait_matches). */
     if (options & ~YOUSJ_WNOHANG)
         return -YOUSJ_EINVAL;
 
     for (;;) {
-        struct task *z = sched_find_zombie_child(me->tid, (int)pid);
+        struct task *z = sched_find_zombie_child(me, (int)pid);
 
         if (z != NULL) {
             /* Status word (Linux layout): exit code in the high
@@ -572,7 +576,7 @@ static long sys_wait4(long pid, uint64_t status_ptr, long options,
             sched_reap_zombie(z);
             return (long)ztid;
         }
-        if (!sched_has_children(me->tid, (int)pid))
+        if (!sched_has_children(me, (int)pid))
             return -YOUSJ_ECHILD;
         if (options & YOUSJ_WNOHANG)
             return 0;
@@ -587,7 +591,9 @@ static long sys_wait4(long pid, uint64_t status_ptr, long options,
         /* Sleep until a matching child exits: sched_exit_current
          * wakes us through wait_target. */
         me->wait_target = pid;
+        me->wait_active = true;
         sched_block_current();
+        me->wait_active = false;
         me->wait_target = 0;
     }
 }
@@ -815,6 +821,11 @@ static long sys_clone(struct yousj_syscall_ctx *ctx, long flags,
          * (tgid was set to the child's tid at creation). */
         if (flags & CLONE_THREAD_K)
             child->tgid = me->tgid;
+        /* M65: process group and session inherit across
+         * clone (creation made the child its own leader;
+         * inheritance overwrites, once, here). */
+        child->pgid = me->pgid;
+        child->sid = me->sid;
         /* M28: comm is inherited across clone, as on Linux;
          * execve renames to the image basename. Without
          * this every forked child was named "clone" (the
@@ -3256,11 +3267,30 @@ static long sys_ioctl(long fd, uint64_t req, uint64_t arg)
     case 0x541B: /* FIONREAD */
         need = 4;
         break;
+    case 0x540F: /* TCGETPGRP */
+    case 0x5410: /* TIOCSPGRP */
+        need = 4; /* M65: one pid_t */
+        break;
+    case 0x540E: /* TIOCSCTTY */
+        need = 0; /* M65: arg is an int flag, not a pointer */
+        break;
     default:
         break;
     }
     if (need != 0 && !user_range_ok(arg, need))
         return -YOUSJ_EFAULT;
+    if (req == 0x540F) {
+        /* M65 TCGETPGRP fixup: if the recorded foreground
+         * group no longer exists, the console adopts the
+         * caller's group. The boot value names no live
+         * group, and a job-control shell that finds a
+         * stranger in the foreground stops itself with
+         * SIGTTIN, waiting for a handover nobody here
+         * performs. */
+        if (!group_exists((uint64_t)fs_console_fg_get(),
+                          me->sid))
+            fs_console_fg_set((int32_t)me->pgid);
+    }
     return fs_ioctl(f, req, arg);
 }
 
@@ -4241,12 +4271,134 @@ static long sys_arch_prctl(long code, uint64_t addr)
     }
 }
 
+/* --- M65: process groups and sessions --------------------
+ * pgid/sid are thread-group attributes: every write lands
+ * on all tasks sharing the tgid, so any member reads back
+ * the same values. */
+
+/* Set pgid (and optionally sid) on every member of a
+ * thread group. */
+static void group_apply(uint64_t tgid, uint64_t pgid,
+                        uint64_t sid, int set_sid)
+{
+    uint64_t tids[YOUSJ_SCHED_MAX_TASKS];
+    uint32_t n = sched_live_tids(tids, YOUSJ_SCHED_MAX_TASKS);
+    uint32_t i;
+    for (i = 0; i < n; i++) {
+        struct task *t = sched_find_task((int)tids[i]);
+        if (t != NULL && t->tgid == tgid) {
+            t->pgid = pgid;
+            if (set_sid)
+                t->sid = sid;
+        }
+    }
+}
+
+/* Does a process group `pgid` exist inside session `sid`? */
+static int group_exists(uint64_t pgid, uint64_t sid)
+{
+    uint64_t tids[YOUSJ_SCHED_MAX_TASKS];
+    uint32_t n = sched_live_tids(tids, YOUSJ_SCHED_MAX_TASKS);
+    uint32_t i;
+    for (i = 0; i < n; i++) {
+        struct task *t = sched_find_task((int)tids[i]);
+        if (t != NULL && t->pgid == pgid && t->sid == sid &&
+            t->state != TASK_ZOMBIE)
+            return 1;
+    }
+    return 0;
+}
+
+static long sys_setsid(void)
+{
+    struct task *me = sched_current();
+    if (me->pgid == me->tgid)
+        return -YOUSJ_EPERM; /* already a group leader */
+    group_apply(me->tgid, me->tgid, me->tgid, 1);
+    return (long)me->sid;
+}
+
+static long sys_setpgid(long pid, long pgid)
+{
+    struct task *me = sched_current();
+    struct task *tgt;
+    uint64_t newpg;
+
+    if (pid < 0 || pgid < 0)
+        return -YOUSJ_EINVAL;
+    tgt = pid == 0 ? me : sched_find_task((int)pid);
+    if (tgt == NULL || tgt->state == TASK_ZOMBIE)
+        return -YOUSJ_ESRCH;
+    if (tgt->sid != me->sid)
+        return -YOUSJ_EPERM; /* another session */
+    if (tgt->tgid != me->tgid) {
+        /* Only a child group of the caller may be moved. */
+        struct task *leader = sched_find_task((int)tgt->tgid);
+        if (leader == NULL || leader->parent_tid != me->tid)
+            return -YOUSJ_EPERM;
+    }
+    newpg = pgid == 0 ? tgt->tgid : (uint64_t)pgid;
+    if (newpg != tgt->tgid && !group_exists(newpg, me->sid))
+        return -YOUSJ_EPERM; /* no such group in this session */
+    group_apply(tgt->tgid, newpg, 0, 0);
+    return 0;
+}
+
+static long sys_getpgid(long pid)
+{
+    struct task *tgt;
+    if (pid < 0)
+        return -YOUSJ_EINVAL;
+    tgt = pid == 0 ? sched_current()
+                   : sched_find_task((int)pid);
+    if (tgt == NULL)
+        return -YOUSJ_ESRCH;
+    return (long)tgt->pgid;
+}
+
+static long sys_getsid(long pid)
+{
+    struct task *tgt;
+    if (pid < 0)
+        return -YOUSJ_EINVAL;
+    tgt = pid == 0 ? sched_current()
+                   : sched_find_task((int)pid);
+    if (tgt == NULL)
+        return -YOUSJ_ESRCH;
+    return (long)tgt->sid;
+}
+
 static long sys_kill(long pid, long sig)
 {
     struct task *victim;
 
     if (sig < 0 || sig >= YOUSJ_NSIG)
         return -YOUSJ_EINVAL;
+    if (pid <= 0) {
+        /* M65: pid 0 and negative pids address a process
+         * group: 0 is the caller's own group, -pgid that
+         * group (-1 broadcast is not implemented: ESRCH). */
+        uint64_t tids[YOUSJ_SCHED_MAX_TASKS];
+        uint32_t n, i;
+        int delivered = 0;
+        uint64_t want;
+        if (pid == -1)
+            return -YOUSJ_ESRCH;
+        want = pid == 0 ? sched_current()->pgid
+                        : (uint64_t)(-pid);
+        n = sched_live_tids(tids, YOUSJ_SCHED_MAX_TASKS);
+        for (i = 0; i < n; i++) {
+            struct task *v = sched_find_task((int)tids[i]);
+            if (v == NULL || v->mm == NULL ||
+                v->state == TASK_ZOMBIE || v->pgid != want)
+                continue;
+            delivered = 1;
+            if (sig != 0)
+                signal_send(v, (int)sig,
+                            (int)sched_current()->tid);
+        }
+        return delivered ? 0 : -YOUSJ_ESRCH;
+    }
     victim = sched_find_task((int)pid);
     if (victim == NULL || victim->state == TASK_ZOMBIE)
         return -YOUSJ_ESRCH;
@@ -4557,6 +4709,16 @@ static long dispatch_inner(struct yousj_syscall_ctx *ctx)
         return (long)sched_current()->tid;
     case YOUSJ_SYS_kill:
         return sys_kill((long)a1, (long)a2);
+    case YOUSJ_SYS_getpgrp:
+        return sys_getpgid(0);
+    case YOUSJ_SYS_setsid:
+        return sys_setsid();
+    case YOUSJ_SYS_getpgid:
+        return sys_getpgid((long)a1);
+    case YOUSJ_SYS_getsid:
+        return sys_getsid((long)a1);
+    case YOUSJ_SYS_setpgid:
+        return sys_setpgid((long)a1, (long)a2);
     case YOUSJ_SYS_uname:
         return sys_uname(a1);
     case YOUSJ_SYS_wait4:
@@ -4569,6 +4731,12 @@ static long dispatch_inner(struct yousj_syscall_ctx *ctx)
                          CLONE_VFORK_K | CLONE_VM_K |
                              YOUSJ_SIGCHLD,
                          0, 0, 0, 0);
+    case YOUSJ_SYS_fork:
+        /* M65: the standalone fork syscall (everything
+         * else reached clone through musl's fork(), but
+         * busybox ash's job-control path calls fork(2)
+         * itself). */
+        return sys_clone(ctx, YOUSJ_SIGCHLD, 0, 0, 0, 0);
     case YOUSJ_SYS_execve:
         return sys_execve(a1, a2, a3);
     case YOUSJ_SYS_rt_sigaction:

@@ -3457,6 +3457,24 @@ void fs_random_fill(uint8_t *dst, uint64_t count)
 #define FS_TIOCGWINSZ 0x5413
 #define FS_TIOCSWINSZ 0x5414
 #define FS_FIONREAD 0x541B
+#define FS_TIOCSCTTY 0x540E /* M65: adopt controlling tty */
+#define FS_TCGETPGRP 0x540F /* M65 */
+#define FS_TIOCSPGRP 0x5410 /* M65 */
+
+/* M65: the console's foreground process group (tcsetpgrp
+ * state). One console, one value; boots as group 1 and a
+ * shell moves it as jobs come and go. */
+static int32_t g_fg_pgid = 1;
+
+int32_t fs_console_fg_get(void)
+{
+    return g_fg_pgid;
+}
+
+void fs_console_fg_set(int32_t pgid)
+{
+    g_fg_pgid = pgid;
+}
 
 static struct {
     uint32_t iflag, oflag, cflag, lflag;
@@ -3522,6 +3540,20 @@ long fs_ioctl(struct yousj_file *f, uint64_t req,
         *p = serial_rx_ready() ? 1 : 0;
         return 0;
     }
+    case FS_TCGETPGRP: {
+        int *p = (int *)(uintptr_t)arg;
+        *p = g_fg_pgid;
+        return 0;
+    }
+    case FS_TIOCSPGRP: {
+        const int *p = (const int *)(uintptr_t)arg;
+        g_fg_pgid = *p;
+        return 0;
+    }
+    case FS_TIOCSCTTY:
+        /* One console, no per-session terminal ownership
+         * to arbitrate: adopting it always succeeds. */
+        return 0;
     default:
         return -FS_ENOTTY;
     }

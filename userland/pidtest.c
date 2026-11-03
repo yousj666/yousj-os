@@ -42,6 +42,13 @@
 #define SYS_wait4 61
 #define SYS_exit_group 231
 #define SYS_getdents64 217
+#define SYS_ioctl 16
+#define SYS_kill 62
+#define SYS_getpgrp 111
+#define SYS_setsid 112
+#define SYS_getpgid 121
+#define SYS_getsid 124
+#define SYS_setpgid 109
 
 #define ENOENT (-2)
 
@@ -774,6 +781,103 @@ int main(int argc, char **argv)
         ok = ok && c > 0 && vf_flag == 7 &&
              ((st >> 8) & 0xFF) == 3;
         report("vfork", ok);
+    }
+
+    /* M65: process groups and sessions. We start as a
+     * member of the shell's group; setsid (we are not the
+     * leader) makes us session+group leader, a second
+     * setsid must fail. Children can be moved between
+     * groups, kill(-pgid) takes a whole group down, and
+     * wait4 accepts the group forms 0 and -pgid. */
+    {
+        long me = sys_call1(SYS_getpid, 0);
+        long sid, c1, c2, st = 0;
+        int ok = 1;
+        int fg = 0;
+
+        ok = ok && sys_call1(SYS_getpgrp, 0) ==
+                       sys_call2(SYS_getpgid, 0, 0);
+        sid = sys_call1(SYS_setsid, 0);
+        ok = ok && sid == me &&
+             sys_call2(SYS_getpgid, 0, 0) == me &&
+             sys_call2(SYS_getsid, 0, 0) == me;
+        ok = ok && sys_call1(SYS_setsid, 0) == -1; /* leader */
+        ok = ok && sys_call2(SYS_getpgid, 99999, 0) == -3;
+
+        /* move a child into its own group and back */
+        c1 = sys_call4(SYS_clone, 17, 0, 0, 0);
+        if (c1 == 0) {
+            sleep_ms(1500);
+            die(0);
+        }
+        ok = ok && c1 > 0 &&
+             sys_call3(SYS_setpgid, c1, c1, 0) == 0 &&
+             sys_call2(SYS_getpgid, c1, 0) == c1 &&
+             sys_call3(SYS_setpgid, c1, me, 0) == 0 &&
+             sys_call2(SYS_getpgid, c1, 0) == me;
+        sys_call4(SYS_wait4, c1, (long)(uintptr_t)&st, 0, 0);
+
+        /* kill(-pgid) kills the whole group by signal */
+        c1 = sys_call4(SYS_clone, 17, 0, 0, 0);
+        if (c1 == 0) {
+            sleep_ms(1500);
+            die(0);
+        }
+        c2 = sys_call4(SYS_clone, 17, 0, 0, 0);
+        if (c2 == 0) {
+            sleep_ms(1500);
+            die(0);
+        }
+        ok = ok && c1 > 0 && c2 > 0 &&
+             sys_call3(SYS_setpgid, c1, c1, 0) == 0 &&
+             sys_call3(SYS_setpgid, c2, c1, 0) == 0 &&
+             sys_call3(SYS_kill, -c1, 9, 0) == 0;
+        st = 0;
+        sys_call4(SYS_wait4, c1, (long)(uintptr_t)&st, 0, 0);
+        ok = ok && (st & 0x7F) == 9;
+        st = 0;
+        sys_call4(SYS_wait4, c2, (long)(uintptr_t)&st, 0, 0);
+        ok = ok && (st & 0x7F) == 9;
+        ok = ok && sys_call3(SYS_kill, -c1, 0, 0) == -3;
+
+        /* wait4(-pgid): reap a child by its group */
+        c1 = sys_call4(SYS_clone, 17, 0, 0, 0);
+        if (c1 == 0) {
+            sleep_ms(200);
+            die(5);
+        }
+        ok = ok && c1 > 0 &&
+             sys_call3(SYS_setpgid, c1, c1, 0) == 0;
+        st = 0;
+        ok = ok &&
+             sys_call4(SYS_wait4, -c1, (long)(uintptr_t)&st,
+                       0, 0) == c1 &&
+             ((st >> 8) & 0xFF) == 5;
+
+        /* wait4(0): any child in OUR group */
+        c1 = sys_call4(SYS_clone, 17, 0, 0, 0);
+        if (c1 == 0)
+            die(6);
+        st = 0;
+        ok = ok && c1 > 0 &&
+             sys_call4(SYS_wait4, 0, (long)(uintptr_t)&st,
+                       0, 0) == c1 &&
+             ((st >> 8) & 0xFF) == 6;
+
+        /* console foreground group round-trips */
+        ok = ok &&
+             sys_call4(SYS_ioctl, 0, 0x540F,
+                       (long)(uintptr_t)&fg, 0) == 0 && fg >= 1;
+        fg = (int)me;
+        ok = ok &&
+             sys_call4(SYS_ioctl, 0, 0x5410, /* TIOCSPGRP */
+                       (long)(uintptr_t)&fg, 0) == 0;
+        fg = 0;
+        ok = ok &&
+             sys_call4(SYS_ioctl, 0, 0x540F,
+                       (long)(uintptr_t)&fg, 0) == 0 &&
+             fg == (int)me;
+        report("groups", ok);
     }
 
     out("PIDTEST DONE\n");
