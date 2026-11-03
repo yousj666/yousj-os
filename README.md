@@ -676,7 +676,22 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   语义）。验收：dirfdtest 加 exchange 场景
   （内容互换、互斥 flags、缺名 ENOENT），
   ramfs 与 yfs 各跑一遍。
-- ⏳ 下一步候选：inotify 盘点、/dev 盘点。
+- ✅ /dev 字符设备 M47（2026-11-03）：此前
+  /dev 不存在、控制台只是无名文件对象。现
+  fs_init 建 /dev 并预置 null/zero/full/
+  random/urandom 五个字符设备（ramfs 节点
+  带 dev 号，stat 为 S_IFCHR 0666，目录项
+  类型 DT_CHR）：null 读 EOF 写吞噬、zero
+  读零、full 写 ENOSPC 读零、random/urandom
+  共用 xorshift PRNG（RTC＋tick 播种，无熵
+  模型，明示）。file_read/write 与 pread/
+  pwrite 都分发到设备语义；shell 的
+  `> /dev/null` 自此可用。验收：fstest 加
+  devices 场景（吞噬/零读/ENOSPC/随机流两
+  段不同/stat 类型）。定位中一枚实现 bug：
+  建设备时误把 walk 的父目录当 /dev 本身，
+  设备建到了根目录——已改 fs_lookup。
+- ⏳ 下一步候选：inotify 盘点。
 
 ## 从零构建
 

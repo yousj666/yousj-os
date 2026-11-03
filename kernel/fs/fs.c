@@ -104,6 +104,8 @@ struct yousj_ramfs_node {
                                            containing dir */
     struct yousj_dent *dents;           /* directories: entries */
     uint32_t nlink;                     /* M44: dent count */
+    uint32_t dev;                       /* M47: character
+                                           device id, 0 = none */
     uint32_t size;                      /* regular files */
     uint32_t mtime;                     /* M23: epoch seconds */
     uint32_t atime;                     /* M26: independent */
@@ -2147,7 +2149,10 @@ static void stat_from_ramfs_node(struct yousj_ramfs_node *n,
     info->mtime = n->mtime;
     info->atime = n->atime;
     info->ctime = n->ctime;
-    if (n->is_link) {
+    if (n->dev != 0) { /* M47 */
+        info->mode = S_IFCHR_K | (n->mode & 07777u);
+        info->size = 0;
+    } else if (n->is_link) {
         info->mode = S_IFLNK_K | (n->mode & 07777u);
         info->size = n->size;
     } else if (n->is_dir) {
@@ -2523,6 +2528,55 @@ int fs_mount_data(void)
     return rc;
 }
 
+/* M47: character devices. Ids: 1 null, 2 zero, 3 full,
+ * 4 random (urandom shares it -- there is no entropy
+ * model, just a xorshift PRNG seeded at init from the
+ * wall clock and the tick count). */
+#define DEV_NULL   1
+#define DEV_ZERO   2
+#define DEV_FULL   3
+#define DEV_RANDOM 4
+
+static uint64_t g_rng_state = 0x9E3779B97F4A7C15ull;
+
+static uint8_t rng_byte(void)
+{
+    uint64_t x = g_rng_state;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    g_rng_state = x;
+    return (uint8_t)((x * 0x2545F4914F6CDD1Dull) >> 56);
+}
+
+static long dev_read(struct yousj_file *f, uint8_t *dst,
+                     uint64_t count)
+{
+    uint64_t i;
+    switch (f->node->dev) {
+    case DEV_NULL:
+        return 0;
+    case DEV_ZERO:
+    case DEV_FULL:
+        for (i = 0; i < count; i++)
+            dst[i] = 0;
+        return (long)count;
+    case DEV_RANDOM:
+        for (i = 0; i < count; i++)
+            dst[i] = rng_byte();
+        return (long)count;
+    default:
+        return -YOUSJ_EBADF;
+    }
+}
+
+static long dev_write(struct yousj_file *f, uint64_t count)
+{
+    if (f->node->dev == DEV_FULL)
+        return -YOUSJ_ENOSPC;
+    return (long)count; /* null, zero, random: sink */
+}
+
 long file_read(struct yousj_file *f, uint8_t *dst, uint64_t count)
 {
     long n;
@@ -2558,6 +2612,8 @@ long file_read(struct yousj_file *f, uint8_t *dst, uint64_t count)
         return -YOUSJ_EISDIR;
     if ((f->flags & YOUSJ_O_ACCMODE) == YOUSJ_O_WRONLY)
         return -YOUSJ_EBADF;
+    if (f->node->dev != 0) /* M47 */
+        return dev_read(f, dst, count);
     n = node_pread(f->node, f->offset, dst, count);
     if (n > 0) {
         f->offset += (uint64_t)n;
@@ -2593,6 +2649,8 @@ long file_write(struct yousj_file *f, const uint8_t *src,
         return -YOUSJ_EISDIR;
     if ((f->flags & YOUSJ_O_ACCMODE) == YOUSJ_O_RDONLY)
         return -YOUSJ_EBADF;
+    if (f->node->dev != 0) /* M47 */
+        return dev_write(f, count);
     if (f->flags & YOUSJ_O_APPEND)
         f->offset = f->node->size;
     n = node_pwrite(f->node, f->offset, src, count);
@@ -2630,6 +2688,9 @@ long fs_pread_file(struct yousj_file *f, uint64_t off,
     }
     if (f->backend == 0 && f->node == NULL)
         return -YOUSJ_EBADF; /* the console is not mappable */
+    if (f->backend == 0 && f->node != NULL &&
+        f->node->dev != 0) /* M47: offsets mean nothing */
+        return dev_read(f, dst, count);
     while (done < count) {
         uint64_t chunk = count - done;
         long n;
@@ -2658,6 +2719,9 @@ long fs_pwrite_file(struct yousj_file *f, uint64_t off,
         return -YOUSJ_EBADF;
     if (f->backend == 0 && f->node == NULL)
         return -YOUSJ_EBADF;
+    if (f->backend == 0 && f->node != NULL &&
+        f->node->dev != 0) /* M47 */
+        return dev_write(f, count);
     while (done < count) {
         uint64_t chunk = count - done;
         long n;
@@ -2964,6 +3028,7 @@ long file_getdents(struct yousj_file *f, uint8_t *buf, uint64_t count)
             *(uint64_t *)(rec + 8) = (uint64_t)(idx + 1);
             *(uint16_t *)(rec + 16) = (uint16_t)reclen;
             rec[18] = c->is_dir ? YOUSJ_DT_DIR : c->is_link ? 10
+                          : c->dev != 0 ? 2 /* DT_CHR, M47 */
                           : YOUSJ_DT_REG;
             mem_copy(rec + 19, (const uint8_t *)dwalk->name,
                      namelen);
@@ -2998,6 +3063,32 @@ void fs_init(void)
      * the stat and getdents branches before the ramfs node
      * is ever consulted. */
     ramfs_mkdir_path("/proc");
+    /* M47: /dev with the classic character devices. */
+    ramfs_mkdir_path("/dev");
+    {
+        struct yousj_ramfs_node *devdir = fs_lookup("/dev");
+        static const char *const names[5] = {
+            "null", "zero", "full", "random", "urandom"
+        };
+        static const uint32_t ids[5] = { 1, 2, 3, 4, 4 };
+        int i;
+        if (devdir != NULL) {
+            for (i = 0; i < 5; i++) {
+                struct yousj_ramfs_node *n = node_create(
+                    devdir, names[i], str_len(names[i]),
+                    false);
+                if (n != NULL) {
+                    n->dev = ids[i];
+                    n->mode = 0666;
+                }
+            }
+        }
+        g_rng_state ^= (uint64_t)yousj_now_unix() << 32 ^
+                       sched_uptime_ticks() ^
+                       0x2545F4914F6CDD1Dull;
+        if (g_rng_state == 0)
+            g_rng_state = 0x9E3779B97F4A7C15ull;
+    }
 }
 
 static long install_file(const char *path, const uint8_t *data,

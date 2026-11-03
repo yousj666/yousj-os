@@ -588,6 +588,63 @@ static void t_link_midpath(void)
            buf[0] == 'I' && buf[1] == 'N');
 }
 
+/* M47: the /dev character devices. */
+static void t_devices(void)
+{
+    char buf[16], buf2[16];
+    long fd, n, i;
+    int ok = 1;
+    fd = open_("/dev/null", 1 /* O_WRONLY */);
+    ok = ok && fd >= 0 &&
+         sys_call3(SYS_write, fd, (long)(uintptr_t)"hello", 5) == 5;
+    if (fd >= 0)
+        sys_call3(SYS_close, fd, 0, 0);
+    fd = open_("/dev/null", O_RDONLY);
+    ok = ok && fd >= 0 &&
+         sys_call3(SYS_read, fd, (long)(uintptr_t)buf, 4) == 0;
+    if (fd >= 0)
+        sys_call3(SYS_close, fd, 0, 0);
+    fd = open_("/dev/zero", O_RDONLY);
+    n = fd >= 0 ? sys_call3(SYS_read, fd, (long)(uintptr_t)buf, 8) : -1;
+    ok = ok && n == 8;
+    for (i = 0; i < 8; i++)
+        ok = ok && buf[i] == 0;
+    if (fd >= 0)
+        sys_call3(SYS_close, fd, 0, 0);
+    fd = open_("/dev/full", 1);
+    ok = ok && fd >= 0 &&
+         sys_call3(SYS_write, fd, (long)(uintptr_t)"x", 1) == -28;
+    if (fd >= 0)
+        sys_call3(SYS_close, fd, 0, 0);
+    fd = open_("/dev/urandom", O_RDONLY);
+    n = fd >= 0 ? sys_call3(SYS_read, fd, (long)(uintptr_t)buf, 16) : -1;
+    {
+        long n2 = fd >= 0 ? sys_call3(SYS_read, fd,
+                                      (long)(uintptr_t)buf2, 16)
+                          : -1;
+        int same = 1, allzero = 1;
+        for (i = 0; i < 16; i++) {
+            if (buf[i] != buf2[i])
+                same = 0;
+            if (buf[i] != 0)
+                allzero = 0;
+        }
+        ok = ok && n == 16 && n2 == 16 && !same && !allzero;
+    }
+    if (fd >= 0)
+        sys_call3(SYS_close, fd, 0, 0);
+    {
+        /* stat: character device type bits */
+        uint8_t stb[144];
+        long rc = sys_call4(262 /* newfstatat */, -100,
+                            (long)(uintptr_t)"/dev/null",
+                            (long)(uintptr_t)stb, 0);
+        uint32_t mode = *(uint32_t *)(stb + 24);
+        ok = ok && rc == 0 && (mode & 0170000) == 0020000;
+    }
+    report("devices", ok);
+}
+
 static void t_link_unlink(void)
 {
     char buf[32];
@@ -628,6 +685,7 @@ int main(void)
     t_readlink();
     t_link_midpath();
     t_link_unlink();
+    t_devices();
 
     if (fd >= 0)
         sys_call3(SYS_close, fd, 0, 0);
