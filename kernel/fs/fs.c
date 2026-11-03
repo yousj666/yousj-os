@@ -985,6 +985,8 @@ static long yfs_open_path_fs(const char *rel, long flags,
 #define PROC_ID_PMAPS    11 /* M39 */
 #define PROC_ID_PFDDIR   12 /* M41 */
 #define PROC_ID_PFD      13 /* M41 */
+#define PROC_ID_PFDINFODIR 14 /* M45 */
+#define PROC_ID_PFDINFO  15 /* M45 */
 static const char *const g_proc_names[3] = {
     "uptime", "meminfo", "version"
 };
@@ -999,7 +1001,8 @@ static bool is_proc_path(const char *path)
 static bool proc_is_dir_id(int id)
 {
     return id == 0 || id == PROC_ID_PIDDIR ||
-           id == PROC_ID_PFDDIR;
+           id == PROC_ID_PFDDIR ||
+           id == PROC_ID_PFDINFODIR;
 }
 
 /* Inode numbers: the flat files keep 9000+id; a pid entry
@@ -1110,6 +1113,35 @@ static int proc_find2(const char *rel, uint32_t *pid_out,
             if (leaf[0] == 'f' && leaf[1] == 'd' &&
                 leaf[2] == '\0')
                 return PROC_ID_PFDDIR;
+            if (leaf[0] == 'f' && leaf[1] == 'd' &&
+                leaf[2] == 'i' && leaf[3] == 'n' &&
+                leaf[4] == 'f' && leaf[5] == 'o' &&
+                leaf[6] == '\0')
+                return PROC_ID_PFDINFODIR;
+            if (leaf[0] == 'f' && leaf[1] == 'd' &&
+                leaf[2] == 'i' && leaf[3] == 'n' &&
+                leaf[4] == 'f' && leaf[5] == 'o' &&
+                leaf[6] == '/') {
+                const char *d = leaf + 7;
+                uint64_t v = 0, j = 0;
+                struct task *t;
+                if (d[0] == '\0')
+                    return -1;
+                while (d[j] >= '0' && d[j] <= '9') {
+                    v = v * 10 + (uint64_t)(d[j] - '0');
+                    if (v >= YOUSJ_NR_OPEN)
+                        return -1;
+                    j++;
+                }
+                if (d[j] != '\0')
+                    return -1;
+                t = sched_find_task((int)*pid_out);
+                if (t == NULL || t->fd_file[v] == NULL)
+                    return -1;
+                if (fd_out != NULL)
+                    *fd_out = (int)v;
+                return PROC_ID_PFDINFO;
+            }
             if (leaf[0] == 'f' && leaf[1] == 'd' &&
                 leaf[2] == '/') {
                 /* M41: fd/<n> -- only while that fd is
@@ -1373,8 +1405,28 @@ static const char *proc_state_word(char c)
     }
 }
 
-static uint32_t proc_generate(int id, uint32_t pid, char *buf,
-                              uint32_t cap)
+static void pb_oct(struct pbuf *b, uint32_t v)
+{
+    char tmp[12];
+    int n = 0, i;
+    if (v == 0) {
+        pb_puts(b, "0");
+        return;
+    }
+    while (v > 0) {
+        tmp[n++] = (char)('0' + (v & 7u));
+        v >>= 3;
+    }
+    for (i = n - 1; i >= 0; i--) {
+        char one[2];
+        one[0] = tmp[i];
+        one[1] = '\0';
+        pb_puts(b, one);
+    }
+}
+
+static uint32_t proc_generate(int id, uint32_t pid, int pfd,
+                              char *buf, uint32_t cap)
 {
     struct pbuf b;
     b.buf = buf;
@@ -1397,7 +1449,7 @@ static uint32_t proc_generate(int id, uint32_t pid, char *buf,
         pb_puts(&b, " kB\n");
         break;
     case PROC_ID_VERSION:
-        pb_puts(&b, "Yousj OS version 0.9 (M41) x86_64 #1\n");
+        pb_puts(&b, "Yousj OS version 0.9 (M45) x86_64 #1\n");
         break;
     case PROC_ID_PCMDLINE: {
         /* Raw bytes, not text: the argv is NUL-joined, so
@@ -1424,6 +1476,30 @@ static uint32_t proc_generate(int id, uint32_t pid, char *buf,
             n = b.cap;
         for (i = 0; i < n; i++)
             b.buf[b.len++] = t->env[i];
+        break;
+    }
+    case PROC_ID_PFDINFO: {
+        struct task *t = sched_find_task((int)pid);
+        struct yousj_file *tf =
+            (t != NULL && pfd >= 0 && pfd < YOUSJ_NR_OPEN)
+                ? t->fd_file[pfd]
+                : NULL;
+        struct yousj_stat_info si;
+        if (tf == NULL)
+            break;
+        pb_puts(&b, "pos:\t");
+        pb_putu(&b, tf->offset);
+        pb_puts(&b, "\nflags:\t");
+        pb_oct(&b, (uint32_t)tf->flags);
+        pb_puts(&b, "\nmnt_id:\t");
+        pb_putu(&b, tf->backend == 1 ? 2
+                                     : (tf->backend == 0 &&
+                                                tf->node != NULL
+                                            ? 1
+                                            : 0));
+        pb_puts(&b, "\nino:\t");
+        pb_putu(&b, fs_file_stat(tf, &si) ? si.ino : 0);
+        pb_puts(&b, "\n");
         break;
     }
     case PROC_ID_PMAPS: {
@@ -1528,10 +1604,11 @@ static long proc_open(const char *path, long flags,
     long acc = flags & YOUSJ_O_ACCMODE;
     struct yousj_file *f;
     int id;
+    int fdn = -1;
     uint32_t pid = 0;
     if (rel[0] == '/')
         rel++;
-    id = proc_find(rel, &pid);
+    id = proc_find2(rel, &pid, &fdn);
     if (id < 0)
         return -YOUSJ_ENOENT_L;
     if (proc_is_dir_id(id)) {
@@ -1547,10 +1624,12 @@ static long proc_open(const char *path, long flags,
     f->backend = 2;
     f->proc_id = id;
     f->proc_pid = pid;
+    f->proc_fd = fdn;
     f->flags = flags;
     f->offset = 0;
     if (!proc_is_dir_id(id))
-        f->proc_len = proc_generate(id, pid, f->proc_buf,
+        f->proc_len = proc_generate(id, pid, fdn,
+                                    f->proc_buf,
                                     sizeof(f->proc_buf));
     *out = f;
     return 0;
@@ -2068,10 +2147,11 @@ bool fs_path_stat2(const char *path, bool follow,
     if (is_proc_path(path)) {
         const char *rel = path + 5;
         int id;
+        int pfdn = -1;
         uint32_t pid = 0;
         if (rel[0] == '/')
             rel++;
-        id = proc_find(rel, &pid);
+        id = proc_find2(rel, &pid, &pfdn);
         if (id < 0)
             return false;
         /* M35: the magic links either report themselves
@@ -2131,13 +2211,19 @@ bool fs_path_stat2(const char *path, bool follow,
         info->atime = info->mtime;
         info->ctime = info->mtime;
         info->ino = proc_ino_for(id, pid);
+        if (id == PROC_ID_PFDINFODIR)
+            info->ino = 40000 + (uint64_t)pid;
+        if (id == PROC_ID_PFDINFO)
+            info->ino = 50000 + (uint64_t)pid * 16 +
+                        (uint64_t)(pfdn < 0 ? 0 : pfdn);
         if (proc_is_dir_id(id)) {
             info->mode = S_IFDIR_K | 0555u;
             info->size = 0;
         } else {
             char scratch[640]; /* M34/35: fit a full environ */
             info->mode = S_IFREG_K | 0444u;
-            info->size = proc_generate(id, pid, scratch,
+            info->size = proc_generate(id, pid, pfdn,
+                                       scratch,
                                        sizeof(scratch));
         }
         return true;
@@ -2585,9 +2671,10 @@ long file_getdents(struct yousj_file *f, uint8_t *buf, uint64_t count)
         static const char *const root_names[5] = {
             ".", "..", "uptime", "meminfo", "version"
         };
-        static const char *const pid_names[10] = {
+        static const char *const pid_names[11] = {
             ".", "..", "status", "stat", "cmdline",
-            "environ", "cwd", "exe", "maps", "fd"
+            "environ", "cwd", "exe", "maps", "fd",
+            "fdinfo"
         };
         uint64_t tids[YOUSJ_SCHED_MAX_TASKS];
         int fds[YOUSJ_NR_OPEN]; /* M41: PFDDIR listing */
@@ -2601,7 +2688,8 @@ long file_getdents(struct yousj_file *f, uint8_t *buf, uint64_t count)
             ntids = sched_live_tids(tids,
                                     YOUSJ_SCHED_MAX_TASKS);
             total = 5 + ntids;
-        } else if (f->proc_id == PROC_ID_PFDDIR) {
+        } else if (f->proc_id == PROC_ID_PFDDIR ||
+                   f->proc_id == PROC_ID_PFDINFODIR) {
             struct task *t = sched_find_task(
                 (int)f->proc_pid);
             int k;
@@ -2612,7 +2700,7 @@ long file_getdents(struct yousj_file *f, uint8_t *buf, uint64_t count)
                         fds[total++ - 2] = k;
             }
         } else {
-            total = 10;
+            total = 11;
         }
         for (i = f->offset; i < total; i++) {
             const char *nm;
@@ -2653,14 +2741,21 @@ long file_getdents(struct yousj_file *f, uint8_t *buf, uint64_t count)
                 else if (i == 8)
                     ino = proc_ino_for(PROC_ID_PMAPS,
                                        f->proc_pid);
-                else {
+                else if (i == 9) {
                     ino = 30000 + f->proc_pid; /* PFDDIR */
                     dtype = YOUSJ_DT_DIR;
+                } else {
+                    ino = 40000 + f->proc_pid; /* PFDINFODIR */
+                    dtype = YOUSJ_DT_DIR;
                 }
-            } else if (f->proc_id == PROC_ID_PFDDIR) {
+            } else if (f->proc_id == PROC_ID_PFDDIR ||
+                       f->proc_id == PROC_ID_PFDINFODIR) {
                 if (i == 0) {
                     nm = ".";
-                    ino = 30000 + f->proc_pid;
+                    ino = (f->proc_id == PROC_ID_PFDDIR
+                               ? 30000
+                               : 40000) +
+                          f->proc_pid;
                     dtype = YOUSJ_DT_DIR;
                 } else if (i == 1) {
                     nm = "..";
@@ -2671,10 +2766,17 @@ long file_getdents(struct yousj_file *f, uint8_t *buf, uint64_t count)
                     int fdn = fds[i - 2];
                     u32_dec(numbuf, (uint32_t)fdn);
                     nm = numbuf;
-                    ino = 20000 +
-                          (uint64_t)f->proc_pid * 16 +
-                          (uint64_t)fdn;
-                    dtype = 10; /* DT_LNK */
+                    if (f->proc_id == PROC_ID_PFDDIR) {
+                        ino = 20000 +
+                              (uint64_t)f->proc_pid * 16 +
+                              (uint64_t)fdn;
+                        dtype = 10; /* DT_LNK */
+                    } else {
+                        ino = 50000 +
+                              (uint64_t)f->proc_pid * 16 +
+                              (uint64_t)fdn;
+                        dtype = YOUSJ_DT_REG;
+                    }
                 }
             } else if (i < 5) {
                 nm = root_names[i];

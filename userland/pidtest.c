@@ -35,6 +35,7 @@
 #define SYS_getpid 39
 #define SYS_clone 56
 #define SYS_pipe 22
+#define SYS_lseek 8
 #define SYS_mmap 9
 #define SYS_munmap 11
 #define SYS_execve 59
@@ -595,7 +596,8 @@ int main(int argc, char **argv)
     {
         char lb[300];
         struct st sb;
-        long ln, xfd, pfd[2];
+        long ln, xfd;
+        int pfd[2];
         int ok;
         xfd = sys_call3(SYS_open,
                         (long)(uintptr_t)"/bin/pidtest", 0, 0);
@@ -671,6 +673,45 @@ int main(int argc, char **argv)
         sys_call1(SYS_close, pfd[0]);
         sys_call1(SYS_close, pfd[1]);
         report("fd-dir", ok);
+    }
+
+    /* M45: fdinfo. */
+    {
+        char xp[64], ib[256], db[1024];
+        const char *pre = "/proc/self/fdinfo/";
+        uint64_t j = 0;
+        long xfd, n, got;
+        int ok;
+        while (pre[j] != '\0') {
+            xp[j] = pre[j];
+            j++;
+        }
+        xfd = sys_call3(SYS_open,
+                        (long)(uintptr_t)"/bin/pidtest", 0, 0);
+        if (xfd >= 10)
+            xp[j++] = (char)('0' + xfd / 10);
+        xp[j++] = (char)('0' + xfd % 10);
+        xp[j] = '\0';
+        sys_call3(SYS_lseek, xfd, 5, 0);
+        n = read_file(xp, ib, sizeof(ib));
+        ok = n > 0 && contains(ib, n, "pos:\t5\n") &&
+             contains(ib, n, "flags:\t0\n") &&
+             contains(ib, n, "mnt_id:\t1\n") &&
+             contains(ib, n, "ino:\t");
+        got = read_dents("/proc/self/fdinfo", db,
+                         sizeof(db));
+        ok = ok && got > 0 &&
+             dent_type(db, got, "0") == 8;
+        got = read_dents("/proc/self", db, sizeof(db));
+        ok = ok && got > 0 &&
+             dent_type(db, got, "fdinfo") == 4;
+        ok = ok && sys_call3(SYS_open,
+                             (long)(uintptr_t)
+                                 "/proc/self/fdinfo/99",
+                             0, 0) == -2;
+        if (xfd >= 0)
+            sys_call1(SYS_close, xfd);
+        report("fdinfo", ok);
     }
 
     out("PIDTEST DONE\n");

@@ -656,8 +656,19 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   后 nlink=2、经一名字写入另一名字可见、
   unlink 后计数回落、两条规则），ramfs 与
   yfs 各跑一遍。
-- ⏳ 下一步候选：/proc/<pid>/fdinfo、
-  renameat2 余下 flags、inotify 盘点。
+- ✅ /proc/<pid>/fdinfo M45（2026-11-03）：
+  /proc 线收官——pid 目录十一项。fdinfo 子
+  目录按 fd 号列生成式小文件（DT_REG），内
+  容 pos（当前偏移）/flags（八进制）/
+  mnt_id（ramfs 1、yfs 2、其他 0）/ino；存
+  在性规则同 fd 链接。验收途中挖出 M41 测试
+  的潜伏 bug：pidtest 的 fd-dir 场景把 pipe
+  的 int 对装进 long 数组，收尾 close 了错
+  位的值、误关 fd 0——已改为 int[2]。
+  验收：pidtest 加 fdinfo（内容四行、目录
+  列表类型、pid 目录新项、坏 fd ENOENT）。
+- ⏳ 下一步候选：renameat2 余下 flags
+  （EXCHANGE）、inotify 盘点、/dev 盘点。
 
 ## 从零构建
 
