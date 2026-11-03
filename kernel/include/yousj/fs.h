@@ -121,6 +121,11 @@ struct yousj_file {
     struct yousj_usock *usock;    /* non-NULL: an unconnected
                                       or listening named-socket
                                       endpoint (M68) */
+    uint32_t so_opts;              /* M71: SOL_SOCKET boolean
+                                      option ledger (bits in
+                                      the syscall layer) */
+    int32_t so_rcvbuf;             /* M71: 0 = unset */
+    int32_t so_sndbuf;             /* M71: 0 = unset */
     struct yousj_epoll *epoll;     /* non-NULL: an epoll set (M18) */
     struct yousj_inotify *inotify; /* non-NULL: an inotify
                                       instance (M48) */

@@ -162,6 +162,9 @@
 #define YOUSJ_SYS_recvmsg     47    /* M69 */
 #define YOUSJ_SYS_getsockname 51    /* M69 */
 #define YOUSJ_SYS_getpeername 52    /* M69 */
+#define YOUSJ_SYS_setsockopt 54     /* M71 */
+#define YOUSJ_SYS_getsockopt 55     /* M71 */
+#define YOUSJ_SYS_accept4 288       /* M71 */
 #define YOUSJ_SYS_setpgid     109   /* M65 */
 #define YOUSJ_SYS_getpgrp     111   /* M65 */
 #define YOUSJ_SYS_setsid      112   /* M65 */

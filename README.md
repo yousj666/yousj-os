@@ -1234,11 +1234,38 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   在数据报端点上即无地
   址收发。socktest 新增
   dgram 场景（共 10）。
-- ⏳ 下一步候选：
-  setsockopt/getsockopt
-  常用项＋accept4，或
-  SCM_RIGHTS 传 fd，或
-  抽象地址（@路径）。
+- ✅ socket 选项与
+  accept4 M71（2026-11-
+  04）：setsockopt(54)/
+  getsockopt(55) 的 SOL_
+  SOCKET 面做记账式支
+  持：REUSEADDR/REUSE-
+  PORT/KEEPALIVE/DONT-
+  ROUTE/BROADCAST/PASS-
+  CRED 六个布尔项存读一
+  致，RCVBUF/SNDBUF 记
+  值（钳制后回读，未设
+  报默认 4096），SO_TYPE
+  报真实类型、SO_ERROR
+  恒 0；未知选项与非
+  SOL_SOCKET 层一律
+  ENOPROTOOPT，如
+  Linux。账本挂在 file
+  上（dup/fork 共享，与
+  选项属于 socket 本身
+  的语义一致）。accept4
+  (288)：NONBLOCK/CLO-
+  EXEC 落在新连接上，未
+  知标志位先行回 EINVAL。
+  socktest 新增 sockopt
+  场景（共 11）。
+- ⏳ 下一步：转入网络
+  栈战线——virtio-net 驱
+  动与链路层（帧收发＋
+  ARP），为 IPv4/UDP/
+  TCP 与 AF_INET 铺路；
+  SCM_RIGHTS 与抽象地
+  址留在 socket 面待办。
 
 ## 从零构建
 

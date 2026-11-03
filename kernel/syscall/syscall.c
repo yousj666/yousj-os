@@ -194,6 +194,7 @@ void syscall_init(void)
 #define YOUSJ_ECONNREFUSED 111 /* M68 */
 #define YOUSJ_EDESTADDRREQ 89  /* M70 */
 #define YOUSJ_EMSGSIZE 90      /* M70 */
+#define YOUSJ_ENOPROTOOPT 92   /* M71 */
 #define YOUSJ_ERANGE 34  /* M9 */
 #define YOUSJ_ENOSYS 38
 #define YOUSJ_ETIMEDOUT 110 /* M50 */
@@ -3907,14 +3908,16 @@ static long sys_connect(long fd, uint64_t addr_ptr, long addrlen)
     return fs_usock_connect(f, resolved);
 }
 
-static long sys_accept(long fd, uint64_t addr_ptr,
-                       uint64_t addrlen_ptr)
+static long sys_accept_flags(long fd, uint64_t addr_ptr,
+                             uint64_t addrlen_ptr, long flags)
 {
     struct task *me = sched_current();
     struct yousj_file *f = fd_file_of(me, fd);
     struct yousj_file *nf;
     long rc, nfd;
 
+    if (flags & ~(0x800L | 0x80000L)) /* NONBLOCK | CLOEXEC */
+        return -YOUSJ_EINVAL;
     if (f == NULL)
         return -YOUSJ_EBADF;
     if (f->usock == NULL)
@@ -3935,11 +3938,15 @@ static long sys_accept(long fd, uint64_t addr_ptr,
     }
     if (rc != 0)
         return rc;
+    if (flags & 0x800L) /* SOCK_NONBLOCK lands on the file */
+        nf->flags |= YOUSJ_O_NONBLOCK;
     nfd = fd_alloc(me, nf);
     if (nfd < 0) {
         file_put(nf);
         return nfd;
     }
+    if (flags & 0x80000L) /* SOCK_CLOEXEC */
+        me->files->fd_cloexec |= (uint16_t)(1u << nfd);
     if (addr_ptr != 0 && user_range_ok(addr_ptr, 2)) {
         /* The peer is anonymous: family and an empty path. */
         ((uint8_t *)(uintptr_t)addr_ptr)[0] = 1;
@@ -3949,6 +3956,12 @@ static long sys_accept(long fd, uint64_t addr_ptr,
             *(uint32_t *)(uintptr_t)addrlen_ptr = 2;
     }
     return nfd;
+}
+
+static long sys_accept(long fd, uint64_t addr_ptr,
+                       uint64_t addrlen_ptr)
+{
+    return sys_accept_flags(fd, addr_ptr, addrlen_ptr, 0);
 }
 
 /* --- M69: send/recv family and socket names ----------------
@@ -4339,6 +4352,145 @@ static long sys_getname(long fd, uint64_t addr_ptr,
     if (!peer && f->usock != NULL)
         path = f->usock->bound_path;
     return put_sockaddr_un(addr_ptr, addrlen_ptr, path);
+}
+
+/* --- M71: socket options -----------------------------------
+ * Real programs set options at startup and die on ENOSYS, so
+ * the SOL_SOCKET surface is a ledger: booleans are recorded
+ * in the file's so_opts bits and read back faithfully, buffer
+ * sizes are recorded (clamped), SO_TYPE and SO_ERROR report
+ * the truth (stream/datagram, no pending error). Anything
+ * else -- a TCP-level option on a unix socket, an unknown
+ * name -- fails ENOPROTOOPT as on Linux. The ledger lives on
+ * the file, so dup shares it and fork keeps it, matching how
+ * the options belong to the socket, not the descriptor. */
+
+#define YOUSJ_SOL_SOCKET 1
+#define YOUSJ_SO_TYPE 3
+#define YOUSJ_SO_ERROR 4
+#define YOUSJ_SO_DONTROUTE 5
+#define YOUSJ_SO_BROADCAST 6
+#define YOUSJ_SO_SNDBUF 7
+#define YOUSJ_SO_RCVBUF 8
+#define YOUSJ_SO_KEEPALIVE 9
+#define YOUSJ_SO_REUSEADDR 2
+#define YOUSJ_SO_REUSEPORT 15
+#define YOUSJ_SO_PASSCRED 16
+/* so_opts bit positions */
+#define SO_BIT_REUSEADDR 0
+#define SO_BIT_REUSEPORT 1
+#define SO_BIT_KEEPALIVE 2
+#define SO_BIT_DONTROUTE 3
+#define SO_BIT_BROADCAST 4
+#define SO_BIT_PASSCRED 5
+
+static int so_bit_for(long optname)
+{
+    switch (optname) {
+    case YOUSJ_SO_REUSEADDR:
+        return SO_BIT_REUSEADDR;
+    case YOUSJ_SO_REUSEPORT:
+        return SO_BIT_REUSEPORT;
+    case YOUSJ_SO_KEEPALIVE:
+        return SO_BIT_KEEPALIVE;
+    case YOUSJ_SO_DONTROUTE:
+        return SO_BIT_DONTROUTE;
+    case YOUSJ_SO_BROADCAST:
+        return SO_BIT_BROADCAST;
+    case YOUSJ_SO_PASSCRED:
+        return SO_BIT_PASSCRED;
+    default:
+        return -1;
+    }
+}
+
+static bool file_is_socket(struct yousj_file *f)
+{
+    return f->spair != NULL || f->usock != NULL;
+}
+
+static long sys_setsockopt(long fd, long level, long optname,
+                           uint64_t optval_ptr, long optlen)
+{
+    struct yousj_file *f = fd_file_of(sched_current(), fd);
+    int32_t val;
+    int bit;
+
+    if (f == NULL)
+        return -YOUSJ_EBADF;
+    if (!file_is_socket(f))
+        return -YOUSJ_ENOTSOCK;
+    if (level != YOUSJ_SOL_SOCKET)
+        return -YOUSJ_ENOPROTOOPT;
+    bit = so_bit_for(optname);
+    if (bit >= 0 || optname == YOUSJ_SO_RCVBUF ||
+        optname == YOUSJ_SO_SNDBUF) {
+        if (optlen < 4)
+            return -YOUSJ_EINVAL;
+        if (!user_range_ok(optval_ptr, 4))
+            return -YOUSJ_EFAULT;
+        val = *(const int32_t *)(uintptr_t)optval_ptr;
+        if (bit >= 0) {
+            if (val != 0)
+                f->so_opts |= (uint32_t)(1u << bit);
+            else
+                f->so_opts &= ~(uint32_t)(1u << bit);
+            return 0;
+        }
+        if (val < 1024)
+            val = 1024;
+        if (val > (1 << 20))
+            val = 1 << 20;
+        if (optname == YOUSJ_SO_RCVBUF)
+            f->so_rcvbuf = val;
+        else
+            f->so_sndbuf = val;
+        return 0;
+    }
+    return -YOUSJ_ENOPROTOOPT; /* SO_TYPE/SO_ERROR are
+                                  read-only; the rest unknown */
+}
+
+static long sys_getsockopt(long fd, long level, long optname,
+                           uint64_t optval_ptr,
+                           uint64_t optlen_ptr)
+{
+    struct yousj_file *f = fd_file_of(sched_current(), fd);
+    int32_t val;
+    uint32_t cap, n, i;
+    int bit;
+
+    if (f == NULL)
+        return -YOUSJ_EBADF;
+    if (!file_is_socket(f))
+        return -YOUSJ_ENOTSOCK;
+    if (level != YOUSJ_SOL_SOCKET)
+        return -YOUSJ_ENOPROTOOPT;
+    bit = so_bit_for(optname);
+    if (optname == YOUSJ_SO_TYPE)
+        val = f->usock != NULL ? f->usock->type : 1;
+    else if (optname == YOUSJ_SO_ERROR)
+        val = 0; /* no pending error is ever recorded */
+    else if (optname == YOUSJ_SO_RCVBUF)
+        val = f->so_rcvbuf != 0 ? f->so_rcvbuf : 4096;
+    else if (optname == YOUSJ_SO_SNDBUF)
+        val = f->so_sndbuf != 0 ? f->so_sndbuf : 4096;
+    else if (bit >= 0)
+        val = (f->so_opts & (uint32_t)(1u << bit)) != 0 ? 1 : 0;
+    else
+        return -YOUSJ_ENOPROTOOPT;
+    if (optval_ptr == 0 || optlen_ptr == 0)
+        return -YOUSJ_EFAULT;
+    if (!user_range_ok(optlen_ptr, 4) ||
+        !user_range_ok(optval_ptr, 4))
+        return -YOUSJ_EFAULT;
+    cap = *(uint32_t *)(uintptr_t)optlen_ptr;
+    n = cap < 4 ? cap : 4;
+    for (i = 0; i < n; i++)
+        ((uint8_t *)(uintptr_t)optval_ptr)[i] =
+            (uint8_t)((uint32_t)val >> (8 * i));
+    *(uint32_t *)(uintptr_t)optlen_ptr = 4;
+    return 0;
 }
 
 static long sys_shutdown(long fd, long how)
@@ -5485,6 +5637,14 @@ static long dispatch_inner(struct yousj_syscall_ctx *ctx)
         return sys_getname((long)a1, a2, a3, false);
     case YOUSJ_SYS_getpeername:
         return sys_getname((long)a1, a2, a3, true);
+    case YOUSJ_SYS_setsockopt:
+        return sys_setsockopt((long)a1, (long)a2, (long)a3,
+                              a4, (long)a5);
+    case YOUSJ_SYS_getsockopt:
+        return sys_getsockopt((long)a1, (long)a2, (long)a3,
+                              a4, a5);
+    case YOUSJ_SYS_accept4:
+        return sys_accept_flags((long)a1, a2, a3, (long)a4);
     case YOUSJ_SYS_socket:
         return sys_socket((long)a1, (long)a2, (long)a3);
     case YOUSJ_SYS_bind:

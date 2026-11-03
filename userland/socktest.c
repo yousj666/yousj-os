@@ -47,6 +47,10 @@
 #define SYS_getsockname  51
 #define SYS_getpeername  52
 #define SYS_socketpair   53
+#define SYS_setsockopt   54
+#define SYS_getsockopt   55
+#define SYS_fcntl        72
+#define SYS_accept4      288
 #define SYS_clone        56
 #define SYS_wait4        61
 #define SYS_unlink       87
@@ -774,6 +778,113 @@ static void t_dgram(void)
     report2("dgram", ok, r);
 }
 
+/* M71: the SOL_SOCKET ledger and accept4 */
+static long getopt_i32(long fd, long name, int32_t *out)
+{
+    uint32_t len = 4;
+    long r = sys_call6(SYS_getsockopt, fd, 1, name,
+                       (long)(uintptr_t)out,
+                       (long)(uintptr_t)&len, 0);
+    if (r == 0 && len != 4)
+        return -1000;
+    return r;
+}
+
+static void t_sockopt(void)
+{
+    struct sockaddr_un_k un;
+    int32_t v;
+    int ok = 1;
+    long r, s, d, fd, cli, acc;
+
+    s = sys_call3(SYS_socket, AF_UNIX, SOCK_STREAM, 0);
+    d = sys_call3(SYS_socket, AF_UNIX, 2, 0);
+    ok = ok && s >= 0 && d >= 0;
+
+    /* a plain file is not a socket */
+    fd = sys_call3(SYS_open, (long)(uintptr_t)"/sockopt.tmp",
+                   0x41, 0644);
+    v = 1;
+    r = sys_call6(SYS_setsockopt, fd, 1, 2, (long)(uintptr_t)&v,
+                  4, 0);
+    ok = ok && r == -88; /* ENOTSOCK */
+    sys_call3(SYS_close, fd, 0, 0);
+    sys_call3(SYS_unlink, (long)(uintptr_t)"/sockopt.tmp", 0, 0);
+
+    /* the boolean ledger round-trips */
+    v = 1;
+    r = sys_call6(SYS_setsockopt, s, 1, 2 /* REUSEADDR */,
+                  (long)(uintptr_t)&v, 4, 0);
+    ok = ok && r == 0;
+    v = 0;
+    ok = ok && getopt_i32(s, 2, &v) == 0 && v == 1;
+    v = 0;
+    sys_call6(SYS_setsockopt, s, 1, 2, (long)(uintptr_t)&v, 4,
+              0);
+    v = 9;
+    ok = ok && getopt_i32(s, 2, &v) == 0 && v == 0;
+
+    /* buffer sizes record and report; an untouched datagram
+     * socket reports the default */
+    v = 8192;
+    r = sys_call6(SYS_setsockopt, s, 1, 8 /* RCVBUF */,
+                  (long)(uintptr_t)&v, 4, 0);
+    ok = ok && r == 0;
+    v = 0;
+    ok = ok && getopt_i32(s, 8, &v) == 0 && v == 8192;
+    v = 0;
+    ok = ok && getopt_i32(d, 8, &v) == 0 && v == 4096;
+
+    /* type and the (always clear) error slot */
+    v = 0;
+    ok = ok && getopt_i32(s, 3, &v) == 0 && v == 1;
+    v = 0;
+    ok = ok && getopt_i32(d, 3, &v) == 0 && v == 2;
+    v = 7;
+    ok = ok && getopt_i32(s, 4, &v) == 0 && v == 0;
+
+    /* refusals: unknown name, wrong level, short value,
+     * setting a read-only option */
+    v = 1;
+    r = sys_call6(SYS_setsockopt, s, 1, 999,
+                  (long)(uintptr_t)&v, 4, 0);
+    ok = ok && r == -92; /* ENOPROTOOPT */
+    r = sys_call6(SYS_setsockopt, s, 6 /* IPPROTO_TCP */, 2,
+                  (long)(uintptr_t)&v, 4, 0);
+    ok = ok && r == -92;
+    r = sys_call6(SYS_setsockopt, s, 1, 2,
+                  (long)(uintptr_t)&v, 2, 0);
+    ok = ok && r == -22; /* EINVAL */
+    r = sys_call6(SYS_setsockopt, s, 1, 3 /* SO_TYPE */,
+                  (long)(uintptr_t)&v, 4, 0);
+    ok = ok && r == -92;
+    r = getopt_i32(s, 999, &v);
+    ok = ok && r == -92;
+
+    /* accept4: flags land on the accepted socket */
+    ok = ok && do_bind(s, "/o1.sock") == 0;
+    ok = ok && sys_call3(SYS_listen, s, 2, 0) == 0;
+    cli = sys_call3(SYS_socket, AF_UNIX, SOCK_STREAM, 0);
+    fill_addr(&un, "/o1.sock");
+    ok = ok && sys_call3(SYS_connect, cli,
+                         (long)(uintptr_t)&un, 110) == 0;
+    acc = sys_call4(SYS_accept4, s, 0, 0,
+                    0x800 | 0x80000); /* NONBLOCK|CLOEXEC */
+    ok = ok && acc >= 0;
+    r = sys_call3(SYS_fcntl, acc, 3 /* F_GETFL */, 0);
+    ok = ok && (r & 0x800) != 0; /* O_NONBLOCK */
+    r = sys_call3(SYS_fcntl, acc, 1 /* F_GETFD */, 0);
+    ok = ok && (r & 1) != 0; /* FD_CLOEXEC */
+    r = sys_call4(SYS_accept4, s, 0, 0, 0x4000);
+    ok = ok && r == -22; /* unknown flag bits */
+    sys_call3(SYS_close, acc, 0, 0);
+    sys_call3(SYS_close, cli, 0, 0);
+    sys_call3(SYS_close, s, 0, 0);
+    sys_call3(SYS_close, d, 0, 0);
+    sys_call3(SYS_unlink, (long)(uintptr_t)"/o1.sock", 0, 0);
+    report2("sockopt", ok, r);
+}
+
 int main(void)
 {
     out("socktest: M68 named AF_UNIX sockets\n");
@@ -787,6 +898,7 @@ int main(void)
     t_fork();
     t_msgio();
     t_dgram();
+    t_sockopt();
     out("SOCKTEST DONE\n");
     return failures ? 1 : 0;
 }
