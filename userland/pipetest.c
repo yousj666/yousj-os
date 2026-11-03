@@ -327,7 +327,7 @@ static void t_sockpair(void)
     /* rejects: wrong family, wrong type */
     ok = ok && sys_call4(SYS_socketpair, 2, 1, 0,
                          (long)(uintptr_t)sv) == -97;
-    ok = ok && sys_call4(SYS_socketpair, 1, 2, 0,
+    ok = ok && sys_call4(SYS_socketpair, 1, 3, 0,
                          (long)(uintptr_t)sv) == -93;
     if (sys_call4(SYS_socketpair, 1, 1, 0,
                   (long)(uintptr_t)sv) != 0) {

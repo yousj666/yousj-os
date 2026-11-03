@@ -1204,11 +1204,41 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   musl 程序从此调得到。
   socktest 新增 msgio 场
   景（共 9）。
+- ✅ SOCK_DGRAM 数据报
+  M70（2026-11-04）：数
+  据报端点（type 2）带包
+  队列（深度 8、单包上限
+  1024B，超长回 EMSGS-
+  IZE）——保消息边界、包
+  上带发送方绑定路径与
+  来源端点；sendto 按目
+  标路径投递（无此路径
+  ENOENT、不是数据报端
+  点 ECONNREFUSED），
+  recvfrom 回填来源（匿
+  名发送方报空路径）；
+  MSG_TRUNC 报告包的真
+  实长度、截断即消费；
+  connect 给数据报设默
+  认对端（sendto 无地址
+  与 write 走默认端，没
+  设过回 EDESTADDRREQ），
+  已连接的接收方按来源
+  端点过滤、别人的包静
+  默丢弃（如 Linux）；
+  getpeername 报告默认对
+  端；listen 在数据报上
+  回 EOPNOTSUPP；数据报
+  型 socketpair 两端互为
+  默认对端。read/write
+  在数据报端点上即无地
+  址收发。socktest 新增
+  dgram 场景（共 10）。
 - ⏳ 下一步候选：
-  SOCK_DGRAM 数据报（无
-  连接、按路径 sendto），
-  或 setsockopt/getsockopt
-  常用项，或 accept4。
+  setsockopt/getsockopt
+  常用项＋accept4，或
+  SCM_RIGHTS 传 fd，或
+  抽象地址（@路径）。
 
 ## 从零构建
 

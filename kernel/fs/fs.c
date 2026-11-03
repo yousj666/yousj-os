@@ -39,6 +39,7 @@
 #define YOUSJ_EOPNOTSUPP_L 95  /* M68 */
 #define YOUSJ_ECONNREFUSED_L 111 /* M68 */
 #define YOUSJ_EAGAIN_L 11      /* M68 */
+#define YOUSJ_EDESTADDRREQ_L 89 /* M70 */
 
 static uint64_t str_len(const char *s); /* defined below */
 
@@ -839,6 +840,18 @@ static void usock_release(struct yousj_file *f)
             sp->in_use = false;
     }
     u->pend_count = 0;
+    /* M70: nobody may keep pointing at a dead datagram
+     * endpoint (the pool is tiny; a full scan is cheap). */
+    for (i = 0; i < MAX_USOCKS; i++) {
+        if (g_usocks[i].in_use && g_usocks[i].dgram_peer == u) {
+            g_usocks[i].dgram_peer = NULL;
+            g_usocks[i].dgram_connected = false;
+        }
+    }
+    u->dgram_peer = NULL;
+    u->dgram_connected = false;
+    u->rx_count = 0;
+    u->rx_head = 0;
     /* The bound node outlives the endpoint (as on Linux);
      * it just stops reaching anyone. */
     if (u->node != NULL) {
@@ -849,7 +862,7 @@ static void usock_release(struct yousj_file *f)
     u->in_use = false;
 }
 
-long fs_usock_create(struct yousj_file **out)
+long fs_usock_create(struct yousj_file **out, int type)
 {
     struct yousj_usock *u = NULL;
     struct yousj_file *f;
@@ -869,6 +882,7 @@ long fs_usock_create(struct yousj_file **out)
     mem_zero((uint8_t *)u, sizeof(*u));
     u->in_use = true;
     u->state = 0;
+    u->type = (uint8_t)type;
     f->usock = u;
     f->flags = YOUSJ_O_RDWR;
     *out = f;
@@ -993,6 +1007,147 @@ long fs_usock_accept_try(struct yousj_file *f,
     nf->flags = YOUSJ_O_RDWR;
     *out = nf;
     return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* M70: datagram service. Delivery is one bounded copy into the
+ * destination's packet queue; a full queue reports EAGAIN and
+ * the syscall layer applies the blocking protocol. A receiver
+ * that connect()ed only takes packets from its chosen peer --
+ * anything else is dropped on the floor, successfully as far
+ * as the sender can tell, exactly like Linux. */
+
+static long dgram_deliver(struct yousj_usock *src,
+                          struct yousj_usock *dst,
+                          const uint8_t *data, uint32_t len)
+{
+    struct yousj_dgram_pkt *p;
+    uint32_t i;
+
+    if (dst->dgram_connected && dst->dgram_peer != src)
+        return 0; /* filtered: silently dropped */
+    if (dst->rx_count >= YOUSJ_DGRAM_QUEUE)
+        return -YOUSJ_EAGAIN_L;
+    p = &dst->rxq[(dst->rx_head + dst->rx_count) %
+                  YOUSJ_DGRAM_QUEUE];
+    p->len = len;
+    p->src = src;
+    for (i = 0; i < 108; i++) {
+        p->from[i] = src->bound_path[i];
+        if (src->bound_path[i] == '\0')
+            break;
+    }
+    for (i = 0; i < len; i++)
+        p->data[i] = data[i];
+    dst->rx_count++;
+    return 0;
+}
+
+long fs_dgram_pair_create(struct yousj_file **a_out,
+                          struct yousj_file **b_out)
+{
+    struct yousj_file *a, *b;
+    long rc;
+
+    rc = fs_usock_create(&a, 2);
+    if (rc != 0)
+        return rc;
+    rc = fs_usock_create(&b, 2);
+    if (rc != 0) {
+        file_put(a);
+        return rc;
+    }
+    a->usock->dgram_peer = b->usock;
+    b->usock->dgram_peer = a->usock;
+    a->usock->dgram_connected = true;
+    b->usock->dgram_connected = true;
+    *a_out = a;
+    *b_out = b;
+    return 0;
+}
+
+long fs_usock_connect_dgram(struct yousj_file *f,
+                            const char *path)
+{
+    char resolved[PATH_MAX_LEN + 1];
+    struct yousj_ramfs_node *n;
+    long rc;
+
+    rc = fs_resolve_links(path, resolved, false);
+    if (rc != 0)
+        return rc;
+    if (is_data_path(resolved) || is_proc_path(resolved))
+        return -YOUSJ_ECONNREFUSED_L;
+    n = fs_lookup(resolved);
+    if (n == NULL)
+        return -YOUSJ_ENOENT_L;
+    if (!n->is_sock || n->sock_owner == NULL ||
+        n->sock_owner->type != 2)
+        return -YOUSJ_ECONNREFUSED_L;
+    f->usock->dgram_peer = n->sock_owner;
+    f->usock->dgram_connected = true;
+    return 0;
+}
+
+long fs_dgram_send_path(struct yousj_file *from,
+                        const char *path, const uint8_t *data,
+                        uint32_t len)
+{
+    char resolved[PATH_MAX_LEN + 1];
+    struct yousj_ramfs_node *n;
+    long rc;
+
+    rc = fs_resolve_links(path, resolved, false);
+    if (rc != 0)
+        return rc;
+    if (is_data_path(resolved) || is_proc_path(resolved))
+        return -YOUSJ_ECONNREFUSED_L;
+    n = fs_lookup(resolved);
+    if (n == NULL)
+        return -YOUSJ_ENOENT_L;
+    if (!n->is_sock || n->sock_owner == NULL ||
+        n->sock_owner->type != 2)
+        return -YOUSJ_ECONNREFUSED_L;
+    return dgram_deliver(from->usock, n->sock_owner, data, len);
+}
+
+long fs_dgram_send_peer(struct yousj_file *from,
+                        const uint8_t *data, uint32_t len)
+{
+    struct yousj_usock *dst = from->usock->dgram_peer;
+
+    if (dst == NULL)
+        return -YOUSJ_EDESTADDRREQ_L; /* never aimed anywhere */
+    if (!dst->in_use)
+        return -YOUSJ_ECONNREFUSED_L;
+    return dgram_deliver(from->usock, dst, data, len);
+}
+
+long fs_dgram_recv_try(struct yousj_file *f, uint8_t *dst,
+                       uint64_t cap, bool peek,
+                       uint32_t *real_len_out, char *from_out)
+{
+    struct yousj_usock *u = f->usock;
+    struct yousj_dgram_pkt *p;
+    uint64_t n, i;
+
+    if (u == NULL || u->type != 2)
+        return -YOUSJ_EINVAL_L;
+    if (u->rx_count == 0)
+        return -YOUSJ_EAGAIN_L;
+    p = &u->rxq[u->rx_head];
+    *real_len_out = p->len;
+    for (i = 0; p->from[i] != '\0' && i < 107; i++)
+        from_out[i] = p->from[i];
+    from_out[i] = '\0';
+    n = cap < p->len ? cap : p->len;
+    for (i = 0; i < n; i++)
+        dst[i] = p->data[i];
+    if (!peek) {
+        u->rx_head = (u->rx_head + 1) % YOUSJ_DGRAM_QUEUE;
+        u->rx_count--;
+    }
+    return (long)n;
 }
 
 /* ------------------------------------------------------------------ */

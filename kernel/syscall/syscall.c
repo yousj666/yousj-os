@@ -76,9 +76,16 @@ static long sys_recv_sock(struct yousj_file *f, uint64_t buf,
                           uint64_t count, long flags); /* M69 */
 static long sys_send_sock(struct yousj_file *f, uint64_t buf,
                           uint64_t len, long flags);   /* M69 */
+static long sys_send_dgram(struct yousj_file *f, uint64_t buf,
+                           uint64_t len, long flags,
+                           const char *path);            /* M70 */
+static long sys_recv_dgram(struct yousj_file *f, uint64_t buf,
+                           uint64_t len, long flags,
+                           char *from_out);              /* M70 */
 
 /* M69: MSG_* bits (the generic x86-64 values). */
 #define YOUSJ_MSG_PEEK     2
+#define YOUSJ_MSG_TRUNC    0x20 /* M70 */
 #define YOUSJ_MSG_DONTWAIT 0x40
 #define YOUSJ_MSG_WAITALL  0x100
 #define YOUSJ_MSG_NOSIGNAL 0x4000
@@ -185,6 +192,8 @@ void syscall_init(void)
 #define YOUSJ_EISCONN 106      /* M68 */
 #define YOUSJ_ENOTCONN 107     /* M68 */
 #define YOUSJ_ECONNREFUSED 111 /* M68 */
+#define YOUSJ_EDESTADDRREQ 89  /* M70 */
+#define YOUSJ_EMSGSIZE 90      /* M70 */
 #define YOUSJ_ERANGE 34  /* M9 */
 #define YOUSJ_ENOSYS 38
 #define YOUSJ_ETIMEDOUT 110 /* M50 */
@@ -273,8 +282,10 @@ static long sys_write(long fd, uint64_t buf, uint64_t len)
         return sys_write_pipe(f, buf, len);
     if (f->spair != NULL) /* M67 */
         return sys_write_sock(f, buf, len);
-    if (f->usock != NULL) /* M68: not connected */
-        return -YOUSJ_ENOTCONN;
+    if (f->usock != NULL) /* M68/M70 */
+        return f->usock->type == 2
+                   ? sys_send_dgram(f, buf, len, 0, NULL)
+                   : -YOUSJ_ENOTCONN;
     if (f->backend == 0 && f->node == NULL)
         return sys_write_console(buf, len);
     if (len == 0)
@@ -1489,8 +1500,10 @@ static long sys_read(long fd, uint64_t buf, uint64_t count)
         return sys_read_pipe(f, buf, count);
     if (f->spair != NULL) /* M67 */
         return sys_read_sock(f, buf, count);
-    if (f->usock != NULL) /* M68: not connected */
-        return -YOUSJ_ENOTCONN;
+    if (f->usock != NULL) /* M68/M70 */
+        return f->usock->type == 2
+                   ? sys_recv_dgram(f, buf, count, 0, NULL)
+                   : -YOUSJ_ENOTCONN;
     if (f->inotify != NULL) { /* M48 */
         if (count == 0)
             return 0;
@@ -2813,11 +2826,18 @@ static short fd_ready_file(struct yousj_file *f, long fd,
         return (short)((rev & (POLLERR_K | POLLHUP_K)) |
                        (rev & events));
     }
-    if (f->usock != NULL) { /* M68: a listening socket is
+    if (f->usock != NULL) { /* M68/M70: a listening socket is
                              * readable with a pending
-                             * connection; other endpoint states
-                             * are never ready */
-        if (f->usock->state == 2 && f->usock->pend_count > 0)
+                             * connection; a datagram socket is
+                             * readable with a queued packet and
+                             * always writable (blocking happens
+                             * at the destination's queue) */
+        if (f->usock->type == 2) {
+            if (f->usock->rx_count > 0)
+                rev |= POLLIN_K;
+            rev |= POLLOUT_K;
+        } else if (f->usock->state == 2 &&
+                   f->usock->pend_count > 0)
             rev |= POLLIN_K;
         return (short)(rev & events);
     }
@@ -3731,11 +3751,14 @@ static long sys_socketpair(long domain, long type,
 
     if (domain != 1) /* AF_UNIX only -- there is no stack */
         return -YOUSJ_EAFNOSUPPORT;
-    if ((type & ~(0x800L | 0x80000L)) != 1 || protocol != 0)
-        return -YOUSJ_EPROTONOSUPPORT; /* SOCK_STREAM only */
+    if (((type & ~(0x800L | 0x80000L)) != 1 &&
+         (type & ~(0x800L | 0x80000L)) != 2) || protocol != 0)
+        return -YOUSJ_EPROTONOSUPPORT; /* STREAM or DGRAM */
     if (!user_range_ok(sv_ptr, 8))
         return -YOUSJ_EFAULT;
-    rc = fs_sockpair_create(&a, &b);
+    rc = (type & ~(0x800L | 0x80000L)) == 2
+             ? fs_dgram_pair_create(&a, &b) /* M70 */
+             : fs_sockpair_create(&a, &b);
     if (rc != 0)
         return rc;
     if (type & 0x800L) { /* SOCK_NONBLOCK */
@@ -3811,13 +3834,14 @@ static long sys_socket(long domain, long type, long protocol)
 {
     struct task *me = sched_current();
     struct yousj_file *f;
+    long base = type & ~(0x800L | 0x80000L);
     long rc, fd;
 
     if (domain != 1) /* AF_UNIX only */
         return -YOUSJ_EAFNOSUPPORT;
-    if ((type & ~(0x800L | 0x80000L)) != 1 || protocol != 0)
-        return -YOUSJ_EPROTONOSUPPORT; /* SOCK_STREAM only */
-    rc = fs_usock_create(&f);
+    if ((base != 1 && base != 2) || protocol != 0)
+        return -YOUSJ_EPROTONOSUPPORT; /* STREAM or DGRAM */
+    rc = fs_usock_create(&f, (int)base);
     if (rc != 0)
         return rc;
     if (type & 0x800L) /* SOCK_NONBLOCK */
@@ -3857,6 +3881,8 @@ static long sys_listen(long fd, long backlog)
         return -YOUSJ_EBADF;
     if (f->usock == NULL)
         return -YOUSJ_ENOTSOCK;
+    if (f->usock->type == 2)
+        return -YOUSJ_EOPNOTSUPP; /* datagrams do not listen */
     return fs_usock_listen(f, backlog);
 }
 
@@ -3876,6 +3902,8 @@ static long sys_connect(long fd, uint64_t addr_ptr, long addrlen)
     rc = sock_resolve(me, addr_ptr, addrlen, resolved);
     if (rc != 0)
         return rc;
+    if (f->usock->type == 2) /* M70: aim a datagram endpoint */
+        return fs_usock_connect_dgram(f, resolved);
     return fs_usock_connect(f, resolved);
 }
 
@@ -3982,15 +4010,112 @@ static long put_sockaddr_un(uint64_t addr_ptr,
     return 0;
 }
 
-static long sys_sendto(long fd, uint64_t buf, uint64_t len,
-                       long flags, uint64_t addr_ptr)
+/* --- M70: datagram cores ----------------------------------
+ * The payload is staged through a stack buffer: a blocking
+ * send may sleep while another task runs syscalls, so no
+ * static staging (the standing rule for blocking paths).
+ * path == NULL aims at the endpoint's connect() default (or
+ * its socketpair peer). */
+
+static long sys_send_dgram(struct yousj_file *f, uint64_t buf,
+                           uint64_t len, long flags,
+                           const char *path)
 {
-    struct yousj_file *f = fd_file_of(sched_current(), fd);
+    struct task *me = sched_current();
+    uint8_t kbuf[YOUSJ_DGRAM_MAX];
+    bool dontwait = (f->flags & YOUSJ_O_NONBLOCK) != 0 ||
+                    (flags & YOUSJ_MSG_DONTWAIT) != 0;
+    uint64_t i;
+    long rc;
+
+    if (len > YOUSJ_DGRAM_MAX)
+        return -YOUSJ_EMSGSIZE;
+    if (!user_range_ok(buf, len))
+        return -YOUSJ_EFAULT;
+    for (i = 0; i < len; i++)
+        kbuf[i] = ((const uint8_t *)(uintptr_t)buf)[i];
+    for (;;) {
+        rc = path != NULL
+                 ? fs_dgram_send_path(f, path, kbuf,
+                                      (uint32_t)len)
+                 : fs_dgram_send_peer(f, kbuf, (uint32_t)len);
+        if (rc != -YOUSJ_EAGAIN)
+            return rc == 0 ? (long)len : rc;
+        if (dontwait)
+            return -YOUSJ_EAGAIN;
+        if (signal_deliverable_pending(me)) {
+            me->sig_wake = false;
+            return -YOUSJ_ERESTARTSYS;
+        }
+        sched_sleep_ticks(2);
+    }
+}
+
+static long sys_recv_dgram(struct yousj_file *f, uint64_t buf,
+                           uint64_t len, long flags,
+                           char *from_out)
+{
+    struct task *me = sched_current();
+    uint8_t kbuf[YOUSJ_DGRAM_MAX];
+    char from_tmp[108];
+    bool dontwait = (f->flags & YOUSJ_O_NONBLOCK) != 0 ||
+                    (flags & YOUSJ_MSG_DONTWAIT) != 0;
+    uint32_t real = 0;
+    uint64_t i;
+    long rc;
+
+    if (len > 0 && !user_range_ok(buf, len))
+        return -YOUSJ_EFAULT;
+    for (;;) {
+        rc = fs_dgram_recv_try(f, kbuf, len,
+                               (flags & YOUSJ_MSG_PEEK) != 0,
+                               &real, from_tmp);
+        if (rc != -YOUSJ_EAGAIN)
+            break;
+        if (dontwait)
+            return -YOUSJ_EAGAIN;
+        if (signal_deliverable_pending(me)) {
+            me->sig_wake = false;
+            return -YOUSJ_ERESTARTSYS;
+        }
+        sched_sleep_ticks(2);
+    }
+    if (rc < 0)
+        return rc;
+    for (i = 0; i < (uint64_t)rc; i++)
+        ((uint8_t *)(uintptr_t)buf)[i] = kbuf[i];
+    if (from_out != NULL) {
+        for (i = 0; i < 108; i++) {
+            from_out[i] = from_tmp[i];
+            if (from_tmp[i] == '\0')
+                break;
+        }
+    }
+    /* MSG_TRUNC reports the packet's true size */
+    return (flags & YOUSJ_MSG_TRUNC) != 0 ? (long)real : rc;
+}
+
+static long sys_sendto(long fd, uint64_t buf, uint64_t len,
+                       long flags, uint64_t addr_ptr,
+                       long addrlen)
+{
+    struct task *me = sched_current();
+    struct yousj_file *f = fd_file_of(me, fd);
 
     if (f == NULL)
         return -YOUSJ_EBADF;
-    if (f->usock != NULL)
-        return -YOUSJ_ENOTCONN;
+    if (f->usock != NULL) {
+        if (f->usock->type != 2)
+            return -YOUSJ_ENOTCONN; /* a stream endpoint */
+        if (addr_ptr != 0) {
+            char path[256];
+            long rc = sock_resolve(me, addr_ptr, addrlen, path);
+            if (rc != 0)
+                return rc;
+            return sys_send_dgram(f, buf, len, flags, path);
+        }
+        return sys_send_dgram(f, buf, len, flags, NULL);
+    }
     if (f->spair == NULL)
         return -YOUSJ_ENOTSOCK;
     if (addr_ptr != 0)
@@ -4007,8 +4132,16 @@ static long sys_recvfrom(long fd, uint64_t buf, uint64_t len,
 
     if (f == NULL)
         return -YOUSJ_EBADF;
-    if (f->usock != NULL)
-        return -YOUSJ_ENOTCONN;
+    if (f->usock != NULL) {
+        char from[108];
+        if (f->usock->type != 2)
+            return -YOUSJ_ENOTCONN;
+        rc = sys_recv_dgram(f, buf, len, flags, from);
+        if (rc >= 0)
+            put_sockaddr_un(addr_ptr, addrlen_ptr,
+                            from[0] != '\0' ? from : NULL);
+        return rc;
+    }
     if (f->spair == NULL)
         return -YOUSJ_ENOTSOCK;
     rc = sys_recv_sock(f, buf, len, flags);
@@ -4019,17 +4152,48 @@ static long sys_recvfrom(long fd, uint64_t buf, uint64_t len,
 
 static long sys_sendmsg(long fd, uint64_t msg_ptr)
 {
-    struct yousj_file *f = fd_file_of(sched_current(), fd);
+    struct task *me = sched_current();
+    struct yousj_file *f = fd_file_of(me, fd);
     const struct msghdr_k *mh;
     uint64_t done_iov = 0;
     long total = 0;
 
     if (f == NULL)
         return -YOUSJ_EBADF;
-    if (f->usock != NULL)
+    if (f->usock != NULL && f->usock->type != 2)
         return -YOUSJ_ENOTCONN;
-    if (f->spair == NULL)
+    if (f->usock == NULL && f->spair == NULL)
         return -YOUSJ_ENOTSOCK;
+    if (f->usock != NULL) {
+        /* M70: a datagram sendmsg is a single packet: exactly
+         * one non-empty iovec, aimed by msg_name or by the
+         * connect() default. */
+        char path[256];
+        const char *aim = NULL;
+        long rc;
+
+        if (!user_range_ok(msg_ptr, sizeof(struct msghdr_k)))
+            return -YOUSJ_EFAULT;
+        mh = (const struct msghdr_k *)(uintptr_t)msg_ptr;
+        if (mh->controllen != 0)
+            return -YOUSJ_EINVAL;
+        if (mh->iovlen != 1)
+            return -YOUSJ_EINVAL;
+        if (!user_range_ok(mh->iov, sizeof(struct yousj_iovec)))
+            return -YOUSJ_EFAULT;
+        if (mh->name != 0) {
+            rc = sock_resolve(me, mh->name, mh->namelen, path);
+            if (rc != 0)
+                return rc;
+            aim = path;
+        }
+        {
+            const struct yousj_iovec *kv =
+                (const struct yousj_iovec *)(uintptr_t)mh->iov;
+            return sys_send_dgram(f, kv->base, kv->len,
+                                  mh->flags, aim);
+        }
+    }
     if (!user_range_ok(msg_ptr, sizeof(struct msghdr_k)))
         return -YOUSJ_EFAULT;
     mh = (const struct msghdr_k *)(uintptr_t)msg_ptr;
@@ -4076,10 +4240,39 @@ static long sys_recvmsg(long fd, uint64_t msg_ptr)
 
     if (f == NULL)
         return -YOUSJ_EBADF;
-    if (f->usock != NULL)
+    if (f->usock != NULL && f->usock->type != 2)
         return -YOUSJ_ENOTCONN;
-    if (f->spair == NULL)
+    if (f->usock == NULL && f->spair == NULL)
         return -YOUSJ_ENOTSOCK;
+    if (f->usock != NULL) {
+        /* M70: a datagram recvmsg takes one packet into its
+         * first iovec; the sender is reported via msg_name. */
+        char from[108];
+        long rc;
+
+        if (!user_range_ok(msg_ptr, sizeof(struct msghdr_k)))
+            return -YOUSJ_EFAULT;
+        mh = (struct msghdr_k *)(uintptr_t)msg_ptr;
+        if (mh->iovlen < 1)
+            return -YOUSJ_EINVAL;
+        if (!user_range_ok(mh->iov, sizeof(struct yousj_iovec)))
+            return -YOUSJ_EFAULT;
+        {
+            const struct yousj_iovec *kv =
+                (const struct yousj_iovec *)(uintptr_t)mh->iov;
+            rc = sys_recv_dgram(f, kv->base, kv->len,
+                                mh->flags, from);
+        }
+        if (rc >= 0) {
+            if (mh->name != 0)
+                put_sockaddr_un(mh->name, msg_ptr + 8,
+                                from[0] != '\0' ? from : NULL);
+            mh->flags = 0; /* MSG_TRUNC flag reporting in
+                            * msg_flags is not done yet */
+            mh->controllen = 0;
+        }
+        return rc;
+    }
     if (!user_range_ok(msg_ptr, sizeof(struct msghdr_k)))
         return -YOUSJ_EFAULT;
     mh = (struct msghdr_k *)(uintptr_t)msg_ptr;
@@ -4132,7 +4325,16 @@ static long sys_getname(long fd, uint64_t addr_ptr,
         return -YOUSJ_EBADF;
     if (f->spair == NULL && f->usock == NULL)
         return -YOUSJ_ENOTSOCK;
-    if (f->usock != NULL && f->usock->state == 0)
+    if (peer && f->usock != NULL && f->usock->type == 2) {
+        /* M70: a datagram peer exists only after connect() */
+        if (!f->usock->dgram_connected ||
+            f->usock->dgram_peer == NULL)
+            return -YOUSJ_ENOTCONN;
+        path = f->usock->dgram_peer->bound_path;
+        return put_sockaddr_un(addr_ptr, addrlen_ptr, path);
+    }
+    if (f->usock != NULL && f->usock->state == 0 &&
+        f->usock->type == 1)
         return -YOUSJ_EINVAL; /* never bound: no name at all */
     if (!peer && f->usock != NULL)
         path = f->usock->bound_path;
@@ -5271,7 +5473,8 @@ static long dispatch_inner(struct yousj_syscall_ctx *ctx)
     case YOUSJ_SYS_shutdown:
         return sys_shutdown((long)a1, (long)a2);
     case YOUSJ_SYS_sendto:
-        return sys_sendto((long)a1, a2, a3, (long)a4, a5);
+        return sys_sendto((long)a1, a2, a3, (long)a4, a5,
+                          (long)a6);
     case YOUSJ_SYS_recvfrom:
         return sys_recvfrom((long)a1, a2, a3, (long)a4, a5, a6);
     case YOUSJ_SYS_sendmsg:

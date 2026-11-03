@@ -75,15 +75,38 @@ struct yousj_sockpair {
  * sockpairs whose end 1 awaits accept; their ends[1] count
  * is the queue's hold, transferred to the accepted file. */
 #define YOUSJ_USOCK_BACKLOG_MAX 4
+/* M70: datagram service. Each datagram endpoint owns a
+ * packet queue: boundaries are preserved, a packet carries
+ * its sender's bound path ("" = anonymous) and, for the
+ * kernel's connected-peer filtering, its source endpoint. */
+#define YOUSJ_DGRAM_QUEUE 8
+#define YOUSJ_DGRAM_MAX   1024
+struct yousj_dgram_pkt {
+    uint32_t len;
+    struct yousj_usock *src; /* sender (never dereferenced
+                                after queueing, compared only) */
+    char from[108];
+    uint8_t data[YOUSJ_DGRAM_MAX];
+};
+
 struct yousj_usock {
     bool in_use;
     uint8_t state; /* 0 fresh, 1 bound, 2 listening */
+    uint8_t type;  /* M70: 1 stream, 2 datagram */
     int backlog;
     int pend_count;
     struct yousj_sockpair *pend[YOUSJ_USOCK_BACKLOG_MAX];
     struct yousj_ramfs_node *node; /* bound node, if any */
     char bound_path[108]; /* M69: for getsockname; "" when
                              unbound */
+    /* M70 datagram state (type 2 only) */
+    struct yousj_dgram_pkt rxq[YOUSJ_DGRAM_QUEUE];
+    int rx_head;
+    int rx_count;
+    struct yousj_usock *dgram_peer; /* a socketpair peer, or
+                                       the connect() default
+                                       destination */
+    bool dgram_connected;
 };
 
 struct yousj_epoll; /* M18: defined in fs.c */
@@ -174,12 +197,31 @@ long fs_sockpair_create(struct yousj_file **a_out,
 
 /* M68: named AF_UNIX stream sockets. All take an absolute,
  * link-resolved path. 0 or a negative errno. */
-long fs_usock_create(struct yousj_file **out);
+long fs_usock_create(struct yousj_file **out, int type);
 long fs_usock_bind(struct yousj_file *f, const char *path);
 long fs_usock_listen(struct yousj_file *f, long backlog);
 long fs_usock_connect(struct yousj_file *f, const char *path);
 long fs_usock_accept_try(struct yousj_file *f,
                          struct yousj_file **out);
+
+/* M70: datagram service. The send entry points take data
+ * already staged in a kernel buffer; delivery may fail
+ * -EAGAIN (queue full: the caller applies the blocking
+ * protocol) and is dropped silently, still returning 0,
+ * when a connected receiver's peer filter rejects it. */
+long fs_dgram_pair_create(struct yousj_file **a_out,
+                          struct yousj_file **b_out);
+long fs_usock_connect_dgram(struct yousj_file *f,
+                            const char *path);
+long fs_dgram_send_path(struct yousj_file *from,
+                        const char *path, const uint8_t *data,
+                        uint32_t len);
+long fs_dgram_send_peer(struct yousj_file *from,
+                        const uint8_t *data, uint32_t len);
+long fs_dgram_recv_try(struct yousj_file *f, uint8_t *dst,
+                       uint64_t cap, bool peek,
+                       uint32_t *real_len_out,
+                       char *from_out);
 
 /* M18: epoll instances. ctl ops mirror Linux: ADD 1, DEL 2,
  * MOD 3. Entries pin their target file (a reference is

@@ -245,8 +245,8 @@ static void t_reject(void)
     r = sys_call3(SYS_socket, 2, SOCK_STREAM, 0);
     ok = ok && r == -97; /* AF_INET: EAFNOSUPPORT */
     if (!ok) { report2("reject", 0, r); return; }
-    r = sys_call3(SYS_socket, AF_UNIX, 2, 0);
-    ok = ok && r == -93; /* SOCK_DGRAM: EPROTONOSUPPORT */
+    r = sys_call3(SYS_socket, AF_UNIX, 3, 0);
+    ok = ok && r == -93; /* SOCK_RAW: EPROTONOSUPPORT */
     r = sys_call3(SYS_socket, AF_UNIX, SOCK_STREAM, 7);
     ok = ok && r == -93; /* nonzero protocol */
     fd = sys_call3(SYS_open, (long)(uintptr_t)"/bin/hello",
@@ -618,6 +618,162 @@ static void t_msgio(void)
     report2("msgio", ok, r);
 }
 
+/* M70: SOCK_DGRAM -- named delivery with sender reporting,
+ * packet boundaries, truncation, peer filtering, pair mode */
+static void t_dgram(void)
+{
+    struct sockaddr_un_k dst, from;
+    char buf[32], big[1030];
+    uint32_t flen;
+    int ok = 1;
+    int dp[2];
+    long r, s, c, a, a2;
+
+    s = sys_call3(SYS_socket, AF_UNIX, 2, 0);
+    c = sys_call3(SYS_socket, AF_UNIX, 2, 0);
+    ok = ok && s >= 0 && c >= 0;
+    fill_addr(&dst, "/d1.sock");
+    r = sys_call6(SYS_sendto, c, (long)(uintptr_t)"hi", 2, 0,
+                  (long)(uintptr_t)&dst, 110);
+    ok = ok && r == -2; /* no such path yet: ENOENT */
+    ok = ok && do_bind(s, "/d1.sock") == 0;
+    ok = ok && do_bind(c, "/d2.sock") == 0;
+
+    /* named delivery, sender identified by its bound path */
+    r = sys_call6(SYS_sendto, c, (long)(uintptr_t)"hello", 5, 0,
+                  (long)(uintptr_t)&dst, 110);
+    ok = ok && r == 5;
+    flen = sizeof(from);
+    r = sys_call6(SYS_recvfrom, s, (long)(uintptr_t)buf, 32, 0,
+                  (long)(uintptr_t)&from,
+                  (long)(uintptr_t)&flen);
+    ok = ok && r == 5 && buf[0] == 'h' && buf[4] == 'o' &&
+         flen == 11 && from.path[1] == 'd' && from.path[2] == '2';
+    fill_addr(&dst, "/d2.sock");
+    r = sys_call6(SYS_sendto, s, (long)(uintptr_t)"world!", 6, 0,
+                  (long)(uintptr_t)&dst, 110);
+    ok = ok && r == 6;
+    r = sys_call6(SYS_recvfrom, c, (long)(uintptr_t)buf, 32, 0,
+                  0, 0);
+    ok = ok && r == 6 && buf[5] == '!';
+
+    /* boundaries: two packets never merge into one read */
+    fill_addr(&dst, "/d1.sock");
+    sys_call6(SYS_sendto, c, (long)(uintptr_t)"AA", 2, 0,
+              (long)(uintptr_t)&dst, 110);
+    sys_call6(SYS_sendto, c, (long)(uintptr_t)"BBB", 3, 0,
+              (long)(uintptr_t)&dst, 110);
+    r = sys_call6(SYS_recvfrom, s, (long)(uintptr_t)buf, 32, 0,
+                  0, 0);
+    ok = ok && r == 2;
+    r = sys_call6(SYS_recvfrom, s, (long)(uintptr_t)buf, 32, 0,
+                  0, 0);
+    ok = ok && r == 3 && buf[2] == 'B';
+
+    /* truncation: the packet is consumed, MSG_TRUNC reports
+     * its true length */
+    sys_call6(SYS_sendto, c, (long)(uintptr_t)"0123456789", 10,
+              0, (long)(uintptr_t)&dst, 110);
+    r = sys_call6(SYS_recvfrom, s, (long)(uintptr_t)buf, 4,
+                  0x20 /* MSG_TRUNC */, 0, 0);
+    ok = ok && r == 10;
+
+    /* PEEK at a packet, then take it, then nothing left */
+    sys_call6(SYS_sendto, c, (long)(uintptr_t)"pk", 2, 0,
+              (long)(uintptr_t)&dst, 110);
+    r = sys_call6(SYS_recvfrom, s, (long)(uintptr_t)buf, 32,
+                  MSG_PEEK_K, 0, 0);
+    ok = ok && r == 2 && buf[0] == 'p';
+    r = sys_call6(SYS_recvfrom, s, (long)(uintptr_t)buf, 32, 0,
+                  0, 0);
+    ok = ok && r == 2;
+    r = sys_call6(SYS_recvfrom, s, (long)(uintptr_t)buf, 32,
+                  MSG_DONTWAIT_K, 0, 0);
+    ok = ok && r == -11;
+
+    /* an anonymous sender reports an empty path; connect sets
+     * the default destination */
+    a = sys_call3(SYS_socket, AF_UNIX, 2, 0);
+    ok = ok && a >= 0;
+    sys_call6(SYS_sendto, a, (long)(uintptr_t)"anon", 4, 0,
+              (long)(uintptr_t)&dst, 110);
+    flen = sizeof(from);
+    r = sys_call6(SYS_recvfrom, s, (long)(uintptr_t)buf, 32, 0,
+                  (long)(uintptr_t)&from,
+                  (long)(uintptr_t)&flen);
+    ok = ok && r == 4 && flen == 2;
+    r = sys_call6(SYS_sendto, a, (long)(uintptr_t)"x", 1, 0, 0,
+                  0);
+    ok = ok && r == -89; /* EDESTADDRREQ before connect */
+    r = sys_call3(SYS_connect, a, (long)(uintptr_t)&dst, 110);
+    ok = ok && r == 0;
+    r = sys_call6(SYS_sendto, a, (long)(uintptr_t)"aimed", 5, 0,
+                  0, 0);
+    ok = ok && r == 5;
+    r = sys_call6(SYS_recvfrom, s, (long)(uintptr_t)buf, 32, 0,
+                  0, 0);
+    ok = ok && r == 5 && buf[0] == 'a';
+
+    /* connected receivers filter: after s aims at c, a packet
+     * from a third party is dropped silently */
+    fill_addr(&dst, "/d2.sock");
+    r = sys_call3(SYS_connect, s, (long)(uintptr_t)&dst, 110);
+    ok = ok && r == 0;
+    a2 = sys_call3(SYS_socket, AF_UNIX, 2, 0);
+    fill_addr(&dst, "/d1.sock");
+    r = sys_call6(SYS_sendto, a2, (long)(uintptr_t)"drop", 4, 0,
+                  (long)(uintptr_t)&dst, 110);
+    ok = ok && r == 4; /* sent fine, dropped at the receiver */
+    sys_call6(SYS_sendto, c, (long)(uintptr_t)"keep", 4, 0,
+              (long)(uintptr_t)&dst, 110);
+    r = sys_call6(SYS_recvfrom, s, (long)(uintptr_t)buf, 32, 0,
+                  0, 0);
+    ok = ok && r == 4 && buf[0] == 'k';
+    r = sys_call6(SYS_recvfrom, s, (long)(uintptr_t)buf, 32,
+                  MSG_DONTWAIT_K, 0, 0);
+    ok = ok && r == -11;
+
+    /* names on datagrams */
+    flen = sizeof(from);
+    r = sys_call3(SYS_getpeername, s, (long)(uintptr_t)&from,
+                  (long)(uintptr_t)&flen);
+    ok = ok && r == 0 && flen == 11 && from.path[2] == '2';
+    flen = sizeof(from);
+    r = sys_call3(SYS_getpeername, c, (long)(uintptr_t)&from,
+                  (long)(uintptr_t)&flen);
+    ok = ok && r == -107; /* c never connected */
+
+    /* service limits */
+    r = sys_call3(SYS_listen, s, 2, 0);
+    ok = ok && r == -95; /* EOPNOTSUPP */
+    r = sys_call6(SYS_sendto, c, (long)(uintptr_t)big, 1025, 0,
+                  (long)(uintptr_t)&dst, 110);
+    ok = ok && r == -90; /* EMSGSIZE */
+
+    /* datagram socketpair: aimed at each other from birth */
+    r = sys_call4(SYS_socketpair, AF_UNIX, 2, 0,
+                  (long)(uintptr_t)dp);
+    ok = ok && r == 0;
+    r = sys_call6(SYS_sendto, dp[0], (long)(uintptr_t)"pr", 2,
+                  0, 0, 0);
+    ok = ok && r == 2;
+    flen = sizeof(from);
+    r = sys_call6(SYS_recvfrom, dp[1], (long)(uintptr_t)buf, 32,
+                  0, (long)(uintptr_t)&from,
+                  (long)(uintptr_t)&flen);
+    ok = ok && r == 2 && buf[1] == 'r' && flen == 2;
+    sys_call3(SYS_close, dp[0], 0, 0);
+    sys_call3(SYS_close, dp[1], 0, 0);
+
+    sys_call3(SYS_close, s, 0, 0);
+    sys_call3(SYS_close, c, 0, 0);
+    sys_call3(SYS_close, a, 0, 0);
+    sys_call3(SYS_close, a2, 0, 0);
+    sys_call3(SYS_unlink, (long)(uintptr_t)"/d1.sock", 0, 0);
+    sys_call3(SYS_unlink, (long)(uintptr_t)"/d2.sock", 0, 0);
+    report2("dgram", ok, r);
+}
+
 int main(void)
 {
     out("socktest: M68 named AF_UNIX sockets\n");
@@ -630,6 +786,7 @@ int main(void)
     t_close();
     t_fork();
     t_msgio();
+    t_dgram();
     out("SOCKTEST DONE\n");
     return failures ? 1 : 0;
 }
