@@ -763,11 +763,31 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   超时 ETIMEDOUT、子进程信号释放无
   超时等待得 EINTR）＋新套件
   qemu-futex-test.py。
-- ⏳ 下一步候选：CLONE_VM 共享地址
-  空间（线程语义第一步，顺带解锁
-  futex 跨任务 WAKE 验收）；或 inotify
-  事件补完（ftruncate 的 MODIFY、
-  exchange 的 MOVE_SELF）。
+- ✅ CLONE_VM M51（2026-11-04）：地址
+  空间可共享。vmm_space 加引用计数
+  （vmm_create_space 出生为 1，
+  space_drop 归零才销毁帧/表/池槽，
+  退出与 execve 的旧空间处置统一走
+  它）；clone 放行 CLONE_VM(0x100)：
+  孩子直接挂父的空间多持一引用，
+  最后一个退出的任务才真拆；同时
+  放行 child_stack（仅 CLONE_VM 可
+  带），线程在自己的栈上醒来。已知
+  简化（v1 明示偏离）：VMA 列表仍按
+  任务存、克隆时拷贝——克隆后新 mmap
+  对兄弟不可见；线程 exec 是脱离到
+  自己的新空间，而非 Linux 的杀光
+  兄弟；信号处置仍按任务（CLONE_
+  SIGHAND 未做）。验收：futextest 加
+  xwake 场景——CLONE_VM 兄弟在共享
+  空间里写字 + WAKE，父的无超时
+  WAIT 真被跨任务唤醒返回 0——M50
+  欠的跨任务 WAKE 至此还清。
+- ⏳ 下一步候选：线程语义续篇
+  （CLONE_SIGHAND/tgid，或 set_tid_
+  address + robust futex 的地基），
+  或 inotify 事件补完（ftruncate 的
+  MODIFY、exchange 的 MOVE_SELF）。
 
 ## 从零构建
 

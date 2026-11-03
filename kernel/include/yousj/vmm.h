@@ -79,6 +79,9 @@ uint32_t vmm_pte_decode_flags(uint64_t pte);
 
 struct vmm_space {
     uint64_t pml4_phys; /* physical address of the PML4 page (the CR3 value) */
+    uint32_t refs;      /* M51: tasks referencing this space
+                         * (CLONE_VM); born at 1 in
+                         * vmm_create_space, destroyed at 0 */
 };
 
 /* Backend: how the VMM gets page-table pages and touches them.

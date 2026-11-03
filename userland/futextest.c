@@ -10,12 +10,13 @@
  *   signal     a task truly blocked in WAIT (no timeout)
  *              is released by a signal: handler runs and
  *              the call returns -EINTR
+ *   xwake      M51: a CLONE_VM sibling sharing this
+ *              address space writes the word and WAKEs;
+ *              the parent's WAIT returns 0 and sees the
+ *              write -- the cross-task wake M50 deferred
  *
  * Prints "futextest: <name> PASS"/"FAIL", then
  * "FUTEXTEST DONE"; exit 0 iff all passed.
- * Cross-task WAKE needs a genuinely shared frame, which
- * arrives with shared address spaces; it is not faked
- * here.
  */
 #include <stdint.h>
 #include <stddef.h>
@@ -129,6 +130,40 @@ static long futex(int32_t *uaddr, long op, long val,
 
 static int32_t word;
 
+/* M51 xwake: the sibling thread's shared word, its stack,
+ * and the asm clone trampoline. A CLONE_VM child resumes
+ * on a FRESH stack with no C frame above it, so the clone
+ * syscall itself must be issued from asm: the parent path
+ * returns to C normally, the child path calls thread_main
+ * as a fresh root and never returns through a frame. */
+static int32_t xword;
+static uint8_t cstack[8192];
+
+/* not static, and marked used: its only caller is the
+ * asm trampoline below, which the compiler cannot see */
+__attribute__((used)) void thread_main(void)
+{
+    sleep_ms(150);
+    xword = 1;
+    futex(&xword, FUTEX_WAKE, 1, NULL);
+    die(0);
+}
+
+extern long clone_vm_call(long flags, uint64_t stack);
+__asm__(
+    ".globl clone_vm_call\n"
+    "clone_vm_call:\n"
+    "    mov $56, %rax\n" /* clone */
+    "    syscall\n"
+    "    test %rax, %rax\n"
+    "    jz 1f\n"
+    "    ret\n" /* parent: pid in rax */
+    "1:  call thread_main\n"
+    "    mov $231, %rax\n" /* exit_group(0) if it returns */
+    "    xor %rdi, %rdi\n"
+    "    syscall\n"
+    "    ud2\n");
+
 static volatile int g_got_usr1;
 static void usr1_handler(long sig, void *info, void *uctx)
 {
@@ -236,6 +271,25 @@ int main(int argc, char **argv)
                           (long)(uintptr_t)&st, 0, 0);
             }
             report("signal", rc == -4 && g_got_usr1 == 1);
+        }
+    }
+
+    /* xwake: a CLONE_VM sibling wakes our WAIT for real */
+    {
+        uint64_t top =
+            (uint64_t)(uintptr_t)(cstack + sizeof(cstack)) &
+            ~15ULL;
+        long c;
+        xword = 0; /* materialize the page before sharing */
+        c = clone_vm_call(17 | 0x100, top); /* SIGCHLD|VM */
+        if (c <= 0) {
+            report("xwake", 0);
+        } else {
+            long st = 0;
+            rc = futex(&xword, FUTEX_WAIT, 0, NULL);
+            sys_call4(SYS_wait4, c, (long)(uintptr_t)&st, 0,
+                      0);
+            report("xwake", rc == 0 && xword == 1);
         }
     }
 

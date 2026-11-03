@@ -267,6 +267,7 @@ int vmm_create_space(struct vmm_space *out)
         return -YOUSJ_ENOMEM;
     mem_zero(table_of(pml4), YOUSJ_VMM_ENTRIES);
     out->pml4_phys = pml4;
+    out->refs = 1; /* M51 */
     if (g_kernel_master != NULL && g_kernel_master != out) {
         /* Share the kernel half (entries 256-511) with the master. */
         uint64_t *dst = table_of(pml4);
@@ -338,6 +339,7 @@ struct vmm_space *vmm_space_alloc(void)
         if (!g_space_pool_used[i]) {
             g_space_pool_used[i] = true;
             g_space_pool[i].pml4_phys = 0;
+            g_space_pool[i].refs = 0;
             return &g_space_pool[i];
         }
     }

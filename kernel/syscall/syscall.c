@@ -262,6 +262,25 @@ static long sys_write(long fd, uint64_t buf, uint64_t len)
  * sig == 0 and a status; fatal signal delivery (signal.c) with
  * sig != 0. Records how the task died for wait4, tears the
  * address space down, and never returns. */
+/* M51: drop one reference to an address space; the last
+ * reference destroys it (frames, tables, pool slot).
+ * Spaces are born with refs == 1 (vmm_create_space) and
+ * CLONE_VM adds one per sharing task. vmm_space_release
+ * no-ops on kmain's static boot space, as before. */
+static void space_drop(struct vmm_space *sp)
+{
+    if (sp == NULL)
+        return;
+    if (sp->refs > 1) {
+        sp->refs--;
+        return;
+    }
+    sp->refs = 0;
+    vmm_free_user_data(sp);
+    vmm_destroy_space(sp);
+    vmm_space_release(sp);
+}
+
 void process_exit(long status, int sig)
 {
     struct task *me = sched_current();
@@ -305,13 +324,16 @@ void process_exit(long status, int sig)
     }
 
     /* Process teardown (SCHED_DESIGN 6.1): an owned address
-     * space is destroyed here, while this task is still the one
-     * running -- detach it from the task first and switch CR3
-     * to the master, so no later schedule can ever reload the
-     * dying space, then free its data frames and its tables.
-     * Non-owned spaces (the boot images) are deliberately kept,
-     * as before. This task's kernel stack survives until the
-     * parent reaps the zombie in wait4. */
+     * space reference is dropped here, while this task is
+     * still the one running -- detach it from the task first
+     * and switch CR3 to the master, so no later schedule can
+     * ever reload it from THIS task. M51: with CLONE_VM the
+     * space itself is destroyed only when the last sharing
+     * task drops it (space_drop); siblings keep running on
+     * it undisturbed. Non-owned spaces (the boot images)
+     * are deliberately kept, as before. This task's kernel
+     * stack survives until the parent reaps the zombie in
+     * wait4. */
     if (me->mm != NULL && me->mm_owned) {
         struct vmm_space *sp = me->mm;
         struct vmm_space *master = vmm_kernel_master();
@@ -322,9 +344,7 @@ void process_exit(long status, int sig)
             vmm_load_cr3(master->pml4_phys);
             sched_note_cr3(master->pml4_phys);
         }
-        vmm_free_user_data(sp);
-        vmm_destroy_space(sp);
-        vmm_space_release(sp);
+        space_drop(sp);
     }
 
     /* Orphans are adopted by init, which reaps them (6.1). */
@@ -414,13 +434,21 @@ static long sys_wait4(long pid, uint64_t status_ptr, long options,
     }
 }
 
-/* clone(56), fork-style only (SCHED_DESIGN 6.2): flags may carry
- * nothing but the exit signal (0 or SIGCHLD); a non-NULL child
- * stack, CLONE_VM/VFORK/THREAD and friends are -EINVAL, never
- * silently ignored. The child gets a deep copy of the user
- * window and resumes at the parent's syscall return point with
- * rax = 0, from the register frame the entry pushed. */
+/* clone(56) (SCHED_DESIGN 6.2): flags may carry the exit
+ * signal (0 or SIGCHLD) and, since M51, CLONE_VM; VFORK/
+ * THREAD and friends are still -EINVAL, never silently
+ * ignored. Plain clone gives the child a deep copy of the
+ * user window; CLONE_VM shares the parent's space outright
+ * (one more reference on it) and is the only form allowed
+ * a child stack. Either way the child resumes at the
+ * parent's syscall return point with rax = 0, from the
+ * register frame the entry pushed. M51 v1 divergence:
+ * the VMA list is still per-task, copied at clone time,
+ * so mappings made after a CLONE_VM clone are not visible
+ * to the sibling (and an exec in one thread detaches it
+ * instead of killing the others, as Linux would). */
 #define YOUSJ_SIGCHLD 17
+#define CLONE_VM_K 0x100
 
 extern void user_frame_resume(uint64_t *resume_fields);
 
@@ -445,25 +473,27 @@ static long sys_clone(struct yousj_syscall_ctx *ctx, long flags,
     struct task *child;
     uint64_t flags_saved;
 
+    bool share_vm = (flags & CLONE_VM_K) != 0;
+
     if (me->mm == NULL)
         return -YOUSJ_EINVAL; /* kernel threads cannot fork */
-    if (child_stack != 0)
-        return -YOUSJ_EINVAL;
-    if ((flags & ~0xFFL) != 0 ||
+    if ((flags & ~(0xFFL | CLONE_VM_K)) != 0 ||
         ((flags & 0xFF) != 0 && (flags & 0xFF) != YOUSJ_SIGCHLD))
         return -YOUSJ_EINVAL;
+    if (child_stack != 0 && !share_vm)
+        return -YOUSJ_EINVAL; /* stacks are a thread concept */
     frame = ctx->frame;
     if (frame == NULL)
         return -YOUSJ_EINVAL;
 
-    space = vmm_space_alloc();
-    if (space == NULL)
+    if (share_vm) {
+        space = me->mm; /* one more reference, taken below */
+    } else if ((space = vmm_space_alloc()) == NULL) {
         return -YOUSJ_ENOMEM;
-    if (vmm_create_space(space) != 0) {
+    } else if (vmm_create_space(space) != 0) {
         vmm_space_release(space);
         return -YOUSJ_ENOMEM;
-    }
-    if (vmm_clone_user_window(space, me->mm) != 0) {
+    } else if (vmm_clone_user_window(space, me->mm) != 0) {
         vmm_free_user_data(space);
         vmm_destroy_space(space);
         vmm_space_release(space);
@@ -477,7 +507,10 @@ static long sys_clone(struct yousj_syscall_ctx *ctx, long flags,
     child = kthread_create_auto("clone", clone_child_start, NULL);
     if (child != NULL) {
         child->mm = space;
-        child->mm_owned = true;
+        child->mm_owned = true; /* the child holds a reference */
+        if (share_vm)
+            space->refs++; /* M51: taken under cli, before the
+                            * child can be scheduled */
         child->brk_start = me->brk_start;
         child->brk_end = me->brk_end;
         child->fs_base = me->fs_base;
@@ -500,6 +533,9 @@ static long sys_clone(struct yousj_syscall_ctx *ctx, long flags,
          * on this task's own kernel stack for exactly this
          * reason (see syscall_entry.S). */
         child->resume_rsp = frame[YOUSJ_FR_RSP];
+        if (child_stack != 0)
+            child->resume_rsp = child_stack; /* M51: CLONE_VM
+                            * threads run on their own stack */
         /* Callee-saved set, captured by the entry shim (M7):
          * without it the child resumes with garbage in exactly
          * the registers compiled code keeps its locals in. */
@@ -811,11 +847,14 @@ static long sys_execve(uint64_t path_ptr, uint64_t argv_ptr,
     vmm_load_cr3(space->pml4_phys);
     sched_note_cr3(space->pml4_phys);
     if (old != NULL && old != space) {
-        vmm_free_user_data(old);
-        vmm_destroy_space(old);
-        /* No-op for the boot space: release only matches pool
-         * slots, and the boot ispace is kmain's static struct. */
-        vmm_space_release(old);
+        /* M51: a plain drop -- destroys the space at its
+         * last reference. A CLONE_VM sibling keeps the old
+         * space alive; the exec'ing task simply detaches
+         * onto its own new one (Linux would kill the
+         * siblings; v1 divergence, noted in the README).
+         * The boot space is kmain's static struct: its
+         * release inside space_drop no-ops, as before. */
+        space_drop(old);
     }
     user_gs_normalize();
     enter_user_mode(entry, new_sp);

@@ -141,9 +141,10 @@ struct task {
     uint64_t        resume_r14;
     uint64_t        resume_r15;
     bool            has_resume;
-    bool            mm_owned;     /* mm points at a pool space from
-                                     vmm_space_alloc(): the exit
-                                     path destroys it (M5). */
+    bool            mm_owned;     /* this task holds one reference
+                                     on mm: the exit path drops it
+                                     and the last drop destroys the
+                                     space (M5; refs since M51). */
     /* M7 signal state (see <yousj/signal.h>). Meaningful only
      * for user tasks (mm != NULL); kernel threads never pass a
      * delivery gate, so their bits simply never move. */
