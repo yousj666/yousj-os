@@ -806,10 +806,37 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   程 set_tid_address 登记、退出清
   零唤醒父的 futex 等待、SETTLS 的
   FS 经 arch_prctl GET_FS 验明。
-- ⏳ 下一步候选：线程语义续篇
-  （CLONE_SIGHAND 信号处置共享、
-  tgid/gettid 语义、robust futex），
-  或 inotify 事件补完（ftruncate 的
+- ✅ 线程组语义 M53（2026-11-04）：
+  信号处置表从 task 内嵌数组改为
+  引用计数的共享对象（sighand，
+  signal.c 池 32，与任务池同尺寸；
+  task 只留指针，NULL 读作全默认、
+  首次 rt_sigaction 时惰性建表）。
+  普通 clone 拷贝一份；CLONE_SIGHAND
+  (0x800) 共享同一表，一处改处置
+  全组可见；exec 若表被共享则先脱离
+  到私有拷贝再重置（SIG_IGN 跨 exec
+  保留不破）；退出放引用。tgid 入
+  task（出生==tid，kthread 创建处
+  统一赋值）：getpid(39) 改报 tgid、
+  gettid(186) 转正报 tid；CLONE_
+  THREAD(0x10000) 转正（须带 VM，
+  否则 EINVAL），孩子继承创建者
+  tgid；/proc/<pid>/status 补 Tgid
+  行。pthread 的 clone 旗标面至此
+  只剩 CLONE_FS/CLONE_FILES 未开。
+  已知简化：THREAD 孩子仍按普通
+  子进程被 wait4/SIGCHLD 对待。
+  验收：futextest 加 sighand 场景
+  ——父装 handler A、CLONE_SIGHAND
+  孩子装 B 进同一张表、父自发信号
+  跑的是 B 而非 A；孩子内 getpid
+  ==父 tid、gettid==自身 tid。
+- ⏳ 下一步候选：CLONE_FILES（fd
+  表共享，pthread 旗标面最后一块；
+  之后可尝试接 musl 的 pthread 形
+  式验证），robust futex，或
+  inotify 事件补完（ftruncate 的
   MODIFY、exchange 的 MOVE_SELF）。
 
 ## 从零构建

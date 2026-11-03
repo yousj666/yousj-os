@@ -49,6 +49,10 @@ struct task {
     struct task_context ctx;      /* offset 0 -- see header note */
     uint64_t        tid;          /* idle = 0, then 1, 2, ... */
     uint64_t        parent_tid;
+    uint64_t        tgid;         /* M53: thread-group id --
+                                     what getpid() reports. Born
+                                     == tid; CLONE_THREAD children
+                                     take the creator's. */
     enum task_state state;
     char            name[16];
     char            exe_path[256]; /* M35: resolved exec path,
@@ -154,7 +158,9 @@ struct task {
      * delivery gate, so their bits simply never move. */
     uint64_t        sig_pending;  /* queued signals, bit (sig-1) */
     uint64_t        sig_blocked;  /* blocked mask, same encoding */
-    struct yousj_sigaction sig_act[YOUSJ_NSIG]; /* dispositions */
+    struct yousj_sighand *sighand; /* M53: disposition table,
+                                     * shareable (CLONE_SIGHAND);
+                                     * NULL = none yet (all DFL) */
     uint64_t        sig_alt_sp;   /* M32: alternate signal stack */
     uint64_t        sig_alt_size;
     uint32_t        sig_alt_flags; /* YOUSJ_SS_DISABLE when off */

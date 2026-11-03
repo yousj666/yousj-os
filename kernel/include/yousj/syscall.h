@@ -95,6 +95,7 @@
 #define YOUSJ_SYS_getppid     110   /* M50: surfaced by the
                                      * futex signal test */
 #define YOUSJ_SYS_set_tid_address 218 /* M52 */
+#define YOUSJ_SYS_gettid      186   /* M53 */
 #define YOUSJ_SYS_copy_file_range 326 /* M43 */
 #define YOUSJ_SYS_dup3        292  /* M10 */
 #define YOUSJ_SYS_pipe2       293  /* M10 */

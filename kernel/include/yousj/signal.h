@@ -90,6 +90,18 @@ struct yousj_sigaction {
     uint64_t mask;     /* extra signals blocked while handler runs */
 };
 
+/* M53: the disposition table as a shareable, refcounted
+ * object (CLONE_SIGHAND). Tasks hold a pointer; NULL means
+ * "no table yet" and reads as all-default. The pool and
+ * the refcount live in signal.c. */
+struct yousj_sighand {
+    uint32_t refs;
+    struct yousj_sigaction act[YOUSJ_NSIG];
+};
+struct yousj_sighand *signal_sighand_alloc(void);
+void signal_sighand_get(struct yousj_sighand *sh);
+void signal_sighand_put(struct yousj_sighand *sh);
+
 /* Register context saved in a signal frame. Field order mirrors
  * the Linux kernel's struct sigcontext (r8..rip, eflags, then the
  * segment/auxiliary tail), so the layout will not need to change
@@ -239,7 +251,8 @@ struct yousj_stack_t {
 /* Inheritance rules: clone copies masks + dispositions and clears
  * pending; execve resets caught handlers to default (ignored
  * stays ignored), keeps masks and pending. */
-void signal_clone_inherit(struct task *child, struct task *parent);
+void signal_clone_inherit(struct task *child, struct task *parent,
+                          bool share);
 void signal_exec_reset(struct task *t);
 
 /* The one process-exit path, shared by exit/exit_group (sig ==

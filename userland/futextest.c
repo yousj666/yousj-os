@@ -193,6 +193,47 @@ __attribute__((used)) void thread_main2(void)
     die(0);
 }
 
+/* M53 sighand: two handlers, one shared table. The parent
+ * installs A; the CLONE_SIGHAND child installs B into the
+ * same table; the parent's own signal must then run B. */
+#define SYS_getpid 39
+#define SYS_gettid 186
+
+static volatile int flag_a;
+static volatile int flag_b;
+static volatile int b_ready;
+static volatile long child_pid_seen;
+static volatile long child_tid_seen;
+
+static void handler_a(long sig, void *info, void *uctx)
+{
+    (void)sig; (void)info; (void)uctx;
+    flag_a = 1;
+}
+
+static void handler_b(long sig, void *info, void *uctx)
+{
+    (void)sig; (void)info; (void)uctx;
+    flag_b = 1;
+}
+
+/* thread_main3 lives below, after struct k_sigaction. */
+
+extern long clone_thread_call(long flags, uint64_t stack);
+__asm__(
+    ".globl clone_thread_call\n"
+    "clone_thread_call:\n"
+    "    mov $56, %rax\n" /* clone */
+    "    syscall\n"
+    "    test %rax, %rax\n"
+    "    jz 1f\n"
+    "    ret\n"
+    "1:  call thread_main3\n"
+    "    mov $231, %rax\n"
+    "    xor %rdi, %rdi\n"
+    "    syscall\n"
+    "    ud2\n");
+
 extern long clone_vm_call5(long flags, uint64_t stack,
                            void *ptid, void *ctid,
                            uint64_t tls);
@@ -234,6 +275,24 @@ struct k_sigaction {
     uint64_t restorer;
     uint64_t mask;
 };
+
+__attribute__((used)) void thread_main3(void)
+{
+    extern char fx_restorer50[];
+    struct k_sigaction act;
+    child_pid_seen = sys_call1(SYS_getpid, 0);
+    child_tid_seen = sys_call1(SYS_gettid, 0);
+    act.handler = (uint64_t)(uintptr_t)handler_b;
+    act.flags = 0x04000004u; /* SA_RESTORER | SA_SIGINFO */
+    act.reserved = 0;
+    act.restorer = (uint64_t)(uintptr_t)fx_restorer50;
+    act.mask = 0;
+    sys_call4(SYS_rt_sigaction, SIGUSR1,
+              (long)(uintptr_t)&act, 0, 8);
+    b_ready = 1;
+    sleep_ms(400);
+    die(0);
+}
 
 static long now_ms(void)
 {
@@ -377,6 +436,54 @@ int main(int argc, char **argv)
             ok = ok && join_word == 0 && join_result == 42 &&
                  fs_seen == (uint64_t)(uintptr_t)tls_area;
             report("join", ok);
+        }
+    }
+
+    /* sighand: CLONE_SIGHAND + CLONE_THREAD semantics */
+    {
+        extern char fx_restorer50[];
+        struct k_sigaction act;
+        uint64_t top =
+            (uint64_t)(uintptr_t)(cstack + sizeof(cstack)) &
+            ~15ULL;
+        long c;
+        int ok, spins;
+        act.flags = 0x04000004u; /* SA_RESTORER | SA_SIGINFO */
+        act.reserved = 0;
+        act.restorer = (uint64_t)(uintptr_t)fx_restorer50;
+        act.mask = 0;
+        act.handler = (uint64_t)(uintptr_t)handler_a;
+        if (sys_call4(SYS_rt_sigaction, SIGUSR1,
+                      (long)(uintptr_t)&act, 0, 8) != 0) {
+            report("sighand", 0);
+        } else {
+            flag_a = 0;
+            flag_b = 0;
+            b_ready = 0;
+            child_pid_seen = 0;
+            child_tid_seen = 0;
+            /* SIGCHLD | VM | SIGHAND(0x800) | THREAD(0x10000) */
+            c = clone_thread_call(17 | 0x100 | 0x800 |
+                                  0x10000, top);
+            if (c <= 0) {
+                report("sighand", 0);
+            } else {
+                long st = 0;
+                long mytid = sys_call1(SYS_gettid, 0);
+                for (spins = 0; spins < 300 && !b_ready;
+                     spins++)
+                    sleep_ms(10);
+                /* The child replaced the SIGUSR1 disposition
+                 * in the SHARED table: our own signal must
+                 * now run ITS handler, not ours. */
+                sys_call3(SYS_kill, mytid, SIGUSR1, 0);
+                sys_call4(SYS_wait4, c,
+                          (long)(uintptr_t)&st, 0, 0);
+                ok = flag_b == 1 && flag_a == 0 &&
+                     child_pid_seen == mytid &&
+                     child_tid_seen == c;
+                report("sighand", ok);
+            }
         }
     }
 

@@ -326,6 +326,11 @@ void process_exit(long status, int sig)
         }
     }
 
+    /* M53: drop this task's sighand reference; a shared
+     * table outlives us for the rest of the group. */
+    signal_sighand_put(me->sighand);
+    me->sighand = NULL;
+
     /* M14: release VMAs first -- MAP_SHARED regions write
      * back while the address space is still intact, and each
      * VMA's own file reference drops here (the fd references
@@ -476,6 +481,8 @@ static long sys_wait4(long pid, uint64_t status_ptr, long options,
 #define CLONE_PARENT_SETTID_K 0x00100000 /* M52 */
 #define CLONE_CHILD_CLEARTID_K 0x00200000 /* M52 */
 #define CLONE_CHILD_SETTID_K  0x01000000 /* M52 */
+#define CLONE_SIGHAND_K       0x800      /* M53 */
+#define CLONE_THREAD_K        0x10000    /* M53 */
 
 /* M52: write a 32-bit value into an address space with no
  * chance of faulting -- translate first, then go through
@@ -527,11 +534,15 @@ static long sys_clone(struct yousj_syscall_ctx *ctx, long flags,
     if ((flags & ~(0xFFL | CLONE_VM_K | CLONE_SETTLS_K |
                   CLONE_PARENT_SETTID_K |
                   CLONE_CHILD_CLEARTID_K |
-                  CLONE_CHILD_SETTID_K)) != 0 ||
+                  CLONE_CHILD_SETTID_K | CLONE_SIGHAND_K |
+                  CLONE_THREAD_K)) != 0 ||
         ((flags & 0xFF) != 0 && (flags & 0xFF) != YOUSJ_SIGCHLD))
         return -YOUSJ_EINVAL;
     if (child_stack != 0 && !share_vm)
         return -YOUSJ_EINVAL; /* stacks are a thread concept */
+    if ((flags & CLONE_THREAD_K) != 0 && !share_vm)
+        return -YOUSJ_EINVAL; /* M53: a thread group shares
+                               * an address space by definition */
     frame = ctx->frame;
     if (frame == NULL)
         return -YOUSJ_EINVAL;
@@ -623,7 +634,13 @@ static long sys_clone(struct yousj_syscall_ctx *ctx, long flags,
             for (i = 0; i < YOUSJ_FX_SIZE; i++)
                 child->fx_area[i] = me->fx_area[i];
         }
-        signal_clone_inherit(child, me);
+        signal_clone_inherit(child, me,
+                             (flags & CLONE_SIGHAND_K) != 0);
+        /* M53: CLONE_THREAD children join the creator's
+         * thread group; everyone else starts their own
+         * (tgid was set to the child's tid at creation). */
+        if (flags & CLONE_THREAD_K)
+            child->tgid = me->tgid;
         /* M28: comm is inherited across clone, as on Linux;
          * execve renames to the image basename. Without
          * this every forked child was named "clone" (the
@@ -3962,6 +3979,9 @@ static long dispatch_inner(struct yousj_syscall_ctx *ctx)
     case YOUSJ_SYS_nanosleep:
         return sys_nanosleep(a1);
     case YOUSJ_SYS_getpid:
+        /* M53: the thread-group id; == tid for a leader */
+        return (long)sched_current()->tgid;
+    case YOUSJ_SYS_gettid:
         return (long)sched_current()->tid;
     case YOUSJ_SYS_getppid:
         return (long)sched_current()->parent_tid;

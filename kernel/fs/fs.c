@@ -1995,6 +1995,8 @@ static uint32_t proc_generate(int id, uint32_t pid, int pfd,
         pb_puts(&b, t->name);
         pb_puts(&b, "\nPid:\t");
         pb_putu(&b, pid);
+        pb_puts(&b, "\nTgid:\t");
+        pb_putu(&b, t->tgid);
         pb_puts(&b, "\nPPid:\t");
         pb_putu(&b, t->parent_tid);
         pb_puts(&b, "\nState:\t");

@@ -33,6 +33,7 @@
 
 #define YOUSJ_EINTR  4
 #define YOUSJ_ESRCH  3
+#define YOUSJ_ENOMEM 12 /* M53 */
 #define YOUSJ_EINVAL 22
 #define YOUSJ_EFAULT 14
 #define YOUSJ_ERESTARTSYS 512 /* internal only; never a user return */
@@ -67,16 +68,55 @@ static const uint8_t g_default_disp[YOUSJ_NSIG] = {
     [YOUSJ_SIGSYS]    = DISP_CORE,
 };
 
+/* --- M53: sighand pool ---------------------------------
+ * One table per task in the worst case, so the pool is
+ * sized to the task pool. A slot with refs == 0 is free. */
+#define SIGHAND_POOL 32
+static struct yousj_sighand g_sighands[SIGHAND_POOL];
+
+struct yousj_sighand *signal_sighand_alloc(void)
+{
+    int i, j;
+    for (i = 0; i < SIGHAND_POOL; i++) {
+        if (g_sighands[i].refs == 0) {
+            g_sighands[i].refs = 1;
+            for (j = 0; j < YOUSJ_NSIG; j++) {
+                g_sighands[i].act[j].handler = YOUSJ_SIG_DFL;
+                g_sighands[i].act[j].flags = 0;
+                g_sighands[i].act[j].reserved = 0;
+                g_sighands[i].act[j].restorer = 0;
+                g_sighands[i].act[j].mask = 0;
+            }
+            return &g_sighands[i];
+        }
+    }
+    return NULL;
+}
+
+void signal_sighand_get(struct yousj_sighand *sh)
+{
+    if (sh != NULL)
+        sh->refs++;
+}
+
+void signal_sighand_put(struct yousj_sighand *sh)
+{
+    if (sh != NULL && sh->refs > 0)
+        sh->refs--;
+}
+
 static enum disp disposition_of(struct task *t, int sig)
 {
     if (sig == YOUSJ_SIGKILL)
         return DISP_TERM; /* uncatchable, unblockable */
     if (sig == YOUSJ_SIGSTOP)
         return DISP_STOP;
-    if (t->sig_act[sig].handler == YOUSJ_SIG_IGN)
-        return DISP_IGNORE;
-    if (t->sig_act[sig].handler != YOUSJ_SIG_DFL)
-        return DISP_HANDLER;
+    if (t->sighand != NULL) {
+        if (t->sighand->act[sig].handler == YOUSJ_SIG_IGN)
+            return DISP_IGNORE;
+        if (t->sighand->act[sig].handler != YOUSJ_SIG_DFL)
+            return DISP_HANDLER;
+    }
     return (enum disp)g_default_disp[sig];
 }
 
@@ -170,12 +210,23 @@ int signal_send(struct task *t, int sig, int from_tid)
 
 /* --- inheritance ------------------------------------------------------- */
 
-void signal_clone_inherit(struct task *child, struct task *parent)
+void signal_clone_inherit(struct task *child, struct task *parent,
+                          bool share)
 {
     int i;
     child->sig_blocked = parent->sig_blocked;
-    for (i = 0; i < YOUSJ_NSIG; i++)
-        child->sig_act[i] = parent->sig_act[i];
+    if (share && parent->sighand != NULL) {
+        /* CLONE_SIGHAND: one table for the whole group */
+        child->sighand = parent->sighand;
+        signal_sighand_get(child->sighand);
+    } else {
+        /* plain clone: a private copy of the dispositions */
+        child->sighand = signal_sighand_alloc();
+        if (child->sighand != NULL && parent->sighand != NULL)
+            for (i = 0; i < YOUSJ_NSIG; i++)
+                child->sighand->act[i] =
+                    parent->sighand->act[i];
+    }
     child->sig_pending = 0; /* pending signals are not inherited */
     /* M32: the alternate stack is inherited (Linux). */
     child->sig_alt_sp = parent->sig_alt_sp;
@@ -186,9 +237,24 @@ void signal_clone_inherit(struct task *child, struct task *parent)
 void signal_exec_reset(struct task *t)
 {
     int i;
-    for (i = 0; i < YOUSJ_NSIG; i++) {
-        if (t->sig_act[i].handler != YOUSJ_SIG_IGN)
-            t->sig_act[i].handler = YOUSJ_SIG_DFL;
+    /* M53: a shared table must not be reset under its other
+     * users -- detach to a private copy first (the copy keeps
+     * SIG_IGN entries, which survive exec as Linux requires),
+     * then reset the caught handlers on the private table. */
+    if (t->sighand != NULL && t->sighand->refs > 1) {
+        struct yousj_sighand *fresh = signal_sighand_alloc();
+        if (fresh != NULL) {
+            for (i = 0; i < YOUSJ_NSIG; i++)
+                fresh->act[i] = t->sighand->act[i];
+            signal_sighand_put(t->sighand);
+            t->sighand = fresh;
+        }
+    }
+    if (t->sighand != NULL) {
+        for (i = 0; i < YOUSJ_NSIG; i++) {
+            if (t->sighand->act[i].handler != YOUSJ_SIG_IGN)
+                t->sighand->act[i].handler = YOUSJ_SIG_DFL;
+        }
     }
     /* Blocked mask and pending signals survive exec (Linux). */
     /* M32: the alternate stack does NOT survive exec --
@@ -222,7 +288,8 @@ static int build_frame(struct task *me, int sig,
                        struct sig_snapshot *snap, int restart,
                        uint64_t syscall_nr)
 {
-    struct yousj_sigaction *act = &me->sig_act[sig];
+    /* Only reached for DISP_HANDLER, so the table exists. */
+    struct yousj_sigaction *act = &me->sighand->act[sig];
     uint64_t flen = sizeof(struct yousj_rt_sigframe);
     uint64_t f, x;
     struct yousj_rt_sigframe *fr;
@@ -357,7 +424,9 @@ static int gate_run(struct task *me, struct sig_snapshot *snap,
 
             me->sig_pending &= ~yousj_sig_bit(sig);
             if (*result_io == -YOUSJ_ERESTARTSYS) {
-                if (me->sig_act[sig].flags & YOUSJ_SA_RESTART)
+                if (me->sighand != NULL &&
+                    (me->sighand->act[sig].flags &
+                     YOUSJ_SA_RESTART))
                     restart = 1;
                 else
                     *result_io = -YOUSJ_EINTR;
@@ -520,7 +589,19 @@ long sys_rt_sigaction(long sig, uint64_t act_ptr, uint64_t old_ptr,
     if (act_ptr != 0 && (sig == YOUSJ_SIGKILL || sig == YOUSJ_SIGSTOP))
         return -YOUSJ_EINVAL; /* uncatchable */
     if (old_ptr != 0) {
-        rc = copy_action_out(old_ptr, &me->sig_act[sig]);
+        /* No table yet reads as an all-default action. */
+        struct yousj_sigaction dfl;
+        const struct yousj_sigaction *cur =
+            me->sighand != NULL ? &me->sighand->act[sig]
+                                : &dfl;
+        if (me->sighand == NULL) {
+            dfl.handler = YOUSJ_SIG_DFL;
+            dfl.flags = 0;
+            dfl.reserved = 0;
+            dfl.restorer = 0;
+            dfl.mask = 0;
+        }
+        rc = copy_action_out(old_ptr, cur);
         if (rc != 0)
             return rc;
     }
@@ -534,7 +615,13 @@ long sys_rt_sigaction(long sig, uint64_t act_ptr, uint64_t old_ptr,
         if (in.restorer != 0 && !yousj_user_range_ok(in.restorer, 1))
             return -YOUSJ_EINVAL;
         in.mask &= VALID_MASK & ~UNBLOCKABLE_MASK;
-        me->sig_act[sig] = in;
+        /* M53: first install materializes the table. */
+        if (me->sighand == NULL) {
+            me->sighand = signal_sighand_alloc();
+            if (me->sighand == NULL)
+                return -YOUSJ_ENOMEM;
+        }
+        me->sighand->act[sig] = in;
     }
     return 0;
 }
