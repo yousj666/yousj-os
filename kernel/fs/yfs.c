@@ -859,6 +859,22 @@ static int dir_link(uint32_t pino, const char *name, uint32_t target)
  * zero (immediately when it is already zero). */
 
 #define REFS_OF(n)   ((n)->flags & 0xFFFFu)
+
+/* M44: hard-link count rides in future[0]; inodes made
+ * before M44 read as 1 (the field was zeroed reserve).
+ * Zero is only ever seen on a never-linked inode. */
+static uint32_t nlink_of(const struct yfs_inode *n)
+{
+    return n->future[0] != 0 ? n->future[0] : 1;
+}
+
+uint32_t yfs_nlink(uint32_t ino)
+{
+    struct yfs_inode n;
+    if (inode_read(ino, &n) != 0)
+        return 1;
+    return nlink_of(&n);
+}
 #define UNLINKED_OF(n) (((n)->flags & 0x10000u) != 0)
 
 static int free_inode_impl(uint32_t ino)
@@ -894,6 +910,13 @@ static int remove_dirent(uint32_t pino, uint32_t slot,
         return -E_IO_L;
     if (inode_read(target, &t) != 0)
         return -E_IO_L;
+    /* M44: one name fewer; the inode itself dies only
+     * when the LAST name goes (free at ref drain). */
+    if (nlink_of(&t) > 1) {
+        t.future[0] = nlink_of(&t) - 1;
+        return inode_write(target, &t) != 0 ? -E_IO_L : 0;
+    }
+    t.future[0] = 0;
     t.flags |= 0x10000u;
     if (inode_write(target, &t) != 0)
         return -E_IO_L;
@@ -1110,6 +1133,7 @@ static long yfs_mknod_t_impl(const char *parent_rel,
     fresh.mode = type == 2 ? 0755u : type == 3 ? 0777u
                                              : 0644u;
     fresh.flags |= 0x20000u; /* MODE_SET */
+    fresh.future[0] = 1; /* M44: nlink */
     for (i = 0; i < 12; i++)
         fresh.blocks[i] = UNALLOC; /* all slots incl. indirect */
     stamp_create(&fresh);
@@ -1149,6 +1173,47 @@ long yfs_rename(const char *old_rel, const char *new_rel)
     long rc;
     txn_begin();
     rc = yfs_rename_impl(old_rel, new_rel);
+    txn_finish(rc >= 0);
+    return rc;
+}
+
+/* M44: hard link -- name an existing inode from a
+ * second directory. Directories refuse (EPERM);
+ * files and symlinks may be linked. */
+static long yfs_link_impl(const char *old_rel,
+                          const char *new_rel)
+{
+    char parent[128], name[40];
+    long target = yfs_lookup(old_rel);
+    long pino;
+    struct yfs_inode t;
+
+    if (target < 0)
+        return target;
+    if (inode_read((uint32_t)target, &t) != 0)
+        return -E_IO_L;
+    if (t.type == 2)
+        return -1; /* EPERM: no hard links to dirs */
+    split_rel(new_rel, parent, name);
+    pino = yfs_lookup(parent);
+    if (pino < 0)
+        return pino;
+    if (dir_find((uint32_t)pino, name, NULL) >= 0)
+        return -E_EXIST_L;
+    if (dir_link((uint32_t)pino, name, (uint32_t)target) != 0)
+        return -E_IO_L;
+    t.future[0] = nlink_of(&t) + 1;
+    t.ctime = (uint32_t)yousj_now_unix();
+    if (inode_write((uint32_t)target, &t) != 0)
+        return -E_IO_L;
+    return 0;
+}
+
+long yfs_link(const char *old_rel, const char *new_rel)
+{
+    long rc;
+    txn_begin();
+    rc = yfs_link_impl(old_rel, new_rel);
     txn_finish(rc >= 0);
     return rc;
 }

@@ -159,6 +159,8 @@ long fs_rename_path(const char *old_path, const char *new_path);
  * fs_readlink_path returns the target's length, or -EINVAL
  * when the path is not a link. */
 long fs_symlink_path(const char *target, const char *linkpath);
+long fs_link_path(const char *old_path, const char *new_path,
+                  bool follow);
 long fs_readlink_path(const char *path, char *buf,
                       uint64_t cap);
 bool fs_file_is_dir(struct yousj_file *f);
@@ -187,6 +189,7 @@ struct yousj_stat_info {
                        M29: yfs format v4 stores all three
                        independently too */
     uint64_t ctime; /* M26/M29: ditto */
+    uint64_t nlink; /* M44: real link count (dirs: 2) */
 };
 bool fs_path_stat2(const char *path, bool follow,
                    struct yousj_stat_info *info);

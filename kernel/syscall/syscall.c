@@ -1474,7 +1474,11 @@ static long fill_stat(uint64_t stat_ptr,
             p[i] = 0;
     }
     st->ino = info->ino;
-    st->nlink = ((info->mode & 0170000u) == 0040000u) ? 2 : 1;
+    st->nlink = info->nlink != 0 ? info->nlink
+                                  : ((info->mode & 0170000u) ==
+                                             0040000u
+                                         ? 2
+                                         : 1); /* M44 */
     st->mode = info->mode;
     st->size = (int64_t)info->size;
     st->blksize = 4096;
@@ -2236,6 +2240,35 @@ static long sys_readlinkat(long dirfd, uint64_t path_ptr,
 }
 
 #define RENAME_NOREPLACE_K 1
+/* M44: link/linkat -- hard links exist since the dent
+ * refactor. AT_SYMLINK_FOLLOW (0x400) resolves the
+ * source first; AT_EMPTY_PATH is not supported. */
+static long sys_linkat(long odfd, uint64_t op, long ndfd,
+                       uint64_t np, long flags)
+{
+    struct task *me = sched_current();
+    static char ob[256], nb[256], ro[256], rn[256];
+    long rc;
+    if (flags & ~0x400L)
+        return -YOUSJ_EINVAL;
+    if (copy_user_string(op, ob, sizeof ob) != 0 ||
+        copy_user_string(np, nb, sizeof nb) != 0)
+        return -YOUSJ_EFAULT;
+    rc = resolve_at(me, odfd, ob, ro);
+    if (rc != 0)
+        return rc;
+    rc = resolve_at(me, ndfd, nb, rn);
+    if (rc != 0)
+        return rc;
+    return fs_link_path(ro, rn, (flags & 0x400L) != 0);
+}
+
+static long sys_link(uint64_t op, uint64_t np)
+{
+    return sys_linkat(YOUSJ_AT_FDCWD, op, YOUSJ_AT_FDCWD, np,
+                      0);
+}
+
 static long sys_renameat(long odfd, uint64_t op, long ndfd,
                          uint64_t np, long flags)
 {
@@ -3317,8 +3350,10 @@ static long dispatch_inner(struct yousj_syscall_ctx *ctx)
         return sys_faccessat((long)a1, a2, (long)a3,
                              (long)a4);
     case YOUSJ_SYS_link:
+        return sys_link(a1, a2);
     case YOUSJ_SYS_linkat:
-        return -YOUSJ_EPERM; /* M33: no hard links (see above) */
+        return sys_linkat((long)a1, a2, (long)a3, a4,
+                          (long)a5);
     case YOUSJ_SYS_chmod:
         return sys_chmod_path(a1, (long)a2, true);
     case YOUSJ_SYS_fchmod:

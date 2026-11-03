@@ -71,6 +71,8 @@ int yfs_truncate(uint32_t ino, uint32_t size);
 int yfs_readdir(uint32_t ino, uint32_t *slot, char *name_out,
                 uint32_t *ino_out, int *is_dir_out);
 /* M13: want_dir=false is unlink, true is rmdir. */
+long yfs_link(const char *old_rel, const char *new_rel);
+uint32_t yfs_nlink(uint32_t ino);
 long yfs_unlink(const char *parent_rel, const char *name,
                 bool want_dir);
 long yfs_rename(const char *old_rel, const char *new_rel);

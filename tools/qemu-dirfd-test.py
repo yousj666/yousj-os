@@ -88,7 +88,7 @@ SCEN = ['openat-rel', 'openat-sub', 'fdcwd', 'statat-rel',
         'utimensat-rel', 'abs-ignores', 'bad-dfd', 'notdir',
         'unlinkat-rel', 'symlinkat-rel', 'mkdirat-rel',
         'renameat-rel', 'renameat2-noreplace',
-        'readlinkat-rel', 'faccessat-rel', 'linkat-eperm',
+        'readlinkat-rel', 'faccessat-rel', 'hardlink',
         'chmod-family', 'creat-modes', 'seekdir', 'sendfile', 'copy-range']
 
 check('shell prompt', until('sh> ', 60))

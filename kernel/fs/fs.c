@@ -79,14 +79,31 @@ static void split_parent_name(const char *rel, char *parent,
 #define MAX_FILES      96
 #define PATH_MAX_LEN   255
 
+/* M44: names live in directory entries, not in the
+ * node -- one node can now be named from several
+ * directories (hard links). A directory node owns a
+ * list of dents; every non-root node is named by
+ * nlink dents. `parent` stays meaningful for
+ * directories only (they cannot be hard-linked). */
+struct yousj_dent {
+    bool in_use;
+    char name[NAME_MAX_LEN + 1];
+    struct yousj_ramfs_node *node;
+    struct yousj_ramfs_node *dir;
+    struct yousj_dent *next;
+};
+
+#define MAX_DENTS 192
+static struct yousj_dent g_dents[MAX_DENTS];
+
 struct yousj_ramfs_node {
     bool in_use;
     bool is_dir;
     bool is_link;                       /* M16: content = target */
-    char name[NAME_MAX_LEN + 1];
-    struct yousj_ramfs_node *parent;
-    struct yousj_ramfs_node *child_head;
-    struct yousj_ramfs_node *sibling;
+    struct yousj_ramfs_node *parent;    /* directories: the
+                                           containing dir */
+    struct yousj_dent *dents;           /* directories: entries */
+    uint32_t nlink;                     /* M44: dent count */
     uint32_t size;                      /* regular files */
     uint32_t mtime;                     /* M23: epoch seconds */
     uint32_t atime;                     /* M26: independent */
@@ -152,16 +169,65 @@ static int mem_cmp_bytes(const char *a, const char *b, uint64_t len)
     return 1;
 }
 
+static struct yousj_dent *dent_alloc(void)
+{
+    int i;
+    for (i = 0; i < MAX_DENTS; i++) {
+        if (!g_dents[i].in_use) {
+            mem_zero((uint8_t *)&g_dents[i],
+                     sizeof(g_dents[i]));
+            g_dents[i].in_use = true;
+            return &g_dents[i];
+        }
+    }
+    return NULL;
+}
+
+static void dent_attach(struct yousj_ramfs_node *dir,
+                        struct yousj_dent *d)
+{
+    d->dir = dir;
+    d->next = dir->dents;
+    dir->dents = d;
+}
+
+static void dent_detach(struct yousj_dent *d)
+{
+    struct yousj_dent **link = &d->dir->dents;
+    while (*link != NULL && *link != d)
+        link = &(*link)->next;
+    if (*link == d) {
+        *link = d->next;
+        d->next = NULL;
+    }
+}
+
+/* Unlink-style removal frees the dent for reuse;
+ * rename keeps its dent (it is re-attached), so the
+ * two steps are separate on purpose (M44 debug:
+ * conflating them recycled a live dent). */
+static void dent_free(struct yousj_dent *d)
+{
+    d->in_use = false;
+}
+
+static struct yousj_dent *node_find_dent(
+    struct yousj_ramfs_node *dir, const char *name, uint64_t len)
+{
+    struct yousj_dent *d;
+    for (d = dir->dents; d != NULL; d = d->next) {
+        if (str_len(d->name) == len &&
+            mem_cmp_bytes(d->name, name, len))
+            return d;
+    }
+    return NULL;
+}
+
 static struct yousj_ramfs_node *node_find_child(
     struct yousj_ramfs_node *dir, const char *name, uint64_t len)
 {
-    struct yousj_ramfs_node *c;
-    for (c = dir->child_head; c != NULL; c = c->sibling) {
-        if (str_len(c->name) == len &&
-            mem_cmp_bytes(c->name, name, len))
-            return c;
-    }
-    return NULL;
+    struct yousj_dent *d = node_find_dent(dir, name, len);
+    return d != NULL ? d->node : NULL;
 }
 
 static struct yousj_ramfs_node *node_create(
@@ -169,20 +235,27 @@ static struct yousj_ramfs_node *node_create(
     bool is_dir)
 {
     struct yousj_ramfs_node *n = node_alloc();
+    struct yousj_dent *d;
     if (n == NULL)
         return NULL;
+    d = dent_alloc();
+    if (d == NULL) {
+        n->in_use = false;
+        return NULL;
+    }
     if (len > NAME_MAX_LEN)
         len = NAME_MAX_LEN;
-    mem_copy((uint8_t *)n->name, (const uint8_t *)name, len);
-    n->name[len] = '\0';
+    mem_copy((uint8_t *)d->name, (const uint8_t *)name, len);
+    d->name[len] = '\0';
+    d->node = n;
     n->is_dir = is_dir;
     n->mode = is_dir ? 0755u : 0644u; /* M36 */
     n->mtime = (uint32_t)yousj_now_unix();
     n->atime = n->mtime;
     n->ctime = n->mtime;
     n->parent = parent;
-    n->sibling = parent->child_head;
-    parent->child_head = n;
+    n->nlink = 1;
+    dent_attach(parent, d);
     return n;
 }
 
@@ -351,19 +424,19 @@ static void node_truncate(struct yousj_ramfs_node *n)
 
 /* --- M13: detach / deferred free -------------------------------- */
 
-static void node_detach(struct yousj_ramfs_node *n)
-{
-    struct yousj_ramfs_node *p = n->parent;
-    struct yousj_ramfs_node **link;
+/* M44: name removal is dent_detach() plus a nlink
+ * drop; the node dies when the count reaches zero
+ * AND the last open reference drains (node_maybe_
+ * free via the unlinked flag, as since M13). */
+static void node_maybe_free(struct yousj_ramfs_node *n);
 
-    if (p == NULL)
-        return;
-    link = &p->child_head;
-    while (*link != NULL && *link != n)
-        link = &(*link)->sibling;
-    if (*link == n) {
-        *link = n->sibling;
-        n->sibling = NULL;
+static void node_unname(struct yousj_ramfs_node *n)
+{
+    if (n->nlink > 0)
+        n->nlink--;
+    if (n->nlink == 0) {
+        n->unlinked = true;
+        node_maybe_free(n);
     }
 }
 
@@ -1582,14 +1655,18 @@ long fs_unlink_path(const char *path)
         struct yousj_ramfs_node *child;
         if (parent == NULL)
             return -YOUSJ_ENOENT;
-        child = node_find_child(parent, base, str_len(base));
-        if (child == NULL)
-            return -YOUSJ_ENOENT;
-        if (child->is_dir)
-            return -YOUSJ_EISDIR;
-        node_detach(child);
-        child->unlinked = true;
-        node_maybe_free(child);
+        {
+            struct yousj_dent *dent = node_find_dent(
+                parent, base, str_len(base));
+            if (dent == NULL)
+                return -YOUSJ_ENOENT;
+            child = dent->node;
+            if (child->is_dir)
+                return -YOUSJ_EISDIR;
+            dent_detach(dent);
+            dent_free(dent);
+            node_unname(child);
+        }
         return 0;
     }
 }
@@ -1614,18 +1691,22 @@ long fs_rmdir_path(const char *path)
         struct yousj_ramfs_node *child;
         if (parent == NULL)
             return -YOUSJ_ENOENT;
-        child = node_find_child(parent, base, str_len(base));
-        if (child == NULL)
-            return -YOUSJ_ENOENT;
-        if (!child->is_dir)
-            return -YOUSJ_ENOTDIR;
-        if (child == g_root)
-            return -YOUSJ_EINVAL;
-        if (child->child_head != NULL)
-            return -YOUSJ_ENOTEMPTY_L;
-        node_detach(child);
-        child->unlinked = true;
-        node_maybe_free(child);
+        {
+            struct yousj_dent *dent = node_find_dent(
+                parent, base, str_len(base));
+            if (dent == NULL)
+                return -YOUSJ_ENOENT;
+            child = dent->node;
+            if (!child->is_dir)
+                return -YOUSJ_ENOTDIR;
+            if (child == g_root)
+                return -YOUSJ_EINVAL;
+            if (child->dents != NULL)
+                return -YOUSJ_ENOTEMPTY_L;
+            dent_detach(dent);
+            dent_free(dent);
+            node_unname(child);
+        }
         return 0;
     }
 }
@@ -1676,30 +1757,91 @@ long fs_rename_path(const char *old_path, const char *new_path)
                 break;
         }
     }
-    dst = node_find_child(nparent, nbase, str_len(nbase));
-    if (dst == src)
-        return 0;
-    if (dst != NULL) {
-        if (dst->is_dir) {
-            if (!src->is_dir)
-                return -YOUSJ_EISDIR;
-            if (dst->child_head != NULL)
-                return -YOUSJ_ENOTEMPTY_L;
-        } else if (src->is_dir) {
-            return -YOUSJ_ENOTDIR;
+    {
+        struct yousj_dent *sdent = node_find_dent(
+            oparent, obase, str_len(obase));
+        struct yousj_dent *ddent = node_find_dent(
+            nparent, nbase, str_len(nbase));
+        if (ddent != NULL && ddent->node == src)
+            return 0;
+        if (ddent != NULL) {
+            dst = ddent->node;
+            if (dst->is_dir) {
+                if (!src->is_dir)
+                    return -YOUSJ_EISDIR;
+                if (dst->dents != NULL)
+                    return -YOUSJ_ENOTEMPTY_L;
+            } else if (src->is_dir) {
+                return -YOUSJ_ENOTDIR;
+            }
+            dent_detach(ddent);
+            dent_free(ddent);
+            node_unname(dst);
         }
-        node_detach(dst);
-        dst->unlinked = true;
-        node_maybe_free(dst);
+        /* M44: the dent itself moves and takes the new
+         * name; the node (and its other names) never
+         * notices. */
+        dent_detach(sdent);
+        mem_copy((uint8_t *)sdent->name,
+                 (const uint8_t *)nbase, str_len(nbase) + 1);
+        dent_attach(nparent, sdent);
+        if (src->is_dir)
+            src->parent = nparent;
     }
-    node_detach(src);
-    mem_copy((uint8_t *)src->name, (const uint8_t *)nbase,
-             str_len(nbase) + 1);
-    src->parent = nparent;
-    src->sibling = nparent->child_head;
-    nparent->child_head = src;
     src->ctime = (uint32_t)yousj_now_unix(); /* M26 */
     return 0;
+}
+
+/* M44: hard links. The source is resolved with the
+ * caller's follow choice (linkat's AT_SYMLINK_FOLLOW);
+ * without it a symlink source links the symlink
+ * itself. Directories refuse with EPERM on both
+ * backends; cross-backend is EXDEV. */
+long fs_link_path(const char *old_path, const char *new_path,
+                  bool follow)
+{
+    char ro[PATH_MAX_LEN + 1], rn[PATH_MAX_LEN + 1];
+    long rc = fs_resolve_links(old_path, ro, follow);
+    if (rc != 0)
+        return rc;
+    rc = fs_resolve_links(new_path, rn, false);
+    if (rc != 0)
+        return rc;
+    if (is_proc_path(ro) || is_proc_path(rn))
+        return -YOUSJ_EACCES_L;
+    {
+        bool od = is_data_path(ro), nd = is_data_path(rn);
+        if (od != nd)
+            return -YOUSJ_EXDEV_L;
+        if (od)
+            return yfs_link(data_rel(ro), data_rel(rn));
+    }
+    {
+        struct yousj_ramfs_node *src = fs_lookup(ro);
+        char base[NAME_MAX_LEN + 1];
+        struct yousj_ramfs_node *parent;
+        struct yousj_dent *d;
+        if (src == NULL)
+            return -YOUSJ_ENOENT_L;
+        if (src->is_dir)
+            return -1; /* EPERM */
+        parent = walk(rn, true, base);
+        if (parent == NULL)
+            return -YOUSJ_ENOENT_L;
+        if (node_find_child(parent, base, str_len(base)) !=
+            NULL)
+            return -YOUSJ_EEXIST_L;
+        d = dent_alloc();
+        if (d == NULL)
+            return -YOUSJ_ENOSPC;
+        mem_copy((uint8_t *)d->name, (const uint8_t *)base,
+                 str_len(base) + 1);
+        d->node = src;
+        src->nlink++;
+        src->ctime = (uint32_t)yousj_now_unix();
+        dent_attach(parent, d);
+        return 0;
+    }
 }
 
 long fs_symlink_path(const char *target, const char *linkpath)
@@ -1862,6 +2004,17 @@ static void stat_from_ramfs_node(struct yousj_ramfs_node *n,
         info->size = n->size;
     }
     info->ino = (uint64_t)(n - g_nodes) + 2;
+    if (n->is_dir) {
+        /* Linux convention: 2 + subdirectories */
+        uint32_t subs = 0;
+        struct yousj_dent *d;
+        for (d = n->dents; d != NULL; d = d->next)
+            if (d->node->is_dir)
+                subs++;
+        info->nlink = 2 + subs;
+    } else {
+        info->nlink = n->nlink;
+    }
 }
 
 static bool stat_from_yfs_ino(uint32_t ino,
@@ -1895,6 +2048,7 @@ static bool stat_from_yfs_ino(uint32_t ino,
         return false;
     }
     info->ino = (uint64_t)ino + 1000000u;
+    info->nlink = t == 2 ? 2 : yfs_nlink(ino);
     return true;
 }
 
@@ -2002,6 +2156,7 @@ bool fs_file_stat(struct yousj_file *f,
 {
     if (f == NULL)
         return false;
+    info->nlink = 1; /* M44: special files */
     if (f->epoll != NULL) {
         info->mode = S_IFREG_K | 0600u;
         info->mtime = 0;
@@ -2611,13 +2766,15 @@ long file_getdents(struct yousj_file *f, uint8_t *buf, uint64_t count)
         return -YOUSJ_ENOTDIR;
     {
         long blocked = 0; /* M38 */
-        for (c = f->node->child_head; c != NULL;
-             c = c->sibling, idx++) {
+        struct yousj_dent *dwalk;
+        for (dwalk = f->node->dents; dwalk != NULL;
+             dwalk = dwalk->next, idx++) {
+            struct yousj_ramfs_node *c = dwalk->node;
             uint64_t namelen, reclen;
             uint8_t *rec;
             if (idx < f->offset)
                 continue;
-            namelen = str_len(c->name);
+            namelen = str_len(dwalk->name);
             reclen = (19 + namelen + 1 + 7) & ~7ULL;
             if (used + reclen > count) {
                 if (used == 0)
@@ -2631,7 +2788,7 @@ long file_getdents(struct yousj_file *f, uint8_t *buf, uint64_t count)
             *(uint16_t *)(rec + 16) = (uint16_t)reclen;
             rec[18] = c->is_dir ? YOUSJ_DT_DIR : c->is_link ? 10
                           : YOUSJ_DT_REG;
-            mem_copy(rec + 19, (const uint8_t *)c->name,
+            mem_copy(rec + 19, (const uint8_t *)dwalk->name,
                      namelen);
             used += reclen;
             f->offset = idx + 1;
@@ -2657,8 +2814,7 @@ void fs_init(void)
     g_root = node_alloc();
     g_root->is_dir = true;
     g_root->mode = 0755; /* M36 */
-    g_root->name[0] = '/';
-    g_root->name[1] = '\0';
+    g_root->nlink = 1;
     g_root->parent = g_root;
     /* M25: the /proc mountpoint shows in the root listing;
      * every operation on it is intercepted by proc_open /

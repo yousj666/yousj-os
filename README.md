@@ -637,10 +637,27 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   dirfdtest 加 copy-range（定位拷贝含空洞、
   lseek 后流式追加、内容逐字节比对、flags
   与管道两条 EINVAL；ramfs/yfs 各一遍）。
-- ⏳ 下一步（M44 专项）：硬链接——ramfs 需
-  把名字从节点里拆成独立目录项（现 33 处树
-  形引用），yfs 目录项已独立相对易行；
-  link/linkat 随之转正。另候选 fdinfo。
+- ✅ 硬链接 M44（2026-11-03）：ramfs 目录项
+  重构——名字从节点里拆出为独立 dent 池
+  （192 项），节点只剩内容与 nlink；create/
+  lookup/getdents/unlink/rmdir/rename 全部
+  改走 dent；rename 变为「移动 dent 改名」，
+  节点与其他名字无感。yfs：nlink 存 inode
+  预留字 future[0]（旧 inode 读作 1，格式不
+  变），remove_dirent 改按计数删、dir_link
+  复用。link/linkat 转正（AT_SYMLINK_
+  FOLLOW 支持；目录 EPERM、重名 EEXIST、
+  跨后端 EXDEV）；st_nlink 报真实计数（目
+  录为 2＋子目录数）。重构中真 bug 一枚：
+  dent_detach 与 dent_free 曾混为一谈，
+  rename 复用了已「释放」的 dent 造成名单
+  自环，已拆清并定位修复。验收：dirfdtest
+  的 linkat-eperm 场景改写为 hardlink（建链
+  后 nlink=2、经一名字写入另一名字可见、
+  unlink 后计数回落、两条规则），ramfs 与
+  yfs 各跑一遍。
+- ⏳ 下一步候选：/proc/<pid>/fdinfo、
+  renameat2 余下 flags、inotify 盘点。
 
 ## 从零构建
 

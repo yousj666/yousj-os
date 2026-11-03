@@ -276,7 +276,9 @@ int main(int argc, char **argv)
     sys_call1(SYS_unlink, (long)(uintptr_t)p);
     join(p, dir, "sf-dst");
     sys_call1(SYS_unlink, (long)(uintptr_t)p);
-    join(p, dir, "cf-src");
+    join(p, dir, "hard");
+    sys_call1(SYS_unlink, (long)(uintptr_t)p);
+    join(p, dir, "cf-src");    join(p, dir, "cf-src");
     sys_call1(SYS_unlink, (long)(uintptr_t)p);
     join(p, dir, "cf-dst");
     sys_call1(SYS_unlink, (long)(uintptr_t)p);
@@ -508,12 +510,60 @@ int main(int argc, char **argv)
                d == -2 && e == 0 && g == 0);
     }
 
-    /* linkat: hard links are -EPERM by design (M33) */
+    /* M44: hard links live now. f.txt currently
+     * holds "dirfd-data" (10 bytes, from earlier
+     * acts). */
     {
-        long rc = sys_call5(SYS_linkat, dfd,
-                            (long)(uintptr_t)"f.txt", dfd,
-                            (long)(uintptr_t)"hard", 0);
-        report("linkat-eperm", rc == -1);
+        struct st sb;
+        char rb[16];
+        long fd, rc;
+        rc = sys_call5(SYS_linkat, dfd,
+                       (long)(uintptr_t)"f.txt", dfd,
+                       (long)(uintptr_t)"hard", 0);
+        int ok = rc == 0;
+        sys_call4(SYS_newfstatat, dfd,
+                  (long)(uintptr_t)"hard",
+                  (long)(uintptr_t)&sb, 0);
+        ok = ok && sb.nlink == 2;
+        join(p, dir, "hard");
+        fd = sys_call3(SYS_open, (long)(uintptr_t)p,
+                       02001 /* O_WRONLY|O_APPEND */, 0);
+        sys_call3(SYS_write, fd, (long)(uintptr_t)"++",
+                  2);
+        sys_call1(SYS_close, fd);
+        join(p, dir, "f.txt");
+        fd = sys_call3(SYS_open, (long)(uintptr_t)p, 0,
+                       0);
+        ok = ok && sys_call3(SYS_read, fd,
+                             (long)(uintptr_t)rb, 12) == 12 &&
+             rb[10] == '+' && rb[11] == '+';
+        sys_call1(SYS_close, fd);
+        /* unlink one name: data and count follow */
+        join(p, dir, "f.txt");
+        sys_call1(SYS_unlink, (long)(uintptr_t)p);
+        sys_call4(SYS_newfstatat, dfd,
+                  (long)(uintptr_t)"hard",
+                  (long)(uintptr_t)&sb, 0);
+        ok = ok && sb.nlink == 1;
+        /* recreate f.txt for the acts that follow */
+        join(p, dir, "f.txt");
+        fd = sys_call4(SYS_open, (long)(uintptr_t)p,
+                       0101, 0644, 0);
+        sys_call3(SYS_write, fd,
+                  (long)(uintptr_t)"dirfd-data", 10);
+        sys_call1(SYS_close, fd);
+        /* rules: dirs refuse, existing names refuse */
+        ok = ok && sys_call5(SYS_linkat, dfd,
+                             (long)(uintptr_t)"sub2", dfd,
+                             (long)(uintptr_t)"dlink",
+                             0) == -1;
+        ok = ok && sys_call5(SYS_linkat, dfd,
+                             (long)(uintptr_t)"f.txt", dfd,
+                             (long)(uintptr_t)"hard",
+                             0) == -17;
+        report("hardlink", ok);
+        join(p, dir, "hard");
+        sys_call1(SYS_unlink, (long)(uintptr_t)p);
     }
 
     /* --- M36: chmod / chown --- */
@@ -804,7 +854,9 @@ int main(int argc, char **argv)
     sys_call1(SYS_unlink, (long)(uintptr_t)p);
     join(p, dir, "sf-dst");
     sys_call1(SYS_unlink, (long)(uintptr_t)p);
-    join(p, dir, "cf-src");
+    join(p, dir, "hard");
+    sys_call1(SYS_unlink, (long)(uintptr_t)p);
+    join(p, dir, "cf-src");    join(p, dir, "cf-src");
     sys_call1(SYS_unlink, (long)(uintptr_t)p);
     join(p, dir, "cf-dst");
     sys_call1(SYS_unlink, (long)(uintptr_t)p);
