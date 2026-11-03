@@ -84,8 +84,16 @@ def memfree():
 try:
     ok = until('sh> ')
     check('boot to shell', ok)
+    t = run_cmd('/bin/busybox --install -s /bin')
+    check('applet install completes', 'No space' not in t and
+          'not an absolute' not in t)
     free0 = None
     for tag in ('run1', 'run2'):
+        t = run_cmd('grep BBSCRIPT /bbtest.sh')
+        check(tag + ' bare grep applet',
+              'echo BBSCRIPT' in t and 'cannot exec' not in t)
+        t = run_cmd('wc -c /bbtest.sh')
+        check(tag + ' bare wc applet', t.strip().find('44') >= 0)
         t = run_cmd('busybox echo BBHELLO')
         check(tag + ' echo', 'BBHELLO' in t and
               'cannot exec' not in t)

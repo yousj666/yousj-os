@@ -75,7 +75,9 @@ static void split_parent_name(const char *rel, char *parent,
     }
 }
 
-#define MAX_NODES      128
+#define MAX_NODES      512 /* M60: room for busybox --install's
+                            * ~300 applet symlinks alongside the
+                            * shipped programs */
 #define NAME_MAX_LEN   31
 #define MAX_FILE_PAGES 256 /* 1 MiB per ramfs file (M58: the
                             * 650 KiB dynamic loader must fit) */
@@ -96,7 +98,8 @@ struct yousj_dent {
     struct yousj_dent *next;
 };
 
-#define MAX_DENTS 192
+#define MAX_DENTS 768 /* M60: dent pool feeds every directory;
+                       * busybox --install alone wants ~300 */
 static struct yousj_dent g_dents[MAX_DENTS];
 
 struct yousj_ramfs_node {

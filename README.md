@@ -982,13 +982,25 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   2MiB→8MiB（M58 扩窗后旧守卫
   一直误报失败、靠链接产物已
   落盘才没断链）。
-- ⏳ 下一步候选：让 busybox 的
-  applet 链接装起来（--install
-  受 ramfs 节点数 128 所限），
-  或 robust futex，或 inotify
-  事件补完（ftruncate 的
-  MODIFY、exchange 的
-  MOVE_SELF）。
+- ✅ applet 全家桶 M60
+  （2026-11-04）：/bin/busybox
+  --install -s /bin 一次装满
+  ——约 300 个 applet 以裸名
+  可用（grep/wc/head 等实测）。
+  卡点不在文件数直觉处：ramfs
+  节点池 128→512 后仍 ENOSPC，
+  真凶是全局目录项池 192，
+  一并提到 768。至此「能跑真
+  Linux 程序」这条线落地：一
+  个真实发行版二进制连同它
+  的命令全家在 Yousj OS 上
+  日常可用。
+- ⏳ 下一步候选：robust futex
+  （set_robust_list 目前是存
+  根，属主死亡的 EOWNERDEAD
+  语义未做），或 inotify 事件
+  补完（ftruncate 的 MODIFY、
+  exchange 的 MOVE_SELF）。
 
 ## 从零构建
 
