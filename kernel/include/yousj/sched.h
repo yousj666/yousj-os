@@ -307,7 +307,7 @@ void         sched_set_name(struct task *t, const char *name);
  * reaper that frees a zombie's kernel stack and pool slot. */
 struct task *sched_find_zombie_child(uint64_t parent_tid, int pid);
 int          sched_has_children(uint64_t parent_tid, int pid);
-void         sched_adopt_children(uint64_t from_tid, uint64_t to_tid);
+int          sched_adopt_children(uint64_t from_tid, uint64_t to_tid);
 int          sched_reap_zombie(struct task *victim);
 
 /* Stage-1 kill ( backs the kill syscall and the M4 acceptance

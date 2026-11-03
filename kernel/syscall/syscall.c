@@ -258,6 +258,56 @@ static long sys_write(long fd, uint64_t buf, uint64_t len)
     return file_write(f, (const uint8_t *)(uintptr_t)buf, len);
 }
 
+static long sys_read(long fd, uint64_t buf, uint64_t count);
+
+/* M56: vectored I/O (readv 19 / writev 20) -- musl's stdio
+ * flush is a writev, so this is on the hot path for any
+ * real libc program. The iovec array is staged through a
+ * small stack chunk; syscalls compose the existing
+ * per-buffer sys_read/sys_write, with the usual rule that
+ * progress already made wins over a later error. */
+struct yousj_iovec {
+    uint64_t base;
+    uint64_t len;
+};
+
+static long sys_rw_vector(long fd, uint64_t iov_ptr, long iovcnt,
+                          int is_write)
+{
+    long total = 0;
+    long done = 0;
+    if (iovcnt < 0 || iovcnt > 1024)
+        return -YOUSJ_EINVAL;
+    while (done < iovcnt) {
+        struct yousj_iovec chunk[8];
+        long n = iovcnt - done, i;
+        if (n > 8)
+            n = 8;
+        if (!user_range_ok(iov_ptr +
+                           (uint64_t)done * sizeof(chunk[0]),
+                           (uint64_t)n * sizeof(chunk[0])))
+            return total > 0 ? total : -YOUSJ_EFAULT;
+        for (i = 0; i < n; i++)
+            chunk[i] = ((const struct yousj_iovec *)
+                        (uintptr_t)iov_ptr)[done + i];
+        for (i = 0; i < n; i++) {
+            long rc;
+            if (chunk[i].len == 0)
+                continue;
+            rc = is_write
+                     ? sys_write(fd, chunk[i].base, chunk[i].len)
+                     : sys_read(fd, chunk[i].base, chunk[i].len);
+            if (rc < 0)
+                return total > 0 ? total : rc;
+            total += rc;
+            if ((uint64_t)rc < chunk[i].len)
+                return total; /* short transfer: stop here */
+        }
+        done += n;
+    }
+    return total;
+}
+
 /* The one process-exit path: exit/exit_group arrive with
  * sig == 0 and a status; fatal signal delivery (signal.c) with
  * sig != 0. Records how the task died for wait4, tears the
@@ -371,9 +421,22 @@ void process_exit(long status, int sig)
         space_drop(sp);
     }
 
-    /* Orphans are adopted by init, which reaps them (6.1). */
-    if (g_init_task != NULL)
-        sched_adopt_children(me->tid, g_init_task->tid);
+    /* Orphans are adopted by init, which reaps them (6.1).
+     * M56: an adoptee that is ALREADY a zombie (a joined
+     * thread is the canonical case: it died while its
+     * parent lived, and the parent never wait4s it) has
+     * already delivered its wakeup -- to the wrong parent.
+     * Without a fresh wake, init sleeps in wait4 forever
+     * next to a reapable child: the adoption lost-wakeup.
+     * Wake it; a specific-pid wait simply re-blocks. */
+    if (g_init_task != NULL) {
+        int zombies = sched_adopt_children(me->tid,
+                                           g_init_task->tid);
+        if (zombies > 0 &&
+            g_init_task->state == TASK_BLOCKED &&
+            g_init_task->wait_target != 0)
+            sched_wake(g_init_task);
+    }
 
     /* SIGCHLD to the parent (M7), carrying the same status word
      * wait4 will report. It is queued before the zombie transition
@@ -483,6 +546,17 @@ static long sys_wait4(long pid, uint64_t status_ptr, long options,
 #define CLONE_THREAD_K        0x10000    /* M53 */
 #define CLONE_FILES_K         0x400      /* M54 */
 #define CLONE_FS_K            0x200      /* M55 */
+#define CLONE_SYSVSEM_K       0x40000    /* M56: accepted,
+                                          * ignored (no SysV
+                                          * semaphore undo
+                                          * lists exist) */
+#define CLONE_DETACHED_K      0x400000   /* M56: accepted,
+                                          * ignored (musl
+                                          * passes it for
+                                          * every thread;
+                                          * our exit
+                                          * bookkeeping is
+                                          * unaffected) */
 
 /* M52: write a 32-bit value into an address space with no
  * chance of faulting -- translate first, then go through
@@ -536,7 +610,8 @@ static long sys_clone(struct yousj_syscall_ctx *ctx, long flags,
                   CLONE_CHILD_CLEARTID_K |
                   CLONE_CHILD_SETTID_K | CLONE_SIGHAND_K |
                   CLONE_THREAD_K | CLONE_FILES_K |
-                  CLONE_FS_K)) != 0 ||
+                  CLONE_FS_K | CLONE_SYSVSEM_K |
+                  CLONE_DETACHED_K)) != 0 ||
         ((flags & 0xFF) != 0 && (flags & 0xFF) != YOUSJ_SIGCHLD))
         return -YOUSJ_EINVAL;
     if (child_stack != 0 && !share_vm)
@@ -743,6 +818,7 @@ static long sys_execve(uint64_t path_ptr, uint64_t argv_ptr,
     uint64_t stage_phys = 0, stage_len = 0, stage_pages = 0;
     struct vmm_space *space, *old;
     uint64_t entry = 0, img_brk = 0, heap_base, new_sp = 0;
+    uint64_t ephdr = 0, ephnum = 0; /* M56: for the auxv */
 
     if (me->mm == NULL)
         return -YOUSJ_EINVAL;
@@ -837,7 +913,8 @@ static long sys_execve(uint64_t path_ptr, uint64_t argv_ptr,
         goto fail_release;
     if (elf_load_user_image(
             (const uint8_t *)yousj_phys_to_virt(stage_phys),
-            stage_len, space, &entry, &img_brk) != 0) {
+            stage_len, space, &entry, &img_brk,
+            &ephdr, &ephnum) != 0) {
         pmm_free_pages(stage_phys, stage_pages);
         goto fail_destroy;
     }
@@ -845,7 +922,8 @@ static long sys_execve(uint64_t path_ptr, uint64_t argv_ptr,
                                               * everything out */
     heap_base = (img_brk + YOUSJ_PAGE_SIZE - 1) & ~(YOUSJ_PAGE_SIZE - 1);
     if (elf_build_initial_stack(space, YOUSJ_INIT_STACK_TOP,
-                                argv_k, envp_k, &new_sp) != 0)
+                                argv_k, envp_k, ephdr, ephnum,
+                                entry, &new_sp) != 0)
         goto fail_destroy;
 
     /* Commit: swap the space, drop the old one, land. This
@@ -3810,6 +3888,10 @@ static long dispatch_inner(struct yousj_syscall_ctx *ctx)
         return sys_read((long)a1, a2, a3);
     case YOUSJ_SYS_write:
         return sys_write((long)a1, a2, a3);
+    case YOUSJ_SYS_readv:
+        return sys_rw_vector((long)a1, a2, (long)a3, 0);
+    case YOUSJ_SYS_writev:
+        return sys_rw_vector((long)a1, a2, (long)a3, 1);
     case YOUSJ_SYS_open:
         return sys_openat(YOUSJ_AT_FDCWD, a1, (long)a2,
                           (long)a3);
@@ -4006,6 +4088,17 @@ static long dispatch_inner(struct yousj_syscall_ctx *ctx)
         return (long)sched_current()->tgid;
     case YOUSJ_SYS_gettid:
         return (long)sched_current()->tid;
+    case YOUSJ_SYS_sched_yield:
+        sched_yield();
+        return 0;
+    case YOUSJ_SYS_set_robust_list:
+        /* M56 stub: accepted, not tracked. Robust mutexes
+         * behave as ordinary ones; the owner-death wakeup
+         * (EOWNERDEAD) is not implemented. musl registers
+         * a list for every thread and ignores failure, but
+         * a hard ENOSYS here has bitten other libcs, so the
+         * honest stub returns success. */
+        return 0;
     case YOUSJ_SYS_getppid:
         return (long)sched_current()->parent_tid;
     case YOUSJ_SYS_set_tid_address:

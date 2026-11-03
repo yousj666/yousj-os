@@ -876,14 +876,48 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   孩子 chdir 到新建目录并
   umask(077)，父的 getcwd 与
   umask 探针随之而变。
-- ⏳ 下一步候选：接 musl 跑真
-  pthread 程序作形式验证（静态
-  链接一个 musl 多线程程序进
-  initramfs，验证整条 pthread
-  创建/汇合/TLS 链），或 robust
-  futex，或 inotify 事件补完
-  （ftruncate 的 MODIFY、
-  exchange 的 MOVE_SELF）。
+- ✅ 真 libc 形式验证 M56
+  （2026-11-04）：musl 1.2.5 静态
+  PIE 程序（musltest：3 线程×
+  5000 次互斥计数＋__thread TLS
+  ＋join 返回值）在 Yousj OS 上
+  跑出 PASS。配套内核工作：
+  ① auxv 补全——AT_PHDR/PHENT/
+  PHNUM/ENTRY/UID/EUID/GID/EGID/
+  HWCAP/CLKTCK/RANDOM/SECURE
+  （此前只有 PAGESZ），栈块按
+  ABI 16 字节对齐；② ELF 加载器
+  支持 ET_DYN 静态 PIE（偏置到
+  窗口基址、镜像靠 AT_PHDR 自
+  重定位），PT_INTERP 明确拒绝；
+  ③ readv/writev(19/20)——musl
+  的 stdio 冲刷走 writev；
+  ④ sched_yield(24)、set_robust_
+  list(273) 存根（接受不跟踪，
+  robust 锁退化为普通锁）；
+  ⑤ clone 接受 CLONE_SYSVSEM 与
+  CLONE_DETACHED 并忽略（musl
+  每个线程都带）。顺带揪出并
+  修复一个真 bug：收养丢失唤醒
+  ——子任务先成僵尸、父后退出时
+  唤醒发给了旧父，被 init 收养
+  后无人再唤醒正在 wait4 的
+  init，僵尸永不回收（每 run 漏
+  3 个任务的内核栈）；收养时若
+  有现成僵尸则补唤醒 init。
+  musl 树取自 Alpine musl-dev
+  1.2.5 apk（dl-cdn.alpinelinux.
+  org），解压在 build/musl/，
+  Makefile 有专用规则（rcrt1.o
+  自重定位入口，不是 Scrt1.o）。
+  验收套件增至 20 个。
+- ⏳ 下一步候选：robust futex，
+  或 inotify 事件补完（ftruncate
+  的 MODIFY、exchange 的
+  MOVE_SELF），或动态链接第一
+  步（PT_INTERP＋ld-musl），或
+  线程组退出语义（exit_group
+  杀全组）。
 
 ## 从零构建
 

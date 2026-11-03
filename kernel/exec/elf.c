@@ -39,8 +39,10 @@ struct elf64_phdr {
 #define ELFCLASS64 2
 #define ELFDATA2LSB 1
 #define ET_EXEC    2
+#define ET_DYN     3
 #define EM_X86_64  62
 #define PT_LOAD    1
+#define PT_INTERP  3
 #define PF_X 1
 #define PF_W 2
 #define PF_R 4
@@ -59,11 +61,18 @@ static uint32_t seg_vmm_flags(const struct elf64_phdr *ph)
 
 int elf_load_user_image(const uint8_t *image, uint64_t size,
                         struct vmm_space *space,
-                        uint64_t *entry_out, uint64_t *brk_out)
+                        uint64_t *entry_out, uint64_t *brk_out,
+                        uint64_t *phdr_out, uint64_t *phnum_out)
 {
     const struct elf64_ehdr *eh;
     uint64_t brk = 0;
+    uint64_t bias = 0;
     uint32_t i;
+
+    if (phdr_out != NULL)
+        *phdr_out = 0;
+    if (phnum_out != NULL)
+        *phnum_out = 0;
 
     if (image == NULL || space == NULL || size < sizeof(*eh))
         return -1;
@@ -71,12 +80,20 @@ int elf_load_user_image(const uint8_t *image, uint64_t size,
     if (eh->ident[0] != 0x7F || eh->ident[1] != 'E' ||
         eh->ident[2] != 'L' || eh->ident[3] != 'F' ||
         eh->ident[4] != ELFCLASS64 || eh->ident[5] != ELFDATA2LSB ||
-        eh->type != ET_EXEC || eh->machine != EM_X86_64 ||
+        eh->machine != EM_X86_64 ||
         eh->phentsize != sizeof(struct elf64_phdr) || eh->phnum == 0 ||
         eh->phoff > size ||
         (uint64_t)eh->phnum * sizeof(struct elf64_phdr) > size - eh->phoff)
         return -1;
-    if (eh->entry < YOUSJ_USER_BASE || eh->entry >= YOUSJ_USER_LIMIT)
+    /* M56: ET_DYN (static PIE) loads at the window base;
+     * the image relocates itself at startup from AT_PHDR,
+     * exactly as on Linux. ET_EXEC keeps its linked VAs. */
+    if (eh->type == ET_DYN)
+        bias = YOUSJ_USER_BASE;
+    else if (eh->type != ET_EXEC)
+        return -1;
+    if (eh->entry + bias < YOUSJ_USER_BASE ||
+        eh->entry + bias >= YOUSJ_USER_LIMIT)
         return -1;
 
     for (i = 0; i < eh->phnum; i++) {
@@ -85,8 +102,18 @@ int elf_load_user_image(const uint8_t *image, uint64_t size,
         uint64_t seg_start, seg_end, page;
         uint32_t want;
 
+        if (ph->type == PT_INTERP)
+            return -1; /* no dynamic loader yet (M56) */
         if (ph->type != PT_LOAD)
             continue;
+        /* M56: if this segment's file range covers the
+         * program-header table, the headers land in memory
+         * with it -- remember where, for AT_PHDR. */
+        if (phdr_out != NULL && *phdr_out == 0 &&
+            eh->phoff >= ph->offset &&
+            eh->phoff + (uint64_t)eh->phnum * sizeof(*ph) <=
+                ph->offset + ph->filesz)
+            *phdr_out = ph->vaddr + bias + (eh->phoff - ph->offset);
         if (ph->memsz == 0)
             continue; /* empty segment (e.g. an all-bss data
                        * segment with no content in this image) */
@@ -94,8 +121,8 @@ int elf_load_user_image(const uint8_t *image, uint64_t size,
             return -1;
         if (ph->offset > size || ph->filesz > size - ph->offset)
             return -1;
-        seg_start = ph->vaddr;
-        seg_end = ph->vaddr + ph->memsz;
+        seg_start = ph->vaddr + bias;
+        seg_end = ph->vaddr + bias + ph->memsz;
         /* A PT_LOAD lying entirely below the window is the ELF
          * headers coverage segment GNU ld adds to some images;
          * nothing in the image references it (entry and all
@@ -138,14 +165,14 @@ int elf_load_user_image(const uint8_t *image, uint64_t size,
             /* Copy the intersection of this page with the
              * segment's file-backed part [vaddr, vaddr+filesz). */
             copy_lo = page;
-            if (copy_lo < ph->vaddr)
-                copy_lo = ph->vaddr;
+            if (copy_lo < ph->vaddr + bias)
+                copy_lo = ph->vaddr + bias;
             copy_hi = page + YOUSJ_PAGE_SIZE;
-            if (copy_hi > ph->vaddr + ph->filesz)
-                copy_hi = ph->vaddr + ph->filesz;
+            if (copy_hi > ph->vaddr + bias + ph->filesz)
+                copy_hi = ph->vaddr + bias + ph->filesz;
             for (j = copy_lo; j < copy_hi; j++)
                 ((uint8_t *)yousj_phys_to_virt(frame))[j - page] =
-                    image[ph->offset + (j - ph->vaddr)];
+                    image[ph->offset + (j - (ph->vaddr + bias))];
         }
         if (seg_end > brk)
             brk = seg_end;
@@ -153,21 +180,36 @@ int elf_load_user_image(const uint8_t *image, uint64_t size,
 
     if (brk == 0)
         return -1; /* no PT_LOAD at all */
-    *entry_out = eh->entry;
+    *entry_out = eh->entry + bias;
     *brk_out = brk;
+    if (phnum_out != NULL)
+        *phnum_out = eh->phnum;
     return 0;
 }
 
 /* --- initial stack ------------------------------------------------------ */
 
 #define YOUSJ_AT_NULL   0
+#define YOUSJ_AT_PHDR   3
+#define YOUSJ_AT_PHENT  4
+#define YOUSJ_AT_PHNUM  5
 #define YOUSJ_AT_PAGESZ 6
+#define YOUSJ_AT_ENTRY  9
+#define YOUSJ_AT_UID    11
+#define YOUSJ_AT_EUID   12
+#define YOUSJ_AT_GID    13
+#define YOUSJ_AT_EGID   14
+#define YOUSJ_AT_CLKTCK 15
+#define YOUSJ_AT_HWCAP  16
+#define YOUSJ_AT_SECURE 23
+#define YOUSJ_AT_RANDOM 25
 #define YOUSJ_STACK_PAGES 4
 
 int elf_build_initial_stack(struct vmm_space *space, uint64_t stack_top,
                             const char *const *argv,
                             const char *const *envp,
-                            uint64_t *sp_out)
+                            uint64_t phdr_va, uint64_t phnum,
+                            uint64_t entry, uint64_t *sp_out)
 {
     uint64_t top_frame = pmm_alloc_page();
     uint8_t *page;
@@ -176,6 +218,7 @@ int elf_build_initial_stack(struct vmm_space *space, uint64_t stack_top,
     uint64_t *block;
     uint64_t argv_ptrs[16];
     uint64_t envp_ptrs[16];
+    uint64_t random_va = 0;
 
     if (top_frame == 0)
         return -1;
@@ -208,9 +251,30 @@ int elf_build_initial_stack(struct vmm_space *space, uint64_t stack_top,
             envp_ptrs[i - argc] = stack_top - YOUSJ_PAGE_SIZE + str_off;
     }
 
-    /* The block sits below the strings, 16-byte aligned. */
-    block_qwords = 1 + argc + 1 + envc + 1 + 4;
-    block_off = (str_off & ~15ULL) - block_qwords * 8;
+    /* M56: 16 random bytes for AT_RANDOM, carved from the
+     * string area like a string. The seed only has to be
+     * unpredictable, not cryptographic: rdtsc stirred with
+     * the stack address through an LCG. */
+    {
+        uint64_t s, j;
+        __asm__ volatile("rdtsc" : "=a"(s) : : "rdx");
+        s ^= stack_top * 0x9E3779B97F4A7C15ULL;
+        if (str_off < 16 + 512)
+            return -1;
+        str_off -= 16;
+        for (j = 0; j < 16; j++) {
+            s = s * 6364136223846793005ULL + 1442695040888963407ULL;
+            page[str_off + j] = (uint8_t)(s >> 56);
+        }
+        random_va = stack_top - YOUSJ_PAGE_SIZE + str_off;
+    }
+
+    /* The block sits below the strings, 16-byte aligned.
+     * M56: the auxv carries the full set a real libc asks
+     * for (program headers for TLS discovery, ids, the
+     * AT_RANDOM pointer) -- 14 pairs incl. AT_NULL. */
+    block_qwords = 1 + argc + 1 + envc + 1 + 28;
+    block_off = ((str_off & ~15ULL) - block_qwords * 8) & ~15ULL;
     block = (uint64_t *)yousj_phys_to_virt(top_frame + block_off);
     i = 0;
     block[i++] = argc;
@@ -223,8 +287,34 @@ int elf_build_initial_stack(struct vmm_space *space, uint64_t stack_top,
             block[i++] = envp_ptrs[k];
         block[i++] = 0;
     }
+    if (phdr_va != 0) {
+        block[i++] = YOUSJ_AT_PHDR;
+        block[i++] = phdr_va;
+        block[i++] = YOUSJ_AT_PHENT;
+        block[i++] = 56; /* sizeof(Elf64_Phdr) */
+        block[i++] = YOUSJ_AT_PHNUM;
+        block[i++] = phnum;
+    }
     block[i++] = YOUSJ_AT_PAGESZ;
     block[i++] = YOUSJ_PAGE_SIZE;
+    block[i++] = YOUSJ_AT_ENTRY;
+    block[i++] = entry;
+    block[i++] = YOUSJ_AT_UID;
+    block[i++] = 0;
+    block[i++] = YOUSJ_AT_EUID;
+    block[i++] = 0;
+    block[i++] = YOUSJ_AT_GID;
+    block[i++] = 0;
+    block[i++] = YOUSJ_AT_EGID;
+    block[i++] = 0;
+    block[i++] = YOUSJ_AT_HWCAP;
+    block[i++] = 0;
+    block[i++] = YOUSJ_AT_CLKTCK;
+    block[i++] = 100;
+    block[i++] = YOUSJ_AT_RANDOM;
+    block[i++] = random_va;
+    block[i++] = YOUSJ_AT_SECURE;
+    block[i++] = 0;
     block[i++] = YOUSJ_AT_NULL;
     block[i++] = 0;
 

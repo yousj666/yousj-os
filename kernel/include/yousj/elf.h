@@ -2,7 +2,11 @@
  *
  * Written from scratch by Muse (coordinator), per
  * docs/SCHED_DESIGN.md sec. 7.3 step 2: the minimal honest subset --
- * ELF64, little-endian, ET_EXEC, x86-64, PT_LOAD segments only.
+ * ELF64, little-endian, x86-64, PT_LOAD segments only.
+ * ET_EXEC loads at its linked addresses; ET_DYN (static
+ * PIE, M56) loads at the user-window base and relocates
+ * itself from AT_PHDR. PT_INTERP images are refused --
+ * there is no dynamic loader yet.
  * No dynamic linking, no PIE relocation, no interpreter: anything
  * fancier is rejected, not half-loaded. The image bytes come from
  * memory (in stage 1, an init ELF embedded in the kernel image;
@@ -41,10 +45,12 @@ int elf_build_initial_stack(struct vmm_space *space,
                             uint64_t stack_top,
                             const char *const *argv,
                             const char *const *envp,
-                            uint64_t *sp_out);
+                            uint64_t phdr_va, uint64_t phnum,
+                            uint64_t entry, uint64_t *sp_out);
 
 int elf_load_user_image(const uint8_t *image, uint64_t size,
                         struct vmm_space *space,
-                        uint64_t *entry_out, uint64_t *brk_out);
+                        uint64_t *entry_out, uint64_t *brk_out,
+                        uint64_t *phdr_out, uint64_t *phnum_out);
 
 #endif /* YOUSJ_ELF_H */

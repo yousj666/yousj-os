@@ -270,6 +270,7 @@ static void boot_launcher_thread(void *arg)
         static struct user_start istart;
         struct task *itask;
         uint64_t entry = 0, img_brk = 0, heap_base;
+        uint64_t iphdr = 0, iphnum = 0; /* M56: for the auxv */
         int ok = 1;
 
         /* The ps/kill acceptance target: a kernel thread that sleeps in long stretches, so it shows up as S in ps. */
@@ -297,7 +298,8 @@ static void boot_launcher_thread(void *arg)
                     (long)isize)
                     ok = 0;
                 if (ok && elf_load_user_image(ibuf, isize, &ispace,
-                                              &entry, &img_brk) != 0)
+                                              &entry, &img_brk,
+                                              &iphdr, &iphnum) != 0)
                     ok = 0;
                 pmm_free_pages(istage, ipages);
             }
@@ -309,6 +311,7 @@ static void boot_launcher_thread(void *arg)
             static const char *const init_argv[] = { "/init", NULL };
             if (elf_build_initial_stack(&ispace, YOUSJ_INIT_STACK_TOP,
                                         init_argv, NULL,
+                                        iphdr, iphnum, entry,
                                         &istart.sp) != 0)
                 ok = 0;
         }

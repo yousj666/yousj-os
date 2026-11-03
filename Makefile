@@ -131,7 +131,7 @@ $(BUILD)/ata.o: kernel/drivers/ata.c kernel/include/yousj/*.h
 	mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(BUILD)/initramfs.cpio: $(BUILD)/yousj-init.elf $(BUILD)/hello.elf $(BUILD)/sh.elf $(BUILD)/sigtest.elf $(BUILD)/fxtest.elf $(BUILD)/fstest.elf $(BUILD)/cat.elf $(BUILD)/pipetest.elf $(BUILD)/mkdir.elf $(BUILD)/ls.elf $(BUILD)/rm.elf $(BUILD)/rmdir.elf $(BUILD)/mv.elf $(BUILD)/bigfile.elf $(BUILD)/mmtest.elf $(BUILD)/polltest.elf $(BUILD)/ln.elf $(BUILD)/readlink.elf $(BUILD)/epolltest.elf $(BUILD)/churn.elf $(BUILD)/stattest.elf $(BUILD)/brktest.elf $(BUILD)/timetest.elf $(BUILD)/faulttest.elf $(BUILD)/proctest.elf $(BUILD)/utimetest.elf $(BUILD)/orphantest.elf $(BUILD)/pidtest.elf $(BUILD)/dirfdtest.elf $(BUILD)/inotifytest.elf $(BUILD)/futextest.elf tools/mkinitramfs.py $(wildcard rootfs/etc/*)
+$(BUILD)/initramfs.cpio: $(BUILD)/yousj-init.elf $(BUILD)/hello.elf $(BUILD)/sh.elf $(BUILD)/sigtest.elf $(BUILD)/fxtest.elf $(BUILD)/fstest.elf $(BUILD)/cat.elf $(BUILD)/pipetest.elf $(BUILD)/mkdir.elf $(BUILD)/ls.elf $(BUILD)/rm.elf $(BUILD)/rmdir.elf $(BUILD)/mv.elf $(BUILD)/bigfile.elf $(BUILD)/mmtest.elf $(BUILD)/polltest.elf $(BUILD)/ln.elf $(BUILD)/readlink.elf $(BUILD)/epolltest.elf $(BUILD)/churn.elf $(BUILD)/stattest.elf $(BUILD)/brktest.elf $(BUILD)/timetest.elf $(BUILD)/faulttest.elf $(BUILD)/proctest.elf $(BUILD)/utimetest.elf $(BUILD)/orphantest.elf $(BUILD)/pidtest.elf $(BUILD)/dirfdtest.elf $(BUILD)/inotifytest.elf $(BUILD)/futextest.elf $(BUILD)/musltest.elf tools/mkinitramfs.py $(wildcard rootfs/etc/*)
 	python3 tools/mkinitramfs.py $(BUILD)
 
 $(BUILD)/initramfs_bin.o: $(BUILD)/initramfs.cpio
@@ -236,6 +236,15 @@ $(BUILD)/inotifytest.elf: userland/inotifytest.c userland/crt0.S userland/init.l
 $(BUILD)/futextest.elf: userland/futextest.c userland/crt0.S userland/init.ld
 	mkdir -p $(BUILD)
 	gcc -ffreestanding -fno-stack-protector -fno-pie -static -nostdlib -mno-sse -mno-sse2 -mno-mmx -mcmodel=large -O2 -Wall -Wextra -Wl,-T,userland/init.ld -Wl,--build-id=none -o $@ userland/crt0.S userland/futextest.c
+
+# M56: musltest is a REAL libc binary (musl 1.2.5, static),
+# built against the extracted Alpine musl-dev tree in
+# build/musl/usr (fetch: musl-dev apk from dl-cdn.alpinelinux.org,
+# see README). Not a freestanding program.
+MUSL_USR = $(CURDIR)/build/musl/usr
+$(BUILD)/musltest.elf: userland/musltest.c $(MUSL_USR)/lib/libc.a
+	mkdir -p $(BUILD)
+	gcc -static-pie -fpie -O2 -nostdinc -isystem $(MUSL_USR)/include -nostdlib $(MUSL_USR)/lib/rcrt1.o $(MUSL_USR)/lib/crti.o userland/musltest.c -L$(MUSL_USR)/lib -lc $(MUSL_USR)/lib/crtn.o -o $@
 
 $(BUILD)/orphantest.elf: userland/orphantest.c userland/crt0.S userland/init.ld
 	mkdir -p $(BUILD)

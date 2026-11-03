@@ -96,6 +96,10 @@
                                      * futex signal test */
 #define YOUSJ_SYS_set_tid_address 218 /* M52 */
 #define YOUSJ_SYS_gettid      186   /* M53 */
+#define YOUSJ_SYS_sched_yield 24    /* M56 */
+#define YOUSJ_SYS_readv       19    /* M56 */
+#define YOUSJ_SYS_writev      20    /* M56 */
+#define YOUSJ_SYS_set_robust_list 273 /* M56 */
 #define YOUSJ_SYS_copy_file_range 326 /* M43 */
 #define YOUSJ_SYS_dup3        292  /* M10 */
 #define YOUSJ_SYS_pipe2       293  /* M10 */

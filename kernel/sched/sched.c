@@ -456,13 +456,18 @@ int sched_has_children(uint64_t parent_tid, int pid)
     return 0;
 }
 
-void sched_adopt_children(uint64_t from_tid, uint64_t to_tid)
+int sched_adopt_children(uint64_t from_tid, uint64_t to_tid)
 {
     uint64_t i;
+    int zombies = 0;
     for (i = 0; i < YOUSJ_SCHED_MAX_TASKS; i++) {
-        if (g_tasks[i].in_use && g_tasks[i].parent_tid == from_tid)
+        if (g_tasks[i].in_use && g_tasks[i].parent_tid == from_tid) {
             g_tasks[i].parent_tid = to_tid;
+            if (g_tasks[i].state == TASK_ZOMBIE)
+                zombies++;
+        }
     }
+    return zombies;
 }
 
 /* Unlink t from the all-tasks list (the pool array is scanned
