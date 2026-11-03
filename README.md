@@ -1009,12 +1009,27 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   EOWNERDEAD、consistent 后锁
   复活（宿主真 Linux 对照同
   过）。
-- ⏳ 下一步候选：inotify 事件
-  补完（ftruncate 的 MODIFY、
-  exchange 的 MOVE_SELF），
-  或 getrandom/ioctl 终端参数
-  等 busybox 交互式 shell 的
-  剩余拼图。
+- ✅ truncate 与 inotify 收尾
+  M62（2026-11-04）：点名一查
+  才发现 truncate/ftruncate
+  根本不存在（一直 ENOSYS）—
+  现已实装：双后端 resize（收
+  缩释放尾页并清零半页尾、扩
+  展走空洞读零），fd 版要求写
+  权限，成功发 IN_MODIFY。
+  RENAME_EXCHANGE 此前不发任
+  何事件，现按 fsnotify_move
+  的交换口径补全：两侧父目录
+  各一对 MOVED_FROM/MOVED_TO
+  （同一 cookie），两对象各
+  MOVE_SELF，yfs 分支同样。
+  inotifytest 增至 13 个场景。
+- ⏳ 下一步候选：getrandom 与
+  ioctl 终端参数（TCGETS/
+  TIOCGWINSZ）等 busybox 交互
+  式 shell 的剩余拼图，或把
+  /bin/sh 换成 busybox sh 做
+  默认 shell 试运行。
 
 ## 从零构建
 

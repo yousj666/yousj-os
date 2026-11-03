@@ -192,6 +192,8 @@ long fs_link_path(const char *old_path, const char *new_path,
 long fs_readlink_path(const char *path, char *buf,
                       uint64_t cap);
 bool fs_file_is_dir(struct yousj_file *f);
+long fs_file_truncate(struct yousj_file *f, uint64_t size); /* M62 */
+long fs_truncate_path(const char *path, uint64_t size);     /* M62 */
 /* M14: positional I/O on an open file object (the mmap
  * layer's read-in / write-back path; the object's own
  * offset is untouched and access-mode checks are the

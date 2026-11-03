@@ -73,7 +73,8 @@ def send(cmd):
 
 SCEN = ['init', 'eagain', 'watch-dir', 'create',
         'watch-file', 'modify-close', 'utimens', 'rename',
-        'poll-ready', 'unlink', 'rm-watch']
+        'poll-ready', 'unlink', 'truncate', 'exchange',
+        'rm-watch']
 
 
 def run(tag):

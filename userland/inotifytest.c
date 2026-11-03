@@ -48,14 +48,31 @@ static long sys_call4(long n, long a1, long a2, long a3, long a4)
     return ret;
 }
 
+static long sys_call5(long n, long a1, long a2, long a3,
+                      long a4, long a5)
+{
+    long ret;
+    register long r10 __asm__("r10") = a4;
+    register long r8 __asm__("r8") = a5;
+    __asm__ volatile("syscall"
+                     : "=a"(ret)
+                     : "a"(n), "D"(a1), "S"(a2), "d"(a3),
+                       "r"(r10), "r"(r8)
+                     : "rcx", "r11", "memory");
+    return ret;
+}
+
 #define SYS_read     0
 #define SYS_write    1
 #define SYS_open     2
 #define SYS_close    3
 #define SYS_poll     7
+#define SYS_truncate 76
+#define SYS_ftruncate 77
 #define SYS_mkdir    83
 #define SYS_unlink   87
 #define SYS_rename   82
+#define SYS_renameat2 316
 #define SYS_inotify_init1    294
 #define SYS_inotify_add_watch 254
 #define SYS_inotify_rm_watch 255
@@ -280,6 +297,133 @@ int main(int argc, char **argv)
         ok = ok && sys_call2(SYS_inotify_rm_watch, ifd,
                              wd_file) == -22;
         report("unlink", ok);
+    }
+
+    /* M62: ftruncate/truncate resize and report
+     * IN_MODIFY on the file watch; the grown region
+     * reads back as zeroes; a read-only fd refuses */
+    {
+        long fd = sys_call4(SYS_open,
+                            (long)(uintptr_t)"/iw/t.txt",
+                            0101, 0644, 0);
+        long wd_t, ok = 1, rn;
+        char rb[16];
+        sys_call3(SYS_write, fd, (long)(uintptr_t)"hello world",
+                  11);
+        sys_call1(SYS_close, fd);
+        sys_call3(SYS_read, ifd, (long)(uintptr_t)buf,
+                  sizeof(buf)); /* drain CREATE */
+        wd_t = sys_call3(SYS_inotify_add_watch, ifd,
+                         (long)(uintptr_t)"/iw/t.txt",
+                         IN_MODIFY);
+        fd = sys_call3(SYS_open, (long)(uintptr_t)"/iw/t.txt",
+                       2 /* O_RDWR */, 0);
+        ok = ok && sys_call2(SYS_ftruncate, fd, 5) == 0;
+        n = sys_call3(SYS_read, ifd, (long)(uintptr_t)buf,
+                      sizeof(buf));
+        off = ev_at(buf, 0, &e, &nm);
+        ok = ok && n == off && e.wd == wd_t &&
+             (e.mask & IN_MODIFY) != 0 && e.len == 0;
+        ok = ok && sys_call2(SYS_truncate,
+                             (long)(uintptr_t)"/iw/t.txt",
+                             8) == 0;
+        n = sys_call3(SYS_read, ifd, (long)(uintptr_t)buf,
+                      sizeof(buf));
+        off = ev_at(buf, 0, &e, &nm);
+        ok = ok && n == off && (e.mask & IN_MODIFY) != 0;
+        rn = sys_call3(SYS_read, fd, (long)(uintptr_t)rb,
+                       sizeof(rb));
+        ok = ok && rn == 8 && rb[0] == 'h' && rb[4] == 'o' &&
+             rb[5] == 0 && rb[6] == 0 && rb[7] == 0;
+        {
+            long rfd = sys_call3(SYS_open,
+                                 (long)(uintptr_t)"/iw/t.txt",
+                                 0, 0);
+            ok = ok && sys_call2(SYS_ftruncate, rfd, 1) ==
+                 -22; /* EINVAL: not open for writing */
+            sys_call1(SYS_close, rfd);
+        }
+        sys_call1(SYS_close, fd);
+        report("truncate", ok);
+    }
+
+    /* M62: RENAME_EXCHANGE swaps the contents and
+     * reports FROM/TO for both names on the dir watch
+     * (one cookie) plus MOVE_SELF on both file watches */
+    {
+        long fa = sys_call4(SYS_open,
+                            (long)(uintptr_t)"/iw/xa",
+                            0101, 0644, 0);
+        long fb = sys_call4(SYS_open,
+                            (long)(uintptr_t)"/iw/xb",
+                            0101, 0644, 0);
+        long wd_a, wd_b, rc, ok = 1;
+        int from_a = 0, to_a = 0, from_b = 0, to_b = 0;
+        int self_a = 0, self_b = 0;
+        uint32_t cookie = 0;
+        char rb[8];
+        sys_call3(SYS_write, fa, (long)(uintptr_t)"AAAA", 4);
+        sys_call3(SYS_write, fb, (long)(uintptr_t)"BBBB", 4);
+        sys_call1(SYS_close, fa);
+        sys_call1(SYS_close, fb);
+        sys_call3(SYS_read, ifd, (long)(uintptr_t)buf,
+                  sizeof(buf)); /* drain CREATEs */
+        wd_a = sys_call3(SYS_inotify_add_watch, ifd,
+                         (long)(uintptr_t)"/iw/xa",
+                         IN_MOVE_SELF);
+        wd_b = sys_call3(SYS_inotify_add_watch, ifd,
+                         (long)(uintptr_t)"/iw/xb",
+                         IN_MOVE_SELF);
+        rc = sys_call5(SYS_renameat2, -100,
+                       (long)(uintptr_t)"/iw/xa", -100,
+                       (long)(uintptr_t)"/iw/xb",
+                       2 /* RENAME_EXCHANGE */);
+        ok = ok && rc == 0;
+        n = sys_call3(SYS_read, ifd, (long)(uintptr_t)buf,
+                      sizeof(buf));
+        off = 0;
+        while (off < n) {
+            const char *en;
+            long sz = ev_at(buf, off, &e, &en);
+            if (e.wd == wd_dir &&
+                (e.mask & IN_MOVED_FROM) != 0 &&
+                name_is(buf + off, "xa"))
+                from_a = 1;
+            else if (e.wd == wd_dir &&
+                     (e.mask & IN_MOVED_TO) != 0 &&
+                     name_is(buf + off, "xa"))
+                to_a = 1;
+            else if (e.wd == wd_dir &&
+                     (e.mask & IN_MOVED_FROM) != 0 &&
+                     name_is(buf + off, "xb"))
+                from_b = 1;
+            else if (e.wd == wd_dir &&
+                     (e.mask & IN_MOVED_TO) != 0 &&
+                     name_is(buf + off, "xb"))
+                to_b = 1;
+            else if (e.wd == wd_a &&
+                     (e.mask & IN_MOVE_SELF) != 0)
+                self_a = 1;
+            else if (e.wd == wd_b &&
+                     (e.mask & IN_MOVE_SELF) != 0)
+                self_b = 1;
+            if (e.wd == wd_dir) {
+                if (cookie == 0)
+                    cookie = e.cookie;
+                else if (e.cookie != cookie)
+                    ok = 0;
+            }
+            off += sz;
+        }
+        ok = ok && from_a && to_a && from_b && to_b &&
+             self_a && self_b && cookie != 0;
+        fa = sys_call3(SYS_open, (long)(uintptr_t)"/iw/xa",
+                       0, 0);
+        n = sys_call3(SYS_read, fa, (long)(uintptr_t)rb,
+                      sizeof(rb));
+        ok = ok && n == 4 && rb[0] == 'B' && rb[3] == 'B';
+        sys_call1(SYS_close, fa);
+        report("exchange", ok != 0);
     }
 
     /* rm_watch: succeeds, IGNORED is delivered */

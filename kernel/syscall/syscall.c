@@ -3146,6 +3146,33 @@ static long sys_fchmodat(long dirfd, uint64_t path_ptr,
     return fs_chmod_path(rp, (uint32_t)mode, true);
 }
 
+/* M62: the truncate pair (they did not exist at all --
+ * ENOSYS -- which is also why no MODIFY event ever fired
+ * for them). Negative lengths are EINVAL; the fs layer
+ * owns existence/type/access checks and the event. */
+static long sys_truncate(uint64_t path_ptr, int64_t len)
+{
+    struct task *me = sched_current();
+    static char pb[256], rp[256];
+    if (len < 0)
+        return -YOUSJ_EINVAL;
+    if (copy_user_string(path_ptr, pb, sizeof pb) != 0)
+        return -YOUSJ_EFAULT;
+    resolve_path(me, pb, rp);
+    return fs_truncate_path(rp, (uint64_t)len);
+}
+
+static long sys_ftruncate(long fd, int64_t len)
+{
+    struct task *me = sched_current();
+    struct yousj_file *f = fd_file_of(me, fd);
+    if (f == NULL)
+        return -YOUSJ_EBADF;
+    if (len < 0)
+        return -YOUSJ_EINVAL;
+    return fs_file_truncate(f, (uint64_t)len);
+}
+
 static long sys_fchmod(long fd, long mode)
 {
     struct task *me = sched_current();
@@ -4326,6 +4353,10 @@ static long dispatch_inner(struct yousj_syscall_ctx *ctx)
         return sys_dup3_sys((long)a1, (long)a2, (long)a3);
     case YOUSJ_SYS_fcntl:
         return sys_fcntl((long)a1, (long)a2, a3);
+    case YOUSJ_SYS_truncate:
+        return sys_truncate(a1, (int64_t)a2);
+    case YOUSJ_SYS_ftruncate:
+        return sys_ftruncate((long)a1, (int64_t)a2);
     case YOUSJ_SYS_getuid:
     case YOUSJ_SYS_getgid:
     case YOUSJ_SYS_geteuid:

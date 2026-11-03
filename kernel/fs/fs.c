@@ -430,6 +430,43 @@ static void node_truncate(struct yousj_ramfs_node *n)
     n->ctime = n->mtime;
 }
 
+/* M62: resize a ramfs file to an exact size (the truncate
+ * family). Shrinking frees whole pages past the new end
+ * and zeroes the tail of the partial last page, so a later
+ * regrow reads zeroes rather than resurrected bytes.
+ * Growing only moves the size: untouched pages are holes
+ * and read as zero. Past the per-file cap is EFBIG. */
+#define YOUSJ_EFBIG_L 27
+static long node_resize(struct yousj_ramfs_node *n,
+                        uint64_t newsize)
+{
+    uint32_t keep, i;
+
+    if (newsize > (uint64_t)MAX_FILE_PAGES * YOUSJ_PAGE_SIZE)
+        return -YOUSJ_EFBIG_L;
+    if (newsize < n->size) {
+        keep = (uint32_t)((newsize + YOUSJ_PAGE_SIZE - 1) /
+                          YOUSJ_PAGE_SIZE);
+        for (i = keep; i < MAX_FILE_PAGES; i++) {
+            if (n->pages[i] != 0) {
+                pmm_free_page(n->pages[i]);
+                n->pages[i] = 0;
+            }
+        }
+        if (newsize % YOUSJ_PAGE_SIZE != 0 && keep > 0 &&
+            n->pages[keep - 1] != 0) {
+            uint8_t *p = (uint8_t *)(uintptr_t)
+                yousj_phys_to_virt(n->pages[keep - 1]);
+            uint32_t off = (uint32_t)(newsize % YOUSJ_PAGE_SIZE);
+            mem_zero(p + off, YOUSJ_PAGE_SIZE - off);
+        }
+    }
+    n->size = (uint32_t)newsize;
+    n->mtime = (uint32_t)yousj_now_unix();
+    n->ctime = n->mtime;
+    return 0;
+}
+
 /* --- M13: detach / deferred free -------------------------------- */
 
 /* M44: name removal is dent_detach() plus a nlink
@@ -2620,8 +2657,33 @@ long fs_exchange_path(const char *a_path, const char *b_path)
             return -YOUSJ_EINVAL;
         if (ad != bd)
             return -YOUSJ_EXDEV_L;
-        if (ad)
-            return yfs_exchange(data_rel(ra), data_rel(rb));
+        if (ad) {
+            /* M62: exchange events, captured before the
+             * swap like the rename path does. */
+            struct target_id aid, bid;
+            long erc;
+            inotify_capture(ra, &aid);
+            inotify_capture(rb, &bid);
+            erc = yfs_exchange(data_rel(ra), data_rel(rb));
+            if (erc == 0) {
+                uint32_t cookie = ++g_inotify_cookie;
+                inotify_child_path(ra, IN_MOVED_FROM_K,
+                                   cookie, aid.ok && aid.is_dir);
+                inotify_child_path(ra, IN_MOVED_TO_K,
+                                   cookie, bid.ok && bid.is_dir);
+                inotify_child_path(rb, IN_MOVED_FROM_K,
+                                   cookie, bid.ok && bid.is_dir);
+                inotify_child_path(rb, IN_MOVED_TO_K,
+                                   cookie, aid.ok && aid.is_dir);
+                if (aid.ok)
+                    inotify_self_id(1, NULL, aid.ino,
+                                    IN_MOVE_SELF_K, aid.is_dir);
+                if (bid.ok)
+                    inotify_self_id(1, NULL, bid.ino,
+                                    IN_MOVE_SELF_K, bid.is_dir);
+            }
+            return erc;
+        }
     }
     {
         char abase[NAME_MAX_LEN + 1], bbase[NAME_MAX_LEN + 1];
@@ -2647,6 +2709,26 @@ long fs_exchange_path(const char *a_path, const char *b_path)
             nb->parent = ap;
         na->ctime = (uint32_t)yousj_now_unix();
         nb->ctime = na->ctime;
+        {
+            /* M62: exchange events -- each parent sees its
+             * object leave (FROM) and the other arrive
+             * (TO) under one cookie; both objects get
+             * MOVE_SELF, mirroring fsnotify_move's
+             * exchange reporting. */
+            uint32_t cookie = ++g_inotify_cookie;
+            inotify_child_id(0, ap, 0, abase,
+                             IN_MOVED_FROM_K, cookie, na->is_dir);
+            inotify_child_id(0, ap, 0, abase,
+                             IN_MOVED_TO_K, cookie, nb->is_dir);
+            inotify_child_id(0, bp, 0, bbase,
+                             IN_MOVED_FROM_K, cookie, nb->is_dir);
+            inotify_child_id(0, bp, 0, bbase,
+                             IN_MOVED_TO_K, cookie, na->is_dir);
+            inotify_self_id(0, na, 0, IN_MOVE_SELF_K,
+                            na->is_dir);
+            inotify_self_id(0, nb, 0, IN_MOVE_SELF_K,
+                            nb->is_dir);
+        }
         return 0;
     }
 }
@@ -3389,6 +3471,86 @@ long file_write(struct yousj_file *f, const uint8_t *src,
         inotify_self_id(0, f->node, 0, IN_MODIFY_K, false);
     }
     return n;
+}
+
+/* M62: the truncate family. On an open file: pipes and
+ * proc files refuse with EINVAL, directories too, and the
+ * descriptor must be open for writing (Linux semantics).
+ * A successful resize stamps the times (in the backends)
+ * and reports IN_MODIFY to the object's watchers, like a
+ * write. */
+long fs_file_truncate(struct yousj_file *f, uint64_t size)
+{
+    long rc;
+
+    if (f == NULL || f->pipe != NULL || f->backend == 2)
+        return -YOUSJ_EINVAL;
+    if (f->backend == 1) {
+        if (yfs_is_dir(f->yfs_ino))
+            return -YOUSJ_EINVAL;
+        if ((f->flags & YOUSJ_O_ACCMODE) == YOUSJ_O_RDONLY)
+            return -YOUSJ_EINVAL;
+        if (size > 0xFFFFFFFFULL)
+            return -YOUSJ_EFBIG_L;
+        rc = yfs_truncate(f->yfs_ino, (uint32_t)size);
+        if (rc == 0)
+            inotify_self_id(1, NULL, f->yfs_ino,
+                            IN_MODIFY_K, false);
+        return rc;
+    }
+    if (f->node == NULL || f->node->is_dir || f->node->dev != 0)
+        return -YOUSJ_EINVAL;
+    if ((f->flags & YOUSJ_O_ACCMODE) == YOUSJ_O_RDONLY)
+        return -YOUSJ_EINVAL;
+    rc = node_resize(f->node, size);
+    if (rc == 0)
+        inotify_self_id(0, f->node, 0, IN_MODIFY_K, false);
+    return rc;
+}
+
+/* M62: truncate by path -- resolve (following links, as
+ * Linux does), refuse proc, dispatch on the backend. The
+ * object must exist and not be a directory. */
+long fs_truncate_path(const char *path, uint64_t size)
+{
+    char resolved[PATH_MAX_LEN + 1];
+    long rc = fs_resolve_links(path, resolved, true);
+
+    if (rc != 0)
+        return rc;
+    if (is_proc_path(resolved))
+        return -YOUSJ_EACCES_L;
+    if (is_data_path(resolved)) {
+        long ino = yfs_lookup(data_rel(resolved));
+        if (ino < 0)
+            return -YOUSJ_ENOENT_L;
+        if (yfs_is_dir((uint32_t)ino))
+            return -YOUSJ_EISDIR;
+        if (size > 0xFFFFFFFFULL)
+            return -YOUSJ_EFBIG_L;
+        rc = yfs_truncate((uint32_t)ino, (uint32_t)size);
+        if (rc == 0)
+            inotify_self_id(1, NULL, (uint32_t)ino,
+                            IN_MODIFY_K, false);
+        return rc;
+    }
+    {
+        char base[NAME_MAX_LEN + 1];
+        struct yousj_ramfs_node *parent = walk(resolved, true,
+                                               base);
+        struct yousj_ramfs_node *n;
+        if (parent == NULL)
+            return -YOUSJ_ENOENT_L;
+        n = node_find_child(parent, base, str_len(base));
+        if (n == NULL)
+            return -YOUSJ_ENOENT_L;
+        if (n->is_dir)
+            return -YOUSJ_EISDIR;
+        rc = node_resize(n, size);
+        if (rc == 0)
+            inotify_self_id(0, n, 0, IN_MODIFY_K, false);
+        return rc;
+    }
 }
 
 bool fs_file_is_dir(struct yousj_file *f)
