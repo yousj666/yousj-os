@@ -164,6 +164,53 @@ __asm__(
     "    syscall\n"
     "    ud2\n");
 
+/* M52 join: the full pthread-style contract. join_word is
+ * both the CHILD_SETTID target (the kernel writes the
+ * child's tid there during clone) and the child's
+ * set_tid_address word (the kernel zeroes it and futex-
+ * wakes it at exit). ptid_word catches PARENT_SETTID.
+ * The trampoline carries all five clone arguments. */
+#define SYS_arch_prctl 158
+#define SYS_set_tid_address 218
+#define ARCH_GET_FS 0x1003
+
+static int32_t join_word;
+static int32_t ptid_word;
+static int32_t join_result;
+static uint64_t fs_seen;
+static uint8_t tls_area[64];
+
+__attribute__((used)) void thread_main2(void)
+{
+    uint64_t fs = 0;
+    sys_call1(SYS_set_tid_address,
+              (long)(uintptr_t)&join_word);
+    sys_call3(SYS_arch_prctl, ARCH_GET_FS,
+              (long)(uintptr_t)&fs, 0);
+    fs_seen = fs;
+    sleep_ms(150);
+    join_result = 42;
+    die(0);
+}
+
+extern long clone_vm_call5(long flags, uint64_t stack,
+                           void *ptid, void *ctid,
+                           uint64_t tls);
+__asm__(
+    ".globl clone_vm_call5\n"
+    "clone_vm_call5:\n"
+    "    mov %rcx, %r10\n" /* arg4 -> child_tidptr slot */
+    "    mov $56, %rax\n" /* clone */
+    "    syscall\n"
+    "    test %rax, %rax\n"
+    "    jz 1f\n"
+    "    ret\n" /* parent: pid in rax */
+    "1:  call thread_main2\n"
+    "    mov $231, %rax\n"
+    "    xor %rdi, %rdi\n"
+    "    syscall\n"
+    "    ud2\n");
+
 static volatile int g_got_usr1;
 static void usr1_handler(long sig, void *info, void *uctx)
 {
@@ -290,6 +337,46 @@ int main(int argc, char **argv)
             sys_call4(SYS_wait4, c, (long)(uintptr_t)&st, 0,
                       0);
             report("xwake", rc == 0 && xword == 1);
+        }
+    }
+
+    /* join: the pthread exit handshake, end to end */
+    {
+        uint64_t top =
+            (uint64_t)(uintptr_t)(cstack + sizeof(cstack)) &
+            ~15ULL;
+        long c;
+        int ok;
+        join_word = 0;
+        ptid_word = 0;
+        join_result = 0;
+        fs_seen = 0;
+        /* SIGCHLD | VM | SETTLS | PARENT_SETTID |
+         * CHILD_CLEARTID | CHILD_SETTID */
+        c = clone_vm_call5(17 | 0x100 | 0x80000 | 0x100000 |
+                           0x200000 | 0x1000000,
+                           top, &ptid_word, &join_word,
+                           (uint64_t)(uintptr_t)tls_area);
+        if (c <= 0) {
+            report("join", 0);
+        } else {
+            long st = 0;
+            /* the writebacks land during clone itself */
+            ok = ptid_word == (int32_t)c &&
+                 join_word == (int32_t)c;
+            /* pthread_join's sleep: wait on the tid word
+             * until the exit path zeroes it */
+            while (join_word != 0) {
+                long v = join_word;
+                if (futex(&join_word, FUTEX_WAIT, v, NULL) ==
+                    -4)
+                    break; /* interrupted: a failure here */
+            }
+            sys_call4(SYS_wait4, c, (long)(uintptr_t)&st, 0,
+                      0);
+            ok = ok && join_word == 0 && join_result == 42 &&
+                 fs_seen == (uint64_t)(uintptr_t)tls_area;
+            report("join", ok);
         }
     }
 

@@ -783,9 +783,32 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   空间里写字 + WAKE，父的无超时
   WAIT 真被跨任务唤醒返回 0——M50
   欠的跨任务 WAKE 至此还清。
+- ✅ 线程创建契约 M52（2026-11-04）：
+  pthread 建/退线程的整套握手。
+  set_tid_address(218) 转正；clone
+  透传 ptid/ctid/tls 三参数并放行
+  CLONE_SETTLS（tls wins 于继承的
+  fs_base）、CLONE_PARENT_SETTID、
+  CLONE_CHILD_SETTID、CLONE_CHILD_
+  CLEARTID。tid 回写在绑定期的 cli
+  内经 mm_write_i32（先翻译后 HHDM
+  写，绝不缺页）落进父/子各自空间，
+  孩子跑起来前已就位。退出路径在
+  空间尚完整时执行 clear_child_tid
+  握手：清零该字 + futex 唤醒——
+  pthread_join 睡的就是这一下。
+  顺手修正 M50 的 futex 键粒度：
+  vmm_translate 只给页基址，键须带
+  页内偏移（此前同页两字共队列、
+  互相误醒后自查重睡，无害但不对）。
+  验收：futextest 加 join 场景——
+  回写在 clone 返回前已落地、子线
+  程 set_tid_address 登记、退出清
+  零唤醒父的 futex 等待、SETTLS 的
+  FS 经 arch_prctl GET_FS 验明。
 - ⏳ 下一步候选：线程语义续篇
-  （CLONE_SIGHAND/tgid，或 set_tid_
-  address + robust futex 的地基），
+  （CLONE_SIGHAND 信号处置共享、
+  tgid/gettid 语义、robust futex），
   或 inotify 事件补完（ftruncate 的
   MODIFY、exchange 的 MOVE_SELF）。
 

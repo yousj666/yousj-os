@@ -77,6 +77,10 @@ struct task {
     uint64_t        brk_end;      /* user tasks: current break */
     uint64_t        fs_base;      /* user tasks: TLS FS base
                                      (arch_prctl ARCH_SET_FS) */
+    uint64_t        clear_child_tid; /* M52: user address the exit
+                                     path zeroes + futex-wakes
+                                     (set_tid_address / clone
+                                     CLONE_CHILD_CLEARTID); 0 = off */
     uint64_t        mmap_next;    /* user tasks: next free VA for
                                      anonymous mmap (bump pointer) */
     /* M24: user-access fault recovery. While a syscall

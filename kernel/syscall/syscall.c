@@ -262,6 +262,11 @@ static long sys_write(long fd, uint64_t buf, uint64_t len)
  * sig == 0 and a status; fatal signal delivery (signal.c) with
  * sig != 0. Records how the task died for wait4, tears the
  * address space down, and never returns. */
+/* M52: the exit path's clear_child_tid handshake wakes a
+ * futex waiter; defined with the futex section below. */
+static long futex_wake_at(struct task *me, uint64_t uaddr,
+                          long val);
+
 /* M51: drop one reference to an address space; the last
  * reference destroys it (frames, tables, pool slot).
  * Spaces are born with refs == 1 (vmm_create_space) and
@@ -304,6 +309,22 @@ void process_exit(long status, int sig)
             __asm__ volatile("cli; hlt");
     }
     me->sig_killed = sig;
+
+    /* M52: the clear_child_tid handshake (set_tid_address /
+     * CLONE_CHILD_CLEARTID) -- zero the word and futex-wake
+     * its waiter, while this task's space is still intact
+     * and loaded. This is what pthread_join sleeps on: the
+     * joiner re-checks, sees 0, and stops waiting. Done
+     * before either parent notification below, matching
+     * Linux's exit ordering closely enough at this scale. */
+    if (me->clear_child_tid != 0) {
+        uint64_t addr = me->clear_child_tid;
+        me->clear_child_tid = 0;
+        if ((addr & 3) == 0 && user_range_ok(addr, 4)) {
+            *(int32_t *)(uintptr_t)addr = 0;
+            futex_wake_at(me, addr, 1);
+        }
+    }
 
     /* M14: release VMAs first -- MAP_SHARED regions write
      * back while the address space is still intact, and each
@@ -435,9 +456,11 @@ static long sys_wait4(long pid, uint64_t status_ptr, long options,
 }
 
 /* clone(56) (SCHED_DESIGN 6.2): flags may carry the exit
- * signal (0 or SIGCHLD) and, since M51, CLONE_VM; VFORK/
- * THREAD and friends are still -EINVAL, never silently
- * ignored. Plain clone gives the child a deep copy of the
+ * signal (0 or SIGCHLD), CLONE_VM (M51), and the M52
+ * thread-contract bits (SETTLS, PARENT_SETTID,
+ * CHILD_SETTID, CHILD_CLEARTID); VFORK/THREAD/SIGHAND
+ * and friends are still -EINVAL, never silently ignored.
+ * Plain clone gives the child a deep copy of the
  * user window; CLONE_VM shares the parent's space outright
  * (one more reference on it) and is the only form allowed
  * a child stack. Either way the child resumes at the
@@ -449,6 +472,29 @@ static long sys_wait4(long pid, uint64_t status_ptr, long options,
  * instead of killing the others, as Linux would). */
 #define YOUSJ_SIGCHLD 17
 #define CLONE_VM_K 0x100
+#define CLONE_SETTLS_K        0x00080000 /* M52 */
+#define CLONE_PARENT_SETTID_K 0x00100000 /* M52 */
+#define CLONE_CHILD_CLEARTID_K 0x00200000 /* M52 */
+#define CLONE_CHILD_SETTID_K  0x01000000 /* M52 */
+
+/* M52: write a 32-bit value into an address space with no
+ * chance of faulting -- translate first, then go through
+ * the HHDM. Used for clone's tid writebacks, which run
+ * under cli in the binding block. A target page that is
+ * not materialized yet is skipped silently: the tid words
+ * name TCB/stack slots the parent prepared before the
+ * clone, materialized in practice. */
+static void mm_write_i32(struct vmm_space *mm, uint64_t uaddr,
+                         int32_t v)
+{
+    uint64_t phys;
+    if (mm == NULL || (uaddr & 3) != 0)
+        return;
+    if (vmm_translate(mm, uaddr, &phys, NULL) != 0)
+        return;
+    *(int32_t *)(uintptr_t)yousj_phys_to_virt(
+        phys + (uaddr & (YOUSJ_PAGE_SIZE - 1))) = v;
+}
 
 extern void user_frame_resume(uint64_t *resume_fields);
 
@@ -465,7 +511,8 @@ static void clone_child_start(void *arg)
 }
 
 static long sys_clone(struct yousj_syscall_ctx *ctx, long flags,
-                      uint64_t child_stack)
+                      uint64_t child_stack, uint64_t parent_tidptr,
+                      uint64_t child_tidptr, uint64_t tls)
 {
     struct task *me = sched_current();
     const uint64_t *frame;
@@ -477,7 +524,10 @@ static long sys_clone(struct yousj_syscall_ctx *ctx, long flags,
 
     if (me->mm == NULL)
         return -YOUSJ_EINVAL; /* kernel threads cannot fork */
-    if ((flags & ~(0xFFL | CLONE_VM_K)) != 0 ||
+    if ((flags & ~(0xFFL | CLONE_VM_K | CLONE_SETTLS_K |
+                  CLONE_PARENT_SETTID_K |
+                  CLONE_CHILD_CLEARTID_K |
+                  CLONE_CHILD_SETTID_K)) != 0 ||
         ((flags & 0xFF) != 0 && (flags & 0xFF) != YOUSJ_SIGCHLD))
         return -YOUSJ_EINVAL;
     if (child_stack != 0 && !share_vm)
@@ -511,9 +561,25 @@ static long sys_clone(struct yousj_syscall_ctx *ctx, long flags,
         if (share_vm)
             space->refs++; /* M51: taken under cli, before the
                             * child can be scheduled */
+        /* M52: the thread-creation contract. CHILD_CLEARTID
+         * registers the exit-handshake word; the SETTID
+         * writebacks land before the child can run
+         * (mm_write_i32 cannot fault, so cli is safe).
+         * SETTLS is applied at the fs_base inherit below,
+         * which it replaces. */
+        if (flags & CLONE_CHILD_CLEARTID_K)
+            child->clear_child_tid = child_tidptr;
+        if (flags & CLONE_PARENT_SETTID_K)
+            mm_write_i32(me->mm, parent_tidptr,
+                         (int32_t)child->tid);
+        if (flags & CLONE_CHILD_SETTID_K)
+            mm_write_i32(space, child_tidptr,
+                         (int32_t)child->tid);
         child->brk_start = me->brk_start;
         child->brk_end = me->brk_end;
-        child->fs_base = me->fs_base;
+        child->fs_base = (flags & CLONE_SETTLS_K)
+                             ? tls
+                             : me->fs_base; /* M52: SETTLS wins */
         child->mmap_next = me->mmap_next;
         child->resume_r9  = frame[0];
         child->resume_r8  = frame[16 / 8];
@@ -1539,8 +1605,40 @@ static long futex_key(struct task *me, uint64_t uaddr,
     uint64_t phys;
     if (vmm_translate(me->mm, uaddr, &phys, NULL) != 0)
         return -YOUSJ_EFAULT;
-    *key_out = phys;
+    /* vmm_translate returns the page base; the key names
+     * the WORD, so the page offset belongs in it. (M50
+     * keyed by page alone: two words on one page shared a
+     * queue and woke each other's waiters, which then
+     * re-checked and re-blocked -- harmless but wrong.
+     * Exact since M52.) */
+    *key_out = phys + (uaddr & (YOUSJ_PAGE_SIZE - 1));
     return 0;
+}
+
+/* Wake up to `val` waiters on uaddr's word; returns the
+ * count woken (0 when the address is not even mapped --
+ * nobody can be waiting on it). Shared by FUTEX_WAKE and
+ * the exit path's clear_child_tid handshake (M52). */
+static long futex_wake_at(struct task *me, uint64_t uaddr,
+                          long val)
+{
+    uint64_t key;
+    long woken = 0;
+    int i;
+    if (futex_key(me, uaddr, &key) != 0)
+        return 0;
+    if (val <= 0)
+        return 0;
+    for (i = 0; i < FUTEX_WAITERS && woken < val; i++) {
+        struct futex_waiter *w = &g_futex[i];
+        if (!w->in_use || w->woken || w->key != key)
+            continue;
+        w->woken = true;
+        woken++;
+        if (sched_find_task(w->tid) == w->task)
+            sched_wake(w->task);
+    }
+    return woken;
 }
 
 static long sys_futex(uint64_t uaddr, long op, long val,
@@ -1557,26 +1655,8 @@ static long sys_futex(uint64_t uaddr, long op, long val,
     if (!user_range_ok(uaddr, 4))
         return -YOUSJ_EFAULT;
 
-    if (cmd == 1) { /* FUTEX_WAKE */
-        uint64_t key;
-        long rc = futex_key(me, uaddr, &key);
-        long woken = 0;
-        int i;
-        if (rc != 0)
-            return 0; /* unmapped: nobody can be waiting */
-        if (val <= 0)
-            return 0;
-        for (i = 0; i < FUTEX_WAITERS && woken < val; i++) {
-            struct futex_waiter *w = &g_futex[i];
-            if (!w->in_use || w->woken || w->key != key)
-                continue;
-            w->woken = true;
-            woken++;
-            if (sched_find_task(w->tid) == w->task)
-                sched_wake(w->task);
-        }
-        return woken;
-    }
+    if (cmd == 1) /* FUTEX_WAKE */
+        return futex_wake_at(me, uaddr, val);
     if (cmd != 0) /* FUTEX_WAIT is 0; the rest is future work */
         return -YOUSJ_ENOSYS;
 
@@ -3885,6 +3965,9 @@ static long dispatch_inner(struct yousj_syscall_ctx *ctx)
         return (long)sched_current()->tid;
     case YOUSJ_SYS_getppid:
         return (long)sched_current()->parent_tid;
+    case YOUSJ_SYS_set_tid_address:
+        sched_current()->clear_child_tid = a1;
+        return (long)sched_current()->tid;
     case YOUSJ_SYS_kill:
         return sys_kill((long)a1, (long)a2);
     case YOUSJ_SYS_uname:
@@ -3892,7 +3975,7 @@ static long dispatch_inner(struct yousj_syscall_ctx *ctx)
     case YOUSJ_SYS_wait4:
         return sys_wait4((long)a1, a2, (long)a3, a4);
     case YOUSJ_SYS_clone:
-        return sys_clone(ctx, (long)a1, a2);
+        return sys_clone(ctx, (long)a1, a2, a3, a4, a5);
     case YOUSJ_SYS_execve:
         return sys_execve(a1, a2, a3);
     case YOUSJ_SYS_rt_sigaction:
