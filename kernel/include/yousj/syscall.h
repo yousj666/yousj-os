@@ -144,5 +144,6 @@
 #define YOUSJ_SYS_get_robust_list 274 /* M61 */
 #define YOUSJ_SYS_truncate    76    /* M62 */
 #define YOUSJ_SYS_ftruncate   77    /* M62 */
+#define YOUSJ_SYS_getrandom   318   /* M63 */
 
 #endif /* YOUSJ_SYSCALL_H */

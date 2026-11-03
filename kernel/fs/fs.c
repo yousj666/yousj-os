@@ -3431,6 +3431,102 @@ long file_read(struct yousj_file *f, uint8_t *dst, uint64_t count)
     return n;
 }
 
+/* M63: the /dev/random PRNG, exported for getrandom. */
+void fs_random_fill(uint8_t *dst, uint64_t count)
+{
+    uint64_t i;
+    for (i = 0; i < count; i++)
+        dst[i] = rng_byte();
+}
+
+/* M63: console terminal state for ioctl. There is no line
+ * discipline in the kernel -- readers edit their own lines
+ * -- but interactive programs (busybox sh above all) gate
+ * their prompt/editing behaviour on TCGETS succeeding,
+ * and set their own mode with TCSETS. So the console
+ * keeps a termios record: TCGETS reports the last values
+ * set (or sane power-on defaults), TCSETS* store them,
+ * and the window size ioctls work the same way. Anything
+ * else, and anything on a non-console file, is ENOTTY,
+ * the standard "not a typewriter" answer. */
+#define FS_ENOTTY 25
+#define FS_TCGETS 0x5401
+#define FS_TCSETS 0x5402
+#define FS_TCSETSW 0x5403
+#define FS_TCSETSF 0x5404
+#define FS_TIOCGWINSZ 0x5413
+#define FS_TIOCSWINSZ 0x5414
+#define FS_FIONREAD 0x541B
+
+static struct {
+    uint32_t iflag, oflag, cflag, lflag;
+    uint8_t line;
+    uint8_t cc[19];
+    uint16_t rows, cols;
+} g_termios = {
+    /* BRKINT|ICRNL|IXON; OPOST|ONLCR; B38400|CS8|CREAD|
+     * HUPCL; ISIG|ICANON|ECHO|ECHOE -- a freshly logged-in
+     * terminal's usual defaults. */
+    0x0502, 0x0005, 0x08BF, 0x001B, 0, { 0 },
+    24, 80
+};
+
+static bool fs_is_console(struct yousj_file *f)
+{
+    if (f == &g_console_file)
+        return true;
+    return f != NULL && f->node != NULL &&
+           f->node->dev == DEV_CONSOLE;
+}
+
+long fs_ioctl(struct yousj_file *f, uint64_t req,
+              uint64_t arg)
+{
+    if (!fs_is_console(f))
+        return -FS_ENOTTY;
+    switch (req) {
+    case FS_TCGETS: {
+        uint8_t *p = (uint8_t *)(uintptr_t)arg;
+        mem_copy(p, (const uint8_t *)&g_termios.iflag, 16);
+        p[16] = g_termios.line;
+        mem_copy(p + 17, g_termios.cc, 19);
+        return 0;
+    }
+    case FS_TCSETS:
+    case FS_TCSETSW:
+    case FS_TCSETSF: {
+        const uint8_t *p = (const uint8_t *)(uintptr_t)arg;
+        mem_copy((uint8_t *)&g_termios.iflag, p, 16);
+        g_termios.line = p[16];
+        mem_copy(g_termios.cc, p + 17, 19);
+        return 0;
+    }
+    case FS_TIOCGWINSZ: {
+        uint16_t *p = (uint16_t *)(uintptr_t)arg;
+        p[0] = g_termios.rows;
+        p[1] = g_termios.cols;
+        p[2] = 0;
+        p[3] = 0;
+        return 0;
+    }
+    case FS_TIOCSWINSZ: {
+        const uint16_t *p = (const uint16_t *)(uintptr_t)arg;
+        g_termios.rows = p[0];
+        g_termios.cols = p[1];
+        return 0;
+    }
+    case FS_FIONREAD: {
+        /* The serial ring has no depth counter; ready
+         * means at least one byte. */
+        int *p = (int *)(uintptr_t)arg;
+        *p = serial_rx_ready() ? 1 : 0;
+        return 0;
+    }
+    default:
+        return -FS_ENOTTY;
+    }
+}
+
 long file_write(struct yousj_file *f, const uint8_t *src,
                 uint64_t count)
 {
@@ -3970,14 +4066,16 @@ void fs_init(void)
     ramfs_mkdir_path("/dev");
     {
         struct yousj_ramfs_node *devdir = fs_lookup("/dev");
-        static const char *const names[6] = {
+        static const char *const names[7] = {
             "null", "zero", "full", "random", "urandom",
-            "console" /* M49 */
+            "console", /* M49 */
+            "tty" /* M63: the console under its other name */
         };
-        static const uint32_t ids[6] = { 1, 2, 3, 4, 4, 5 };
+        static const uint32_t ids[7] = { 1, 2, 3, 4, 4, 5,
+                                         5 };
         int i;
         if (devdir != NULL) {
-            for (i = 0; i < 6; i++) {
+            for (i = 0; i < 7; i++) {
                 struct yousj_ramfs_node *n = node_create(
                     devdir, names[i], str_len(names[i]),
                     false);

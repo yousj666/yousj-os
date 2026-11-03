@@ -1024,12 +1024,30 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   （同一 cookie），两对象各
   MOVE_SELF，yfs 分支同样。
   inotifytest 增至 13 个场景。
-- ⏳ 下一步候选：getrandom 与
-  ioctl 终端参数（TCGETS/
-  TIOCGWINSZ）等 busybox 交互
-  式 shell 的剩余拼图，或把
-  /bin/sh 换成 busybox sh 做
-  默认 shell 试运行。
+- ✅ 交互式 shell M63
+  （2026-11-04）：ioctl 转正
+  （16 号此前只有定义没有实
+  现）——控制台保留一份
+  termios 记录：TCGETS 报上次
+  设定值（初始为登录终端的常
+  规默认），TCSETS/SW/SF 存
+  值，TIOCG/SWINSZ 读写窗
+  口尺寸，FIONREAD 报可读，
+  其余与非控制台文件一律
+  ENOTTY。getrandom(318) 接同
+  一 PRNG。/dev/tty 作为控制台
+  的别名节点出现。此后交互式
+  busybox sh 完整工作：打印自
+  己的提示符、自己回显编辑、
+  跑命令、干净退出（作业控制
+  因尚无进程组而关，属预期降
+  级）。bb 套件新增交互场景。
+- ⏳ 下一步候选：CLONE_VFORK
+  （ash 与 posix_spawn 的首选
+  路径，目前 EINVAL 后回退
+  fork），或进程组/会话
+  （setpgid/setsid）为作业控
+  制铺路。
 
 ## 从零构建
 

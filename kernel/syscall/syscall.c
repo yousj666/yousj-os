@@ -3173,6 +3173,56 @@ static long sys_ftruncate(long fd, int64_t len)
     return fs_file_truncate(f, (uint64_t)len);
 }
 
+/* M63: ioctl -- the fs layer owns the console's termios
+ * record; here we only resolve the descriptor, validate
+ * the argument buffer for the requests that move memory,
+ * and translate "not a tty" into ENOTTY. */
+#define IOCTL_ENOTTY 25
+static long sys_ioctl(long fd, uint64_t req, uint64_t arg)
+{
+    struct task *me = sched_current();
+    struct yousj_file *f = fd_file_of(me, fd);
+    uint64_t need = 0;
+
+    if (f == NULL)
+        return -YOUSJ_EBADF;
+    switch (req) {
+    case 0x5401: /* TCGETS */
+    case 0x5402: /* TCSETS */
+    case 0x5403: /* TCSETSW */
+    case 0x5404: /* TCSETSF */
+        need = 36;
+        break;
+    case 0x5413: /* TIOCGWINSZ */
+    case 0x5414: /* TIOCSWINSZ */
+        need = 8;
+        break;
+    case 0x541B: /* FIONREAD */
+        need = 4;
+        break;
+    default:
+        break;
+    }
+    if (need != 0 && !user_range_ok(arg, need))
+        return -YOUSJ_EFAULT;
+    return fs_ioctl(f, req, arg);
+}
+
+/* M63: getrandom -- the /dev/random PRNG behind a syscall
+ * face. All flag bits are accepted; the pool is always
+ * "initialized" in our model, so even GRND_NONBLOCK fills
+ * completely. */
+static long sys_getrandom(uint64_t buf, uint64_t len,
+                          uint64_t flags)
+{
+    if (flags & ~7ULL)
+        return -YOUSJ_EINVAL;
+    if (len > 0 && !user_range_ok(buf, len))
+        return -YOUSJ_EFAULT;
+    fs_random_fill((uint8_t *)(uintptr_t)buf, len);
+    return (long)len;
+}
+
 static long sys_fchmod(long fd, long mode)
 {
     struct task *me = sched_current();
@@ -4357,6 +4407,10 @@ static long dispatch_inner(struct yousj_syscall_ctx *ctx)
         return sys_truncate(a1, (int64_t)a2);
     case YOUSJ_SYS_ftruncate:
         return sys_ftruncate((long)a1, (int64_t)a2);
+    case YOUSJ_SYS_ioctl:
+        return sys_ioctl((long)a1, a2, a3);
+    case YOUSJ_SYS_getrandom:
+        return sys_getrandom(a1, a2, a3);
     case YOUSJ_SYS_getuid:
     case YOUSJ_SYS_getgid:
     case YOUSJ_SYS_geteuid:

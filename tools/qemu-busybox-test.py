@@ -84,6 +84,21 @@ def memfree():
 try:
     ok = until('sh> ')
     check('boot to shell', ok)
+    # M63: an interactive busybox sh -- with TCGETS alive
+    # it prints its own prompt, edits and runs a command,
+    # and exits back to the system shell.
+    buf = b''
+    s.send(b'busybox sh\n')
+    okp = until('/ #')
+    check('interactive prompt', okp)
+    buf = b''
+    s.send(b'echo INBB $((3+4))\n')
+    okc = until('INBB 7')
+    check('interactive command', okc)
+    buf = b''
+    s.send(b'exit\n')
+    okx = until('sh> ')
+    check('interactive exit', okx)
     t = run_cmd('/bin/busybox --install -s /bin')
     check('applet install completes', 'No space' not in t and
           'not an absolute' not in t)
