@@ -261,6 +261,15 @@ void files_get(struct yousj_files *fl);
 void files_put(struct yousj_files *fl);
 struct yousj_files *files_dup(struct yousj_files *fl);
 
+/* M55: fs-state objects (struct in sched.h). Unlike
+ * files_put, fsstate_put has nothing to close -- the
+ * last drop just frees the slot. */
+struct yousj_fsstate;
+struct yousj_fsstate *fsstate_alloc(void);
+void fsstate_get(struct yousj_fsstate *fs);
+void fsstate_put(struct yousj_fsstate *fs);
+struct yousj_fsstate *fsstate_dup(struct yousj_fsstate *fs);
+
 /* Ramfs file I/O. `dst`/`src`/`buf` are addresses in the
  * CALLER's address space (the syscall layer validates ranges;
  * the console never reaches these). Return bytes moved or a

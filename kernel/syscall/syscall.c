@@ -343,6 +343,10 @@ void process_exit(long status, int sig)
     files_put(me->files);
     me->files = NULL;
 
+    /* M55: drop the fs state (nothing to close in it). */
+    fsstate_put(me->fsstate);
+    me->fsstate = NULL;
+
     /* Process teardown (SCHED_DESIGN 6.1): an owned address
      * space reference is dropped here, while this task is
      * still the one running -- detach it from the task first
@@ -478,6 +482,7 @@ static long sys_wait4(long pid, uint64_t status_ptr, long options,
 #define CLONE_SIGHAND_K       0x800      /* M53 */
 #define CLONE_THREAD_K        0x10000    /* M53 */
 #define CLONE_FILES_K         0x400      /* M54 */
+#define CLONE_FS_K            0x200      /* M55 */
 
 /* M52: write a 32-bit value into an address space with no
  * chance of faulting -- translate first, then go through
@@ -530,7 +535,8 @@ static long sys_clone(struct yousj_syscall_ctx *ctx, long flags,
                   CLONE_PARENT_SETTID_K |
                   CLONE_CHILD_CLEARTID_K |
                   CLONE_CHILD_SETTID_K | CLONE_SIGHAND_K |
-                  CLONE_THREAD_K | CLONE_FILES_K)) != 0 ||
+                  CLONE_THREAD_K | CLONE_FILES_K |
+                  CLONE_FS_K)) != 0 ||
         ((flags & 0xFF) != 0 && (flags & 0xFF) != YOUSJ_SIGCHLD))
         return -YOUSJ_EINVAL;
     if (child_stack != 0 && !share_vm)
@@ -652,7 +658,6 @@ static long sys_clone(struct yousj_syscall_ctx *ctx, long flags,
                 child->cmdline[i] = me->cmdline[i];
             child->cmdline_len = me->cmdline_len;
         }
-        child->umask = me->umask; /* M37 */
         /* M34: environ inherits the same way. */
         {
             uint32_t i;
@@ -672,6 +677,14 @@ static long sys_clone(struct yousj_syscall_ctx *ctx, long flags,
         } else {
             child->files = files_dup(me->files);
         }
+        /* M55: the fs state, same pattern -- CLONE_FS
+         * shares cwd + umask, plain clone copies them. */
+        if (flags & CLONE_FS_K) {
+            child->fsstate = me->fsstate;
+            fsstate_get(child->fsstate);
+        } else {
+            child->fsstate = fsstate_dup(me->fsstate);
+        }
         {
             int i;
             /* M14: VMAs copy with the address space (the pages
@@ -683,8 +696,6 @@ static long sys_clone(struct yousj_syscall_ctx *ctx, long flags,
                     child->vmas[i].file != NULL)
                     file_get(child->vmas[i].file);
             }
-            for (i = 0; i < YOUSJ_CWD_MAX; i++)
-                child->cwd_path[i] = me->cwd_path[i];
         }
     }
     __asm__ volatile("push %0; popfq" : : "r"(flags_saved) : "memory");
@@ -1030,8 +1041,9 @@ static void resolve_path(struct task *t, const char *path, char *out)
 {
     uint64_t i = 0, j;
     if (path[0] != '/') {
-        const char *cwd = (t != NULL && t->cwd_path[0] != '\0')
-                              ? t->cwd_path
+        const char *cwd = (t != NULL && t->fsstate != NULL &&
+                           t->fsstate->cwd_path[0] != '\0')
+                              ? t->fsstate->cwd_path
                               : "/";
         for (j = 0; cwd[j] != '\0' && i < 255; j++)
             out[i++] = cwd[j];
@@ -1194,7 +1206,7 @@ static long sys_openat(long dirfd, uint64_t path_ptr, long flags,
     {
         uint32_t eff = 0;
         if ((flags & YOUSJ_O_CREAT) && mode != 0)
-            eff = (uint32_t)mode & ~me->umask & 07777u;
+            eff = (uint32_t)mode & ~me->fsstate->umask & 07777u;
         rc = fs_open_path(resolved, flags, eff, &f);
     }
     if (rc != 0)
@@ -1841,7 +1853,7 @@ static long sys_mkdir_sys(uint64_t path_ptr, long mode)
     resolve_path(me, path_buf, resolved);
     return fs_mkdir_path(resolved, mode != 0
                                        ? ((uint32_t)mode &
-                                          ~me->umask & 07777u)
+                                          ~me->fsstate->umask & 07777u)
                                        : 0);
 }
 
@@ -1864,15 +1876,15 @@ static long sys_chdir_sys(uint64_t path_ptr)
             return -YOUSJ_ENOTDIR;
     }
     for (i = 0; i < YOUSJ_CWD_MAX - 1 && resolved[i] != '\0'; i++)
-        me->cwd_path[i] = resolved[i];
-    me->cwd_path[i] = '\0';
+        me->fsstate->cwd_path[i] = resolved[i];
+    me->fsstate->cwd_path[i] = '\0';
     return 0;
 }
 
 static long sys_getcwd_sys(uint64_t buf, uint64_t size)
 {
     struct task *me = sched_current();
-    const char *cwd = me->cwd_path[0] != '\0' ? me->cwd_path : "/";
+    const char *cwd = me->fsstate->cwd_path[0] != '\0' ? me->fsstate->cwd_path : "/";
     uint64_t len = 0, i;
 
     while (cwd[len] != '\0')
@@ -2714,7 +2726,7 @@ static long sys_mkdirat(long dirfd, uint64_t path_ptr,
         return rc;
     return fs_mkdir_path(rp, mode != 0
                                  ? ((uint32_t)mode &
-                                    ~me->umask & 07777u)
+                                    ~me->fsstate->umask & 07777u)
                                  : 0);
 }
 
@@ -3917,8 +3929,8 @@ static long dispatch_inner(struct yousj_syscall_ctx *ctx)
                                    a4, a5, (long)ctx->a6);
     case YOUSJ_SYS_umask: {
         struct task *t = sched_current();
-        long old = (long)t->umask;
-        t->umask = (uint32_t)a1 & 0777u;
+        long old = (long)t->fsstate->umask;
+        t->fsstate->umask = (uint32_t)a1 & 0777u;
         return old;
     }
     case YOUSJ_SYS_rmdir:
@@ -4091,6 +4103,13 @@ void user_task_start(void *arg)
      * table (later tasks get theirs through clone). */
     if (me->files == NULL)
         me->files = files_alloc();
+    /* M55: and its own fs state, born at "/" with umask
+     * 0022 as every task was before the object split. */
+    if (me->fsstate == NULL) {
+        me->fsstate = fsstate_alloc();
+        if (me->fsstate != NULL)
+            me->fsstate->umask = 0022;
+    }
     /* M9: a boot-created user task starts life with the console
      * on fds 0-2 (later tasks inherit stdio through clone). */
     if (me->files != NULL &&

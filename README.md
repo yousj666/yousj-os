@@ -856,14 +856,34 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   端送字节、再在共享表里关掉读
   端，父自己的读端随之 EBADF
   （拷贝语义下父应照常可读）。
-- ⏳ 下一步候选：CLONE_FS 收尾
-  clone 旗标面（cwd 字符串与
-  umask 共享），或 robust futex，
-  或 inotify 事件补完（ftruncate
-  的 MODIFY、exchange 的
-  MOVE_SELF）；再往后可尝试接
-  musl 跑真 pthread 程序作形式
-  验证。
+- ✅ fs 状态共享 M55（2026-11-04）：
+  cwd 与 umask 打包成引用计数的
+  共享对象（yousj_fsstate，fs.c
+  池 32；task 只留指针，出生在
+  user_task_start、默认 "/" 与
+  umask 0022）。普通 clone 拷贝、
+  CLONE_FS(0x200) 转正共享：一处
+  chdir/umask 全组生效。退出只放
+  引用（无可关之物）；exec 不脱离
+  ——与 Linux 一致，fs 状态跨
+  exec 保持共享。至此 glibc 的
+  clone 旗标面（VM/FS/FILES/
+  SIGHAND/THREAD/SETTLS/SETTID
+  家族/CLEARTID）全部转正，
+  pthread 的创建路径在 ABI 层
+  面已无缺口。验收：futextest
+  加 clonefs 场景——CLONE_FS
+  孩子 chdir 到新建目录并
+  umask(077)，父的 getcwd 与
+  umask 探针随之而变。
+- ⏳ 下一步候选：接 musl 跑真
+  pthread 程序作形式验证（静态
+  链接一个 musl 多线程程序进
+  initramfs，验证整条 pthread
+  创建/汇合/TLS 链），或 robust
+  futex，或 inotify 事件补完
+  （ftruncate 的 MODIFY、
+  exchange 的 MOVE_SELF）。
 
 ## 从零构建
 

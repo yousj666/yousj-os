@@ -594,6 +594,50 @@ struct yousj_files *files_dup(struct yousj_files *fl)
     return nf;
 }
 
+/* --- M55: fs-state objects (cwd + umask) ----------------
+ * Same pool shape as the fd tables; nothing to close on
+ * the last drop. */
+#define FSSTATE_POOL 32
+static struct yousj_fsstate g_fsstate_pool[FSSTATE_POOL];
+
+struct yousj_fsstate *fsstate_alloc(void)
+{
+    int i;
+    for (i = 0; i < FSSTATE_POOL; i++) {
+        if (g_fsstate_pool[i].refs == 0) {
+            mem_zero((uint8_t *)&g_fsstate_pool[i],
+                     sizeof(g_fsstate_pool[i]));
+            g_fsstate_pool[i].refs = 1;
+            return &g_fsstate_pool[i];
+        }
+    }
+    return NULL;
+}
+
+void fsstate_get(struct yousj_fsstate *fs)
+{
+    if (fs != NULL)
+        fs->refs++;
+}
+
+void fsstate_put(struct yousj_fsstate *fs)
+{
+    if (fs != NULL && fs->refs > 0)
+        fs->refs--;
+}
+
+struct yousj_fsstate *fsstate_dup(struct yousj_fsstate *fs)
+{
+    struct yousj_fsstate *nf = fsstate_alloc();
+    int i;
+    if (nf == NULL || fs == NULL)
+        return nf;
+    for (i = 0; i < YOUSJ_CWD_MAX; i++)
+        nf->cwd_path[i] = fs->cwd_path[i];
+    nf->umask = fs->umask;
+    return nf;
+}
+
 #define MAX_PIPES 16
 static struct yousj_pipe g_pipes[MAX_PIPES];
 
@@ -1684,7 +1728,10 @@ static long proc_link_target(int id, uint32_t pid,
     if (t == NULL)
         return -1;
     if (id == PROC_ID_PCWD)
-        src = t->cwd_path[0] != '\0' ? t->cwd_path : "/";
+        src = (t->fsstate != NULL &&
+               t->fsstate->cwd_path[0] != '\0')
+                  ? t->fsstate->cwd_path
+                  : "/";
     else if (id == PROC_ID_PEXE) {
         if (t->exe_path[0] == '\0')
             return -1;

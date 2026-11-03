@@ -150,8 +150,9 @@ struct task *kthread_create(const char *name, void (*entry)(void *arg),
 
     mem_zero(t, sizeof(*t));
     t->in_use = true;
-    t->umask = 0022; /* M37: every task is born with it;
-                        clone overwrites from the parent */
+    /* M55: umask/cwd live in the fsstate object now --
+     * NULL here; user_task_start births it 0022 + "/",
+     * clone overwrites from the parent. */
     t->tid = g_next_tid++;
     t->tgid = t->tid; /* M53: own group until a THREAD clone */
     t->parent_tid = g_current != NULL ? g_current->tid : 0;

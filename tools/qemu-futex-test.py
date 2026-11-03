@@ -73,7 +73,8 @@ def send(cmd):
 
 
 SCEN = ['mismatch', 'wake-none', 'bad-op', 'timeout',
-        'signal', 'xwake', 'join', 'sighand', 'files']
+        'signal', 'xwake', 'join', 'sighand', 'files',
+        'clonefs']
 
 
 def run(tag):

@@ -50,6 +50,16 @@ static long sys_call1(long nr, long a1)
     return ret;
 }
 
+static long sys_call2(long nr, long a1, long a2)
+{
+    long ret;
+    __asm__ volatile("syscall"
+                     : "=a"(ret)
+                     : "a"(nr), "D"(a1), "S"(a2)
+                     : "rcx", "r11", "memory");
+    return ret;
+}
+
 static long sys_call3(long nr, long a1, long a2, long a3)
 {
     long ret;
@@ -252,6 +262,40 @@ __asm__(
     "    jz 1f\n"
     "    ret\n"
     "1:  call thread_main4\n"
+    "    mov $231, %rax\n"
+    "    xor %rdi, %rdi\n"
+    "    syscall\n"
+    "    ud2\n");
+
+/* M55 clonefs: a CLONE_FS child chdirs and sets umask;
+ * the parent's own cwd and mask must move with it. */
+#define SYS_chdir 80
+#define SYS_mkdir 83
+#define SYS_getcwd 79
+#define SYS_umask 95
+
+static volatile int fs_done;
+static char cwd_buf[64];
+
+__attribute__((used)) void thread_main5(void)
+{
+    sys_call2(SYS_chdir, (long)(uintptr_t)"/fstest", 0);
+    sys_call1(SYS_umask, 077);
+    fs_done = 1;
+    sleep_ms(300);
+    die(0);
+}
+
+extern long clone_fs_call(long flags, uint64_t stack);
+__asm__(
+    ".globl clone_fs_call\n"
+    "clone_fs_call:\n"
+    "    mov $56, %rax\n" /* clone */
+    "    syscall\n"
+    "    test %rax, %rax\n"
+    "    jz 1f\n"
+    "    ret\n"
+    "1:  call thread_main5\n"
     "    mov $231, %rax\n"
     "    xor %rdi, %rdi\n"
     "    syscall\n"
@@ -573,6 +617,40 @@ int main(int argc, char **argv)
                 sys_call1(SYS_close, pipe_wr);
                 report("files", ok1 && ok2);
             }
+        }
+    }
+
+    /* clonefs: CLONE_FS shares cwd + umask */
+    {
+        uint64_t top =
+            (uint64_t)(uintptr_t)(cstack + sizeof(cstack)) &
+            ~15ULL;
+        long c;
+        int ok, spins;
+        sys_call2(SYS_mkdir, (long)(uintptr_t)"/fstest", 0755);
+        fs_done = 0;
+        /* SIGCHLD | VM | FS(0x200) | THREAD(0x10000) */
+        c = clone_fs_call(17 | 0x100 | 0x200 | 0x10000, top);
+        if (c <= 0) {
+            report("clonefs", 0);
+        } else {
+            long st = 0;
+            long old_umask;
+            for (spins = 0; spins < 300 && !fs_done; spins++)
+                sleep_ms(10);
+            cwd_buf[0] = '\0';
+            sys_call2(SYS_getcwd, (long)(uintptr_t)cwd_buf,
+                      sizeof(cwd_buf));
+            /* The child's chdir moved OUR cwd too, and
+             * its umask(077) is the mask we now hold. */
+            old_umask = sys_call1(SYS_umask, 0);
+            sys_call1(SYS_umask, 0022);
+            sys_call2(SYS_chdir, (long)(uintptr_t)"/", 0);
+            ok = cwd_buf[0] == '/' && cwd_buf[1] == 'f' &&
+                 cwd_buf[2] == 's' && old_umask == 077;
+            sys_call4(SYS_wait4, c,
+                      (long)(uintptr_t)&st, 0, 0);
+            report("clonefs", ok);
         }
     }
 

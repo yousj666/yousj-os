@@ -40,6 +40,17 @@ struct yousj_files {
     uint16_t fd_cloexec;       /* per-fd close-on-exec (M10) */
 };
 
+/* M55: the fs state (cwd + umask) as a shareable,
+ * refcounted object (CLONE_FS) -- the last of the
+ * per-task tables to become shareable. Member names
+ * match the old task fields, so call sites only gain
+ * an "fsstate->" hop. Pool + refcount live in fs.c. */
+struct yousj_fsstate {
+    uint32_t refs;
+    char cwd_path[YOUSJ_CWD_MAX]; /* "" = "/" */
+    uint32_t umask;               /* M37: creation mask */
+};
+
 struct vmm_space; /* from <yousj/vmm.h>; tasks only hold the pointer */
 
 enum task_state {
@@ -176,9 +187,11 @@ struct task {
     uint64_t        sig_alt_sp;   /* M32: alternate signal stack */
     uint64_t        sig_alt_size;
     uint32_t        sig_alt_flags; /* YOUSJ_SS_DISABLE when off */
-    uint32_t        umask;        /* M37: creation mask,
-                                     born 0022, clone keeps
-                                     the parent's, exec too */
+    struct yousj_fsstate *fsstate; /* M55: cwd + umask,
+                                     shareable (CLONE_FS);
+                                     NULL for kernel threads;
+                                     born 0022 + "/" in
+                                     user_task_start */
     int             sig_killed;   /* when a signal ended this
                                      task: its number, else 0;
                                      wait4 builds the status
@@ -216,7 +229,6 @@ struct task {
      * pointer itself is NULL only for kernel threads, which
      * never touch fds. Pool + refcount live in fs.c. */
     struct yousj_files *files;
-    char            cwd_path[YOUSJ_CWD_MAX]; /* "" = "/" */
     bool            in_use;
 };
 
