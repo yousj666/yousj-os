@@ -608,6 +608,22 @@ int main(int argc, char **argv)
         ok = ln == 12 && lb[0] == '/' && lb[1] == 'd' &&
              lb[5] == 'c';
         {
+            /* M49: the console link's target is a real
+             * /dev/console node now -- stat of the link
+             * says CHR, and opening the link succeeds
+             * (it used to be ENOENT). */
+            long cfd = sys_call3(SYS_open,
+                                 (long)(uintptr_t)"/proc/self/fd/0",
+                                 2 /* O_RDWR */, 0);
+            ok = ok && cfd >= 0 &&
+                 sys_call3(SYS_stat,
+                           (long)(uintptr_t)"/proc/self/fd/0",
+                           (long)(uintptr_t)&sb, 0) == 0 &&
+                 (sb.mode & 0170000) == 0020000;
+            if (cfd >= 0)
+                sys_call1(SYS_close, cfd);
+        }
+        {
             char xp[64];
             const char *pre = "/proc/self/fd/";
             uint64_t j = 0;

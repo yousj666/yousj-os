@@ -715,9 +715,33 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   规则曾误插进 pidtest 规则与配方之间，
   inotifytest.elf 被 pidtest 源码覆写——靠
   两 elf 的 md5 相同当场抓出。
-- ⏳ 下一步候选：fd 层小缺口扫尾
-  （/proc/self/fd 打开控制台链接）、
-  splice 余项与 utimens 的 ATTRIB 补挂。
+- ✅ 小缺口扫尾 M49（2026-11-04）：三件。
+  ①/dev/console 转正为真设备节点（DEV_
+  CONSOLE=5，读走串口轮询＋信号打断、与
+  syscall 层控制台读者同纪律，写直达
+  serial_putc）——/proc/self/fd 的控制台
+  链接自 M41 起 readlink 报的正是这个路
+  径，此前打开是 ENOENT，如今按路径重开
+  即通，直开 /dev/console 亦可。②utimens
+  补挂 IN_ATTRIB：fs_utimens_path 与
+  fs_utimens_file 在成功后按 chmod 同款
+  inotify_self_id 投递（ramfs/yfs 两后
+  端）。③splice 家族收齐：SPLICE_F_
+  NONBLOCK 转正（pipe 读写内存助手加
+  nonblock 形参；满管道目标在消费输入前
+  先判空转，避免非阻塞失败吞数据）、
+  tee（276，窥环不消费）、vmsplice
+  （278，iovec 经栈缓冲入管道，GIFT 只接
+  受仍拷贝）。验收：fstest devices 加
+  /dev/console（stat CHR＋写令牌由
+  harness 在串口流中核对）、pidtest
+  fd-dir 加控制台链接打开、inotifytest
+  加 utimens 场景、pipetest 加 splice-
+  nonblock/tee/vmsplice 三场景。
+- ⏳ 下一步候选：inotify 事件补完
+  （ftruncate 的 MODIFY、exchange 的
+  MOVE_SELF），或 /proc/self/fd 管道
+  链接按 dup 语义打开。
 
 ## 从零构建
 

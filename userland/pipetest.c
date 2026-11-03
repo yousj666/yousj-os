@@ -29,6 +29,8 @@
 #define SYS_pipe         22
 #define SYS_sendfile     40
 #define SYS_splice       275
+#define SYS_tee          276
+#define SYS_vmsplice     278
 #define SYS_unlink       87
 #define SYS_dup          32
 #define SYS_dup2         33
@@ -432,6 +434,135 @@ static void t_splice(void)
     sys_call3(SYS_unlink, (long)(uintptr_t)"/sp2.txt", 0, 0);
 }
 
+/* M49: SPLICE_F_NONBLOCK is honored -- an empty source
+ * and a full destination both report -EAGAIN, and the
+ * full-destination failure consumes nothing. */
+static void t_splice_nonblock(void)
+{
+    int p1[2] = { -1, -1 }, p2[2] = { -1, -1 };
+    static char fill[4096];
+    char buf[16];
+    long fd, n;
+    int ok;
+    sys_call3(SYS_pipe, (long)(uintptr_t)p1, 0, 0);
+    sys_call3(SYS_pipe, (long)(uintptr_t)p2, 0, 0);
+    /* empty pipe source, NONBLOCK: -EAGAIN, not a hang */
+    n = sys_call6(SYS_splice, p1[0], 0, p2[1], 0, 4, 2);
+    ok = n == -11;
+    /* fill p2 completely through its write end */
+    sys_call3(SYS_write, p2[1], (long)(uintptr_t)fill, 4096);
+    sys_call3(SYS_write, p1[1], (long)(uintptr_t)"abcd", 4);
+    /* full pipe destination, NONBLOCK: -EAGAIN ... */
+    n = sys_call6(SYS_splice, p1[0], 0, p2[1], 0, 4, 2);
+    ok = ok && n == -11;
+    /* ... and the source kept its bytes (no loss) */
+    n = sys_call3(SYS_read, p1[0], (long)(uintptr_t)buf, 4);
+    ok = ok && n == 4 && bytes_eq(buf, "abcd", 4);
+    /* with room again, the same splice succeeds */
+    sys_call3(SYS_read, p2[0], (long)(uintptr_t)fill, 16);
+    sys_call3(SYS_write, p1[1], (long)(uintptr_t)"wxyz", 4);
+    n = sys_call6(SYS_splice, p1[0], 0, p2[1], 0, 4, 2);
+    ok = ok && n == 4;
+    /* a regular-file source into a completely full pipe
+     * also reports -EAGAIN without consuming */
+    sys_call3(SYS_read, p2[0], (long)(uintptr_t)fill, 4096);
+    fd = sys_call3(SYS_open, (long)(uintptr_t)"/spnb.txt",
+                   0101, 0644);
+    sys_call3(SYS_write, fd, (long)(uintptr_t)"filedata", 8);
+    sys_call3(SYS_close, fd, 0, 0);
+    fd = sys_call3(SYS_open, (long)(uintptr_t)"/spnb.txt", 0, 0);
+    sys_call3(SYS_write, p2[1], (long)(uintptr_t)fill, 4096);
+    n = sys_call6(SYS_splice, fd, 0, p2[1], 0, 8, 2);
+    ok = ok && n == -11;
+    sys_call3(SYS_close, fd, 0, 0);
+    report2("splice-nonblock", ok, 0);
+    sys_call3(SYS_close, p1[0], 0, 0);
+    sys_call3(SYS_close, p1[1], 0, 0);
+    sys_call3(SYS_close, p2[0], 0, 0);
+    sys_call3(SYS_close, p2[1], 0, 0);
+    sys_call3(SYS_unlink, (long)(uintptr_t)"/spnb.txt", 0, 0);
+}
+
+/* M49: tee copies pipe to pipe without consuming. */
+static void t_tee(void)
+{
+    int p1[2] = { -1, -1 }, p2[2] = { -1, -1 };
+    char buf[16];
+    long fd, n;
+    int ok;
+    sys_call3(SYS_pipe, (long)(uintptr_t)p1, 0, 0);
+    sys_call3(SYS_pipe, (long)(uintptr_t)p2, 0, 0);
+    sys_call3(SYS_write, p1[1], (long)(uintptr_t)"tee-data-49",
+              11);
+    n = sys_call4(SYS_tee, p1[0], p2[1], 11, 0);
+    ok = n == 11;
+    /* the copy arrived ... */
+    n = sys_call3(SYS_read, p2[0], (long)(uintptr_t)buf, 11);
+    ok = ok && n == 11 && bytes_eq(buf, "tee-data-49", 11);
+    /* ... and the source still holds every byte */
+    n = sys_call3(SYS_read, p1[0], (long)(uintptr_t)buf, 11);
+    ok = ok && n == 11 && bytes_eq(buf, "tee-data-49", 11);
+    /* empty source with NONBLOCK: -EAGAIN */
+    n = sys_call4(SYS_tee, p1[0], p2[1], 4, 2);
+    ok = ok && n == -11;
+    /* only SPLICE_F_NONBLOCK may be set */
+    ok = ok && sys_call4(SYS_tee, p1[0], p2[1], 4, 1) == -22;
+    /* a file end is not a pipe: -EINVAL */
+    fd = sys_call3(SYS_open, (long)(uintptr_t)"/tee.txt",
+                   0101, 0644);
+    ok = ok && sys_call4(SYS_tee, fd, p2[1], 4, 0) == -22;
+    sys_call3(SYS_close, fd, 0, 0);
+    report2("tee", ok, 0);
+    sys_call3(SYS_close, p1[0], 0, 0);
+    sys_call3(SYS_close, p1[1], 0, 0);
+    sys_call3(SYS_close, p2[0], 0, 0);
+    sys_call3(SYS_close, p2[1], 0, 0);
+    sys_call3(SYS_unlink, (long)(uintptr_t)"/tee.txt", 0, 0);
+}
+
+/* M49: vmsplice gathers user iovecs into a pipe. */
+struct test_iov {
+    const char *base;
+    uint64_t len;
+};
+
+static void t_vmsplice(void)
+{
+    int p[2] = { -1, -1 };
+    static struct test_iov iov[2];
+    char buf[16];
+    long fd, n;
+    int ok;
+    iov[0].base = "vm-";
+    iov[0].len = 3;
+    iov[1].base = "splice!";
+    iov[1].len = 7;
+    sys_call3(SYS_pipe, (long)(uintptr_t)p, 0, 0);
+    n = sys_call4(SYS_vmsplice, p[1], (long)(uintptr_t)iov,
+                  2, 0);
+    ok = n == 10;
+    n = sys_call3(SYS_read, p[0], (long)(uintptr_t)buf, 10);
+    ok = ok && n == 10 && bytes_eq(buf, "vm-splice!", 10);
+    /* SPLICE_F_GIFT is accepted (data still copied) */
+    n = sys_call4(SYS_vmsplice, p[1], (long)(uintptr_t)iov,
+                  1, 8);
+    ok = ok && n == 3;
+    sys_call3(SYS_read, p[0], (long)(uintptr_t)buf, 3);
+    /* MOVE is not a vmsplice flag: -EINVAL */
+    ok = ok && sys_call4(SYS_vmsplice, p[1],
+                         (long)(uintptr_t)iov, 1, 1) == -22;
+    /* the destination must be a pipe */
+    fd = sys_call3(SYS_open, (long)(uintptr_t)"/vm.txt",
+                   0101, 0644);
+    ok = ok && sys_call4(SYS_vmsplice, fd,
+                         (long)(uintptr_t)iov, 1, 0) == -22;
+    sys_call3(SYS_close, fd, 0, 0);
+    report2("vmsplice", ok, 0);
+    sys_call3(SYS_close, p[0], 0, 0);
+    sys_call3(SYS_close, p[1], 0, 0);
+    sys_call3(SYS_unlink, (long)(uintptr_t)"/vm.txt", 0, 0);
+}
+
 int main(int argc, char **argv)
 {
     if (argc > 2 && argv[1][0] >= '0' && argv[1][0] <= '9' &&
@@ -441,6 +572,9 @@ int main(int argc, char **argv)
     t_basic();
     t_sendfile_pipe();
     t_splice();
+    t_splice_nonblock();
+    t_tee();
+    t_vmsplice();
     t_block_eof();
     t_epipe();
     t_full();

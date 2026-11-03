@@ -642,6 +642,24 @@ static void t_devices(void)
         uint32_t mode = *(uint32_t *)(stb + 24);
         ok = ok && rc == 0 && (mode & 0170000) == 0020000;
     }
+    {
+        /* M49: /dev/console is a real node -- stat says
+         * CHR, open works, and a write lands on the
+         * terminal (the harness greps for the token). */
+        uint8_t stb[144];
+        long rc = sys_call4(262 /* newfstatat */, -100,
+                            (long)(uintptr_t)"/dev/console",
+                            (long)(uintptr_t)stb, 0);
+        uint32_t mode = *(uint32_t *)(stb + 24);
+        long cfd = open_("/dev/console", O_RDWR);
+        ok = ok && rc == 0 && (mode & 0170000) == 0020000 &&
+             cfd >= 0 &&
+             sys_call3(SYS_write, cfd,
+                       (long)(uintptr_t)"DEVCON-TOKEN-49\n",
+                       16) == 16;
+        if (cfd >= 0)
+            sys_call3(SYS_close, cfd, 0, 0);
+    }
     report("devices", ok);
 }
 

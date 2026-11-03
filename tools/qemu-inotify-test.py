@@ -72,7 +72,7 @@ def send(cmd):
 
 
 SCEN = ['init', 'eagain', 'watch-dir', 'create',
-        'watch-file', 'modify-close', 'rename',
+        'watch-file', 'modify-close', 'utimens', 'rename',
         'poll-ready', 'unlink', 'rm-watch']
 
 

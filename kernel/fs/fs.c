@@ -17,6 +17,7 @@
 #include <yousj/vmm.h> /* errno magnitudes + phys_to_virt */
 #include <yousj/user.h> /* M39: user window constants for maps */
 #include <yousj/signal.h> /* M48: blocking inotify reads */
+#include <drivers/serial.h> /* M49: /dev/console I/O */
 
 #define YOUSJ_EBADF   9
 #define YOUSJ_EEXIST_L 17
@@ -2103,8 +2104,11 @@ long fs_open_path(const char *path, long flags,
                 /* M41: opening an fd link re-opens its
                  * target path (fresh offset, like Linux
                  * for regular files). Non-path targets
-                 * (pipes, the console, epoll) cannot be
-                 * re-opened -- EINVAL. */
+                 * (pipes, epoll) cannot be re-opened --
+                 * EINVAL. The console's target is the
+                 * /dev/console path, a real device node
+                 * since M49, so it re-opens like any
+                 * other path. */
                 char target[PATH_MAX_LEN + 1];
                 if (proc_fd_target(pid, fdn, target,
                                     sizeof(target)) < 0)
@@ -2962,17 +2966,28 @@ long fs_utimens_path(const char *path, bool follow,
     path = resolved;
     if (is_data_path(path)) {
         long ino = yfs_lookup(data_rel(path));
+        long rc;
         if (ino < 0)
             return -YOUSJ_ENOENT_L;
-        return utimens_yfs_ino((uint32_t)ino, aop, mop);
+        rc = utimens_yfs_ino((uint32_t)ino, aop, mop);
+        if (rc == 0) /* M49: like chmod, a stamp change
+                      * is an attribute change */
+            inotify_self_id(1, NULL, (uint32_t)ino,
+                            IN_ATTRIB_K,
+                            yfs_is_dir((uint32_t)ino));
+        return rc;
     }
     if (is_proc_path(path))
         return -YOUSJ_EACCES_L; /* generated files: read-only */
     {
         struct yousj_ramfs_node *n = fs_lookup(path);
+        long rc;
         if (n == NULL)
             return -YOUSJ_ENOENT_L;
-        return utimens_ramfs_node(n, aop, mop);
+        rc = utimens_ramfs_node(n, aop, mop);
+        if (rc == 0) /* M49 */
+            inotify_self_id(0, n, 0, IN_ATTRIB_K, n->is_dir);
+        return rc;
     }
 }
 
@@ -2984,11 +2999,22 @@ long fs_utimens_file(struct yousj_file *f,
         return -YOUSJ_EBADF;
     if (f->backend == 2)
         return -YOUSJ_EACCES_L;
-    if (f->backend == 1)
-        return utimens_yfs_ino(f->yfs_ino, aop, mop);
-    if (f->node != NULL)
-        return utimens_ramfs_node(f->node, aop, mop);
-    return -YOUSJ_EINVAL; /* pipes, epoll, console: no stamps */
+    if (f->backend == 1) {
+        long rc = utimens_yfs_ino(f->yfs_ino, aop, mop);
+        if (rc == 0) /* M49 */
+            inotify_self_id(1, NULL, f->yfs_ino, IN_ATTRIB_K,
+                            yfs_is_dir(f->yfs_ino));
+        return rc;
+    }
+    if (f->node != NULL) {
+        long rc = utimens_ramfs_node(f->node, aop, mop);
+        if (rc == 0) /* M49 */
+            inotify_self_id(0, f->node, 0, IN_ATTRIB_K,
+                            f->node->is_dir);
+        return rc;
+    }
+    return -YOUSJ_EINVAL; /* pipes, epoll, the console
+                             singleton: no stamps */
 }
 
 /* --- M36: chmod / chown --------------------------------
@@ -3078,11 +3104,14 @@ int fs_mount_data(void)
 /* M47: character devices. Ids: 1 null, 2 zero, 3 full,
  * 4 random (urandom shares it -- there is no entropy
  * model, just a xorshift PRNG seeded at init from the
- * wall clock and the tick count). */
+ * wall clock and the tick count). M49 adds 5 console:
+ * the serial terminal as a real /dev node, so the path
+ * the /proc fd links have always named actually opens. */
 #define DEV_NULL   1
 #define DEV_ZERO   2
 #define DEV_FULL   3
 #define DEV_RANDOM 4
+#define DEV_CONSOLE 5
 
 static uint64_t g_rng_state = 0x9E3779B97F4A7C15ull;
 
@@ -3112,15 +3141,51 @@ static long dev_read(struct yousj_file *f, uint8_t *dst,
         for (i = 0; i < count; i++)
             dst[i] = rng_byte();
         return (long)count;
+    case DEV_CONSOLE: { /* M49 */
+        /* The syscall layer's console-reader discipline,
+         * one level down: block for the first byte (2-tick
+         * polls, signals interrupt), then drain whatever
+         * is already buffered. No line discipline -- the
+         * reader (the shell) edits its own lines. */
+        struct task *me = sched_current();
+        uint64_t got = 0;
+        if (count == 0)
+            return 0;
+        while (got == 0) {
+            int c = serial_getc_nonblock();
+            if (c >= 0) {
+                dst[got++] = (uint8_t)c;
+                break;
+            }
+            if (signal_deliverable_pending(me)) {
+                me->sig_wake = false;
+                return -512; /* -ERESTARTSYS */
+            }
+            sched_sleep_ticks(2);
+        }
+        while (got < count) {
+            int c = serial_getc_nonblock();
+            if (c < 0)
+                break;
+            dst[got++] = (uint8_t)c;
+        }
+        return (long)got;
+    }
     default:
         return -YOUSJ_EBADF;
     }
 }
 
-static long dev_write(struct yousj_file *f, uint64_t count)
+static long dev_write(struct yousj_file *f, const uint8_t *src,
+                      uint64_t count)
 {
+    uint64_t i;
     if (f->node->dev == DEV_FULL)
         return -YOUSJ_ENOSPC;
+    if (f->node->dev == DEV_CONSOLE) { /* M49 */
+        for (i = 0; i < count; i++)
+            serial_putc((char)src[i]);
+    }
     return (long)count; /* null, zero, random: sink */
 }
 
@@ -3201,7 +3266,7 @@ long file_write(struct yousj_file *f, const uint8_t *src,
     if ((f->flags & YOUSJ_O_ACCMODE) == YOUSJ_O_RDONLY)
         return -YOUSJ_EBADF;
     if (f->node->dev != 0) /* M47 */
-        return dev_write(f, count);
+        return dev_write(f, src, count);
     if (f->flags & YOUSJ_O_APPEND)
         f->offset = f->node->size;
     n = node_pwrite(f->node, f->offset, src, count);
@@ -3275,7 +3340,7 @@ long fs_pwrite_file(struct yousj_file *f, uint64_t off,
         return -YOUSJ_EBADF;
     if (f->backend == 0 && f->node != NULL &&
         f->node->dev != 0) /* M47 */
-        return dev_write(f, count);
+        return dev_write(f, src, count);
     while (done < count) {
         uint64_t chunk = count - done;
         long n;
@@ -3630,13 +3695,14 @@ void fs_init(void)
     ramfs_mkdir_path("/dev");
     {
         struct yousj_ramfs_node *devdir = fs_lookup("/dev");
-        static const char *const names[5] = {
-            "null", "zero", "full", "random", "urandom"
+        static const char *const names[6] = {
+            "null", "zero", "full", "random", "urandom",
+            "console" /* M49 */
         };
-        static const uint32_t ids[5] = { 1, 2, 3, 4, 4 };
+        static const uint32_t ids[6] = { 1, 2, 3, 4, 4, 5 };
         int i;
         if (devdir != NULL) {
-            for (i = 0; i < 5; i++) {
+            for (i = 0; i < 6; i++) {
                 struct yousj_ramfs_node *n = node_create(
                     devdir, names[i], str_len(names[i]),
                     false);

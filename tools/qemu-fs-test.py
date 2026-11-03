@@ -61,6 +61,7 @@ def run_suite(tag):
     seg = buf[mark:].decode(errors='replace')
     for name in SCENARIOS:
         check(tag + ' fstest ' + name, ('FSTEST ' + name + ' PASS') in seg)
+    check(tag + ' devconsole token', 'DEVCON-TOKEN-49' in seg)
     check(tag + ' fstest exited 0',
           until('sh> ', 10, mark) and 'FSTEST DONE' in seg
           and '[exit ' not in seg.rsplit('FSTEST DONE', 1)[1].split('free')[0])

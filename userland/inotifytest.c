@@ -59,9 +59,11 @@ static long sys_call4(long n, long a1, long a2, long a3, long a4)
 #define SYS_inotify_init1    294
 #define SYS_inotify_add_watch 254
 #define SYS_inotify_rm_watch 255
+#define SYS_utimensat 280
 
 #define IN_NONBLOCK  0x800
 #define IN_MODIFY    0x00000002u
+#define IN_ATTRIB    0x00000004u
 #define IN_CLOSE_WRITE 0x00000008u
 #define IN_MOVED_FROM  0x00000040u
 #define IN_MOVED_TO    0x00000080u
@@ -162,7 +164,8 @@ int main(int argc, char **argv)
 
     wd_file = sys_call3(SYS_inotify_add_watch, ifd,
                         (long)(uintptr_t)"/iw/a.txt",
-                        IN_MODIFY | IN_CLOSE_WRITE |
+                        IN_MODIFY | IN_ATTRIB |
+                            IN_CLOSE_WRITE |
                             IN_DELETE_SELF | IN_MOVE_SELF);
     report("watch-file", wd_file == 2);
 
@@ -184,6 +187,20 @@ int main(int argc, char **argv)
                (e.mask & IN_MODIFY) != 0 && e.len == 0 &&
                e2.wd == 2 &&
                (e2.mask & IN_CLOSE_WRITE) != 0);
+    }
+
+    /* utimensat: a stamp change is IN_ATTRIB (M49) */
+    {
+        static const long times[4] = { 1234567, 0,
+                                       1234568, 0 };
+        long rc = sys_call4(SYS_utimensat, -100,
+                            (long)(uintptr_t)"/iw/a.txt",
+                            (long)(uintptr_t)times, 0);
+        n = sys_call3(SYS_read, ifd, (long)(uintptr_t)buf,
+                      sizeof(buf));
+        off = ev_at(buf, 0, &e, &nm);
+        report("utimens", rc == 0 && n == off && e.wd == 2 &&
+               (e.mask & IN_ATTRIB) != 0 && e.len == 0);
     }
 
     /* rename: FROM/TO pair with one cookie on the dir

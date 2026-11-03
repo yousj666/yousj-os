@@ -63,10 +63,11 @@ static struct yousj_file *fd_file_of(struct task *t, long fd); /* M9, defined wi
 static void resolve_path(struct task *t, const char *path, char *out);
 static long sys_read_pipe(struct yousj_file *f, uint64_t buf, uint64_t count);
 static long pipe_read_mem(struct yousj_file *f, uint8_t *dst,
-                          uint64_t count);
+                          uint64_t count, bool nonblock);
 static long sys_write_pipe(struct yousj_file *f, uint64_t buf, uint64_t len);
 static long pipe_write_mem(struct yousj_file *f,
-                           const uint8_t *src, uint64_t len);
+                           const uint8_t *src, uint64_t len,
+                           bool nonblock);
 
 /* Called from sched_schedule() on every switch (weak hook, see
  * sched.c): TSS.rsp0 and cpu_local.kernel_rsp must always name the
@@ -1176,7 +1177,7 @@ static long sys_sendfile(long out_fd, long in_fd,
         if (n == 0)
             break;
         if (out->pipe != NULL)
-            w = pipe_write_mem(out, kbuf, (uint64_t)n);
+            w = pipe_write_mem(out, kbuf, (uint64_t)n, false);
         else if (out->backend == 0 && out->node == NULL)
             w = -YOUSJ_EINVAL; /* the console cannot take it */
         else
@@ -1203,9 +1204,11 @@ out:
  * either side may be the pipe (at least one must be).
  * Offsets follow the sendfile rule per side -- a pipe
  * side must pass NULL, a file side is positional with
- * a pointer and offset-carried without. SPLICE_F_*
- * flags are accepted; blocking behavior follows the
- * descriptors (documented simplification). */
+ * a pointer and offset-carried without. M49:
+ * SPLICE_F_NONBLOCK is honored (a full out-pipe bails
+ * before any input is consumed, so a failed nonblock
+ * splice never loses data); the other SPLICE_F_* bits
+ * are accepted and ignored. */
 static long splice_off_read(uint64_t ptr, bool is_pipe,
                             int64_t *out)
 {
@@ -1265,8 +1268,15 @@ static long sys_splice(long fd_in, uint64_t off_in_ptr,
         long n, w;
         if (want > sizeof(kbuf))
             want = sizeof(kbuf);
+        if ((flags & 0x2L) && out->pipe != NULL &&
+            out->pipe->count >= YOUSJ_PIPE_CAP) {
+            /* M49: NONBLOCK and nowhere to put the next
+             * chunk -- fail before consuming input. */
+            result = done > 0 ? (long)done : -YOUSJ_EAGAIN;
+            goto out;
+        }
         if (in->pipe != NULL)
-            n = pipe_read_mem(in, kbuf, want);
+            n = pipe_read_mem(in, kbuf, want, flags & 0x2L);
         else if (off_in >= 0)
             n = fs_pread_file(in, (uint64_t)off_in + done,
                               kbuf, want);
@@ -1279,7 +1289,8 @@ static long sys_splice(long fd_in, uint64_t off_in_ptr,
         if (n == 0)
             break;
         if (out->pipe != NULL)
-            w = pipe_write_mem(out, kbuf, (uint64_t)n);
+            w = pipe_write_mem(out, kbuf, (uint64_t)n,
+                               flags & 0x2L);
         else if (off_out >= 0)
             w = fs_pwrite_file(out, (uint64_t)off_out + done,
                                kbuf, (uint64_t)n);
@@ -1306,6 +1317,121 @@ out:
                 off_out + (int64_t)done;
     }
     return done > 0 ? (long)done : result;
+}
+
+/* --- M49: tee ----------------------------------------
+ * splice's non-consuming sibling: copy up to len bytes
+ * from one pipe to another and leave the source intact
+ * (the ring is peeked, never drained). Blocking follows
+ * the descriptors plus SPLICE_F_NONBLOCK, the only flag
+ * tee defines. */
+static long sys_tee(long fd_in, long fd_out, uint64_t len,
+                    long flags)
+{
+    struct task *me = sched_current();
+    struct yousj_file *in = fd_file_of(me, fd_in);
+    struct yousj_file *out = fd_file_of(me, fd_out);
+    uint8_t kbuf[1024];
+    uint64_t done = 0;
+    bool nonblock;
+
+    if (in == NULL || out == NULL)
+        return -YOUSJ_EBADF;
+    if (flags & ~0x2L)
+        return -YOUSJ_EINVAL; /* only SPLICE_F_NONBLOCK */
+    if (in->pipe == NULL || out->pipe == NULL)
+        return -YOUSJ_EINVAL; /* tee is pipe to pipe */
+    if ((in->flags & YOUSJ_O_ACCMODE) != YOUSJ_O_RDONLY ||
+        (out->flags & YOUSJ_O_ACCMODE) != YOUSJ_O_WRONLY)
+        return -YOUSJ_EBADF;
+    nonblock = (flags & 0x2L) != 0;
+    while (done < len) {
+        struct yousj_pipe *p = in->pipe;
+        uint64_t n, i;
+        long w;
+        if (p->count == 0) {
+            if (done > 0)
+                break;
+            if (p->writers == 0)
+                return 0; /* EOF: no writer will ever come */
+            if (nonblock || (in->flags & YOUSJ_O_NONBLOCK))
+                return -YOUSJ_EAGAIN;
+            if (signal_deliverable_pending(me)) {
+                me->sig_wake = false;
+                return -YOUSJ_ERESTARTSYS;
+            }
+            sched_sleep_ticks(2);
+            continue;
+        }
+        n = len - done;
+        if (n > p->count)
+            n = p->count;
+        if (n > sizeof(kbuf))
+            n = sizeof(kbuf);
+        for (i = 0; i < n; i++)
+            kbuf[i] = p->buf[(p->head + i) % YOUSJ_PIPE_CAP];
+        w = pipe_write_mem(out, kbuf, n, flags & 0x2L);
+        if (w < 0)
+            return done > 0 ? (long)done : w;
+        done += (uint64_t)w;
+        if ((uint64_t)w < n)
+            break; /* out filled; the source keeps its bytes */
+    }
+    return (long)done;
+}
+
+/* --- M49: vmsplice -----------------------------------
+ * The last splice-family member: user memory, described
+ * by an iovec array, into a pipe. SPLICE_F_GIFT is
+ * accepted but the bytes are copied like everything
+ * else -- this kernel has no page donation. */
+struct vmsplice_iov {
+    uint64_t base;
+    uint64_t len;
+};
+
+static long sys_vmsplice(long fd, uint64_t iov_ptr,
+                         uint64_t nr_segs, long flags)
+{
+    struct yousj_file *out = fd_file_of(sched_current(), fd);
+    uint8_t kbuf[1024];
+    uint64_t done = 0, s;
+
+    if (out == NULL)
+        return -YOUSJ_EBADF;
+    if (flags & ~(0x2L | 0x8L))
+        return -YOUSJ_EINVAL; /* NONBLOCK | GIFT only */
+    if (out->pipe == NULL)
+        return -YOUSJ_EINVAL; /* vmsplice needs a pipe */
+    if (nr_segs > 1024)
+        return -YOUSJ_EINVAL;
+    if (nr_segs > 0 && !user_range_ok(iov_ptr, nr_segs * 16))
+        return -YOUSJ_EFAULT;
+    for (s = 0; s < nr_segs; s++) {
+        const struct vmsplice_iov *iov =
+            (const struct vmsplice_iov *)(uintptr_t)
+                (iov_ptr + s * 16);
+        uint64_t off = 0;
+        if (iov->len > 0 && !user_range_ok(iov->base, iov->len))
+            return done > 0 ? (long)done : -YOUSJ_EFAULT;
+        while (off < iov->len) {
+            uint64_t chunk = iov->len - off, i;
+            long w;
+            if (chunk > sizeof(kbuf))
+                chunk = sizeof(kbuf);
+            for (i = 0; i < chunk; i++)
+                kbuf[i] = ((const uint8_t *)(uintptr_t)
+                               (iov->base + off))[i];
+            w = pipe_write_mem(out, kbuf, chunk, flags & 0x2L);
+            if (w < 0)
+                return done > 0 ? (long)done : w;
+            done += (uint64_t)w;
+            off += (uint64_t)w;
+            if ((uint64_t)w < chunk)
+                return (long)done; /* pipe filled (nonblock) */
+        }
+    }
+    return (long)done;
 }
 
 /* --- M43: copy_file_range ------------------------------
@@ -2533,13 +2659,17 @@ static long sys_read_pipe(struct yousj_file *f, uint64_t buf,
 
     if (!user_range_ok(buf, count))
         return -YOUSJ_EFAULT;
-    return pipe_read_mem(f, (uint8_t *)(uintptr_t)buf, count);
+    return pipe_read_mem(f, (uint8_t *)(uintptr_t)buf, count,
+                         false);
 }
 
 /* M42 split: the pipe-read loop into a memory sink;
- * sendfile's sibling splice() reads through it. */
+ * sendfile's sibling splice() reads through it. M49:
+ * nonblock is the caller's per-call flag (splice's
+ * SPLICE_F_NONBLOCK), OR-ed with the descriptor's own
+ * O_NONBLOCK inside. */
 static long pipe_read_mem(struct yousj_file *f, uint8_t *dst,
-                          uint64_t count)
+                          uint64_t count, bool nonblock)
 {
     struct task *me = sched_current();
     struct yousj_pipe *p = f->pipe;
@@ -2561,7 +2691,7 @@ static long pipe_read_mem(struct yousj_file *f, uint8_t *dst,
         }
         if (p->writers == 0)
             return 0; /* EOF: every write end is gone */
-        if (f->flags & YOUSJ_O_NONBLOCK)
+        if (nonblock || (f->flags & YOUSJ_O_NONBLOCK))
             return -YOUSJ_EAGAIN;
         if (signal_deliverable_pending(me)) {
             me->sig_wake = false;
@@ -2581,14 +2711,16 @@ static long sys_write_pipe(struct yousj_file *f, uint64_t buf,
     if (!user_range_ok(buf, len))
         return -YOUSJ_EFAULT;
     return pipe_write_mem(f, (const uint8_t *)(uintptr_t)buf,
-                          len);
+                          len, false);
 }
 
 /* M40 split: the pipe-write loop over a memory source.
  * sys_write_pipe validates the user range first;
- * sendfile feeds it a kernel buffer instead. */
+ * sendfile feeds it a kernel buffer instead. M49:
+ * nonblock as in pipe_read_mem. */
 static long pipe_write_mem(struct yousj_file *f,
-                           const uint8_t *src, uint64_t len)
+                           const uint8_t *src, uint64_t len,
+                           bool nonblock)
 {
     struct task *me = sched_current();
     struct yousj_pipe *p = f->pipe;
@@ -2622,7 +2754,7 @@ static long pipe_write_mem(struct yousj_file *f,
                 return (long)written;
             continue;
         }
-        if (f->flags & YOUSJ_O_NONBLOCK)
+        if (nonblock || (f->flags & YOUSJ_O_NONBLOCK))
             return written > 0 ? (long)written : -YOUSJ_EAGAIN;
         if (signal_deliverable_pending(me)) {
             me->sig_wake = false;
@@ -3459,6 +3591,10 @@ static long dispatch_inner(struct yousj_syscall_ctx *ctx)
     case YOUSJ_SYS_splice:
         return sys_splice((long)a1, a2, (long)a3, a4, a5,
                           (long)ctx->a6);
+    case YOUSJ_SYS_tee:
+        return sys_tee((long)a1, (long)a2, a3, (long)a4);
+    case YOUSJ_SYS_vmsplice:
+        return sys_vmsplice((long)a1, a2, a3, (long)a4);
     case YOUSJ_SYS_copy_file_range:
         return sys_copy_file_range((long)a1, a2, (long)a3,
                                    a4, a5, (long)ctx->a6);
