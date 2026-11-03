@@ -124,9 +124,12 @@ static void sleep_ms(long ms)
     sys_call3(SYS_nanosleep, (long)(uintptr_t)t, 0, 0);
 }
 
+/* M57: die() serves thread bodies, so it is plain exit(60);
+ * exit_group(231) takes the whole group down and is used
+ * explicitly by the groupexit scenario only. */
 static void die(long code)
 {
-    sys_call1(SYS_exit_group, code);
+    sys_call1(60, code);
     for (;;) {
     }
 }
@@ -169,7 +172,7 @@ __asm__(
     "    jz 1f\n"
     "    ret\n" /* parent: pid in rax */
     "1:  call thread_main\n"
-    "    mov $231, %rax\n" /* exit_group(0) if it returns */
+    "    mov $60, %rax\n" /* exit(0): thread exit (M57) */
     "    xor %rdi, %rdi\n"
     "    syscall\n"
     "    ud2\n");
@@ -262,7 +265,7 @@ __asm__(
     "    jz 1f\n"
     "    ret\n"
     "1:  call thread_main4\n"
-    "    mov $231, %rax\n"
+    "    mov $60, %rax\n" /* exit(0): thread exit (M57) */
     "    xor %rdi, %rdi\n"
     "    syscall\n"
     "    ud2\n");
@@ -296,7 +299,50 @@ __asm__(
     "    jz 1f\n"
     "    ret\n"
     "1:  call thread_main5\n"
-    "    mov $231, %rax\n"
+    "    mov $60, %rax\n" /* exit(0): thread exit (M57) */
+    "    xor %rdi, %rdi\n"
+    "    syscall\n"
+    "    ud2\n");
+
+/* M57 groupexit: sleeper threads for the group-kill
+ * scenario; they only finish early if SIGKILL lands. */
+#define SYS_clone 56
+#define SYS_open 2
+#define SYS_exit_group 231
+
+static char cstack_b[8192];
+
+static long sys_call5(long nr, long a1, long a2, long a3,
+                      long a4, long a5)
+{
+    long ret;
+    register long r10 __asm__("r10") = a4;
+    register long r8 __asm__("r8") = a5;
+    __asm__ volatile("syscall"
+                     : "=a"(ret)
+                     : "a"(nr), "D"(a1), "S"(a2), "d"(a3),
+                       "r"(r10), "r"(r8)
+                     : "rcx", "r11", "memory");
+    return ret;
+}
+
+__attribute__((used)) void thread_main6(void)
+{
+    sleep_ms(30000);
+    die(0);
+}
+
+extern long clone_sleep_call(long flags, uint64_t stack);
+__asm__(
+    ".globl clone_sleep_call\n"
+    "clone_sleep_call:\n"
+    "    mov $56, %rax\n" /* clone */
+    "    syscall\n"
+    "    test %rax, %rax\n"
+    "    jz 1f\n"
+    "    ret\n"
+    "1:  call thread_main6\n"
+    "    mov $60, %rax\n" /* exit(0): thread exit (M57) */
     "    xor %rdi, %rdi\n"
     "    syscall\n"
     "    ud2\n");
@@ -313,7 +359,7 @@ __asm__(
     "    jz 1f\n"
     "    ret\n"
     "1:  call thread_main3\n"
-    "    mov $231, %rax\n"
+    "    mov $60, %rax\n" /* exit(0): thread exit (M57) */
     "    xor %rdi, %rdi\n"
     "    syscall\n"
     "    ud2\n");
@@ -331,7 +377,7 @@ __asm__(
     "    jz 1f\n"
     "    ret\n" /* parent: pid in rax */
     "1:  call thread_main2\n"
-    "    mov $231, %rax\n"
+    "    mov $60, %rax\n" /* exit(0): thread exit (M57) */
     "    xor %rdi, %rdi\n"
     "    syscall\n"
     "    ud2\n");
@@ -651,6 +697,100 @@ int main(int argc, char **argv)
             sys_call4(SYS_wait4, c,
                       (long)(uintptr_t)&st, 0, 0);
             report("clonefs", ok);
+        }
+    }
+
+    /* groupexit: exit_group takes the whole thread group */
+    {
+        int pfds[2];
+        long p;
+        if (sys_call1(SYS_pipe, (long)(uintptr_t)pfds) != 0) {
+            report("groupexit", 0);
+        } else if ((p = sys_call5(SYS_clone, 17, 0, 0, 0,
+                                   0)) == 0) {
+            /* P: two sleeper threads, report their tids,
+             * then exit_group(7) -- if the group kill works
+             * they die with us instead of sleeping 30 s. */
+            uint64_t top1 =
+                (uint64_t)(uintptr_t)(cstack +
+                                      sizeof(cstack)) & ~15ULL;
+            uint64_t top2 =
+                (uint64_t)(uintptr_t)(cstack_b +
+                                      sizeof(cstack_b)) & ~15ULL;
+            long tids[2];
+            tids[0] = clone_sleep_call(
+                17 | 0x100 | 0x10000, top1);
+            tids[1] = clone_sleep_call(
+                17 | 0x100 | 0x10000, top2);
+            sys_call3(SYS_write, pfds[1],
+                      (long)(uintptr_t)tids, 16);
+            sys_call1(SYS_exit_group, 7);
+            die(99); /* unreachable */
+        } else if (p < 0) {
+            report("groupexit", 0);
+        } else {
+            long tids[2] = {0, 0};
+            long got = 0, st = 0;
+            int ok = 1, spins;
+            while (got < 16) {
+                long n = sys_call3(
+                    SYS_read, pfds[0],
+                    (long)(uintptr_t)((char *)tids + got),
+                    16 - got);
+                if (n <= 0)
+                    break;
+                got += n;
+            }
+            sys_call4(SYS_wait4, p,
+                      (long)(uintptr_t)&st, 0, 0);
+            if (got != 16 || tids[0] <= 0 || tids[1] <= 0 ||
+                ((st >> 8) & 0xff) != 7 || (st & 0x7f) != 0)
+                ok = 0;
+            /* Both grandchildren must vanish from /proc:
+             * killed by the group exit, adopted by init,
+             * reaped. Sleeping on would leave them listed
+             * for 30 s. */
+            for (spins = 0; spins < 40 && ok; spins++) {
+                int alive = 0, k;
+                for (k = 0; k < 2; k++) {
+                    char path[32];
+                    int j = 0;
+                    const char *pre = "/proc/";
+                    long fd;
+                    while (pre[j]) { path[j] = pre[j]; j++; }
+                    {
+                        char dig[12];
+                        int nd = 0;
+                        long v = tids[k];
+                        if (v == 0) dig[nd++] = '0';
+                        while (v > 0) {
+                            dig[nd++] =
+                                (char)('0' + v % 10);
+                            v /= 10;
+                        }
+                        while (nd > 0)
+                            path[j++] = dig[--nd];
+                    }
+                    {
+                        const char *suf = "/status";
+                        int q = 0;
+                        while (suf[q]) path[j++] = suf[q++];
+                    }
+                    path[j] = '\0';
+                    fd = sys_call2(SYS_open,
+                                   (long)(uintptr_t)path, 0);
+                    if (fd >= 0) {
+                        alive = 1;
+                        sys_call1(SYS_close, fd);
+                    }
+                }
+                if (!alive)
+                    break;
+                sleep_ms(100);
+            }
+            if (spins >= 40)
+                ok = 0;
+            report("groupexit", ok);
         }
     }
 

@@ -3863,6 +3863,32 @@ static long sys_kill(long pid, long sig)
                        (int)sched_current()->tid);
 }
 
+/* M57: exit_group terminates the whole thread group, as
+ * on Linux: every other member takes a SIGKILL (delivered
+ * through the ordinary fatal-signal path, which wakes
+ * blocked members and retires ready ones at their gates),
+ * then the caller exits with the given status. Plain
+ * exit(60) remains caller-only. Members already zombies
+ * need nothing; kernel tasks have no tgid peers. */
+static void sys_exit_group(long status)
+{
+    struct task *me = sched_current();
+    uint64_t tids[YOUSJ_SCHED_MAX_TASKS];
+    uint32_t n = sched_live_tids(tids, YOUSJ_SCHED_MAX_TASKS);
+    uint32_t i;
+    for (i = 0; i < n; i++) {
+        struct task *v;
+        if (tids[i] == me->tid)
+            continue;
+        v = sched_find_task((int)tids[i]);
+        if (v != NULL && v->mm != NULL &&
+            v->state != TASK_ZOMBIE && v->tgid == me->tgid)
+            (void)signal_send(v, YOUSJ_SIGKILL, (int)me->tid);
+    }
+    process_exit(status, 0);
+    __builtin_unreachable();
+}
+
 static long sys_ps_snapshot(uint64_t buf, uint64_t len)
 {
     if (len == 0)
@@ -4123,8 +4149,10 @@ static long dispatch_inner(struct yousj_syscall_ctx *ctx)
     case YOUSJ_SYS_sigaltstack:
         return sys_sigaltstack(a1, a2);
     case YOUSJ_SYS_exit:
-    case YOUSJ_SYS_exit_group:
         process_exit((long)a1, 0);
+        __builtin_unreachable();
+    case YOUSJ_SYS_exit_group:
+        sys_exit_group((long)a1);
         __builtin_unreachable();
     case YOUSJ_SYS_NATIVE_PS_SNAPSHOT:
         return sys_ps_snapshot(a1, a2);

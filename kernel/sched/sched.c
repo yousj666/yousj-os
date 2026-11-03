@@ -10,6 +10,7 @@
  * state manipulation that tests/test_sched.c can drive on the host.
  */
 #include <yousj/sched.h>
+#include <yousj/signal.h> /* signal_deliverable_pending (M57) */
 #include <yousj/pmm.h>
 #include <yousj/vmm.h> /* vmm_space layout + CR3 hooks (weak, below) */
 #include <stddef.h> /* offsetof */
@@ -29,6 +30,9 @@ void arch_on_task_switch(struct task *prev, struct task *next);
  * which links sched.c without the FPU layer. */
 void fpu_init_area(uint8_t *area);
 #pragma weak fpu_init_area
+/* signal.h already declares this; weak for the host test,
+ * which links sched.c without signal.c (M57). */
+#pragma weak signal_deliverable_pending
 
 /* The PML4 phys currently loaded in CR3, as far as this cache
  * knows. The cache key is the PHYS, never the struct vmm_space
@@ -782,7 +786,15 @@ int sched_sleep_ticks_sig(uint64_t ticks)
         return 0;
     deadline = g_ticks + ticks;
     for (;;) {
-        if (g_current->sig_wake) {
+        /* M57: a signal that was already deliverable when the
+         * sleep began counts too -- signal_send only latches
+         * sig_wake for tasks it finds BLOCKED, so a victim
+         * killed while still READY (a just-created thread in
+         * exit_group is the canonical case) would otherwise
+         * sleep the full term with SIGKILL pending. */
+        if (g_current->sig_wake ||
+            (signal_deliverable_pending != NULL &&
+             signal_deliverable_pending(g_current))) {
             g_current->sig_wake = false;
             return 1;
         }

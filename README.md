@@ -911,13 +911,35 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   Makefile 有专用规则（rcrt1.o
   自重定位入口，不是 Scrt1.o）。
   验收套件增至 20 个。
+- ✅ 线程组退出语义 M57
+  （2026-11-04）：exit_group
+  (231) 不再只退调用者——同 tgid
+  的其他成员逐个收 SIGKILL（走
+  普通致命信号通路：唤醒阻塞者、
+  在门上退休就绪者），调用者
+  最后以给定状态退出；exit(60)
+  保持单任务语义。连带修掉一个
+  通用洞：信号在任务进入信号感
+  知睡眠「之前」就已待决时，
+  sched_sleep_ticks_sig 只看
+  sig_wake 锁存会整段睡满（刚
+  建好还没跑的线程被组杀正是
+  此形）——睡眠入口改查待决
+  掩码。futextest 的线程蹦床尾
+  与 die() 同步改回 exit(60)
+  （它们一直靠 exit_group 的旧
+  单任务语义过活），新增
+  groupexit 场景：子进程建两个
+  睡 30 秒的线程后 exit_group
+  (7)，父验退出码与两个孙任务
+  从 /proc 消失。musltest 全程
+  绿（真 libc 的 exit() 正走
+  这条路）。
 - ⏳ 下一步候选：robust futex，
   或 inotify 事件补完（ftruncate
   的 MODIFY、exchange 的
   MOVE_SELF），或动态链接第一
-  步（PT_INTERP＋ld-musl），或
-  线程组退出语义（exit_group
-  杀全组）。
+  步（PT_INTERP＋ld-musl）。
 
 ## 从零构建
 
