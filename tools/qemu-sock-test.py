@@ -43,7 +43,7 @@ def check(name, cond):
     print(('PASS ' if cond else 'FAIL ') + name)
     if not cond: fails.append(name)
 
-SCEN = ['reject', 'bindstat', 'refused', 'e2e', 'queue', 'nbaccept', 'close', 'fork']
+SCEN = ['reject', 'bindstat', 'refused', 'e2e', 'queue', 'nbaccept', 'close', 'fork', 'msgio']
 check('shell prompt', until('sh> ', 45))
 
 def run_suite(tag):

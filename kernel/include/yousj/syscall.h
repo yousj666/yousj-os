@@ -147,13 +147,21 @@
 #define YOUSJ_SYS_getrandom   318   /* M63 */
 #define YOUSJ_SYS_vfork       58    /* M64 */
 #define YOUSJ_SYS_fork        57    /* M65: = clone(SIGCHLD) */
-#define YOUSJ_SYS_shutdown    52    /* M67 */
+#define YOUSJ_SYS_shutdown    48    /* M67, number corrected
+                                     * in M69: 48 is Linux's;
+                                     * 52 is getpeername */
 #define YOUSJ_SYS_socketpair  53    /* M67 */
 #define YOUSJ_SYS_socket      41    /* M68 */
 #define YOUSJ_SYS_connect     42    /* M68 */
 #define YOUSJ_SYS_accept      43    /* M68 */
 #define YOUSJ_SYS_bind        49    /* M68 */
 #define YOUSJ_SYS_listen      50    /* M68 */
+#define YOUSJ_SYS_sendto      44    /* M69 */
+#define YOUSJ_SYS_recvfrom    45    /* M69 */
+#define YOUSJ_SYS_sendmsg     46    /* M69 */
+#define YOUSJ_SYS_recvmsg     47    /* M69 */
+#define YOUSJ_SYS_getsockname 51    /* M69 */
+#define YOUSJ_SYS_getpeername 52    /* M69 */
 #define YOUSJ_SYS_setpgid     109   /* M65 */
 #define YOUSJ_SYS_getpgrp     111   /* M65 */
 #define YOUSJ_SYS_setsid      112   /* M65 */

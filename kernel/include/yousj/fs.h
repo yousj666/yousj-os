@@ -82,6 +82,8 @@ struct yousj_usock {
     int pend_count;
     struct yousj_sockpair *pend[YOUSJ_USOCK_BACKLOG_MAX];
     struct yousj_ramfs_node *node; /* bound node, if any */
+    char bound_path[108]; /* M69: for getsockname; "" when
+                             unbound */
 };
 
 struct yousj_epoll; /* M18: defined in fs.c */

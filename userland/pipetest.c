@@ -40,7 +40,7 @@
 #define SYS_exit_group   231
 #define SYS_pipe2        293
 #define SYS_socketpair   53
-#define SYS_shutdown     52
+#define SYS_shutdown     48
 #define SYS_poll         7
 
 #define O_RDONLY  0

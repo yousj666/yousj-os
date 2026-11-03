@@ -1171,11 +1171,44 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   持；accept4 未做。新增
   socktest（8 场景）与
   qemu-sock-test 套件。
-- ⏳ 下一步候选：send/
-  recv 与 MSG 语义，或
-  SOCK_DGRAM 数据报，或
-  socket 面的 getsockopt
-  常用项。
+- ✅ send/recv 家族与
+  MSG 语义 M69（2026-11-
+  04）：sendto(44)/recvfrom
+  (45)/sendmsg(46)/recvmsg
+  (47) 落地（musl 的 send/
+  recv 本就走这四个号）。
+  M67 的读写核心参数化为
+  带 flags 的 recv/send 核
+  心，支持 MSG_PEEK（窥视
+  不消费）、MSG_WAITALL
+  （攒满才回、流结束回部
+  分）、MSG_DONTWAIT（单
+  次非阻塞）、MSG_NOSIG-
+  NAL（EPIPE 不发 SIG-
+  PIPE）；已连接流上带目
+  标地址回 EISCONN，未连
+  接端点回 ENOTCONN；
+  msg 版按 iov 逐段组合，
+  msg_control（辅助数据）
+  未做、带了回 EINVAL。
+  getsockname(51)/getpeer-
+  name(52)：绑定的端点能
+  报回自己的路径（bind 时
+  存下），其余报空路径；
+  未绑定 getsockname 回
+  EINVAL。**号码修正**：
+  M67 把 shutdown 误放在
+  52（实为 getpeername），
+  本轮挪回 Linux 的 48——
+  自有测试程序随之改号，
+  musl 程序从此调得到。
+  socktest 新增 msgio 场
+  景（共 9）。
+- ⏳ 下一步候选：
+  SOCK_DGRAM 数据报（无
+  连接、按路径 sendto），
+  或 setsockopt/getsockopt
+  常用项，或 accept4。
 
 ## 从零构建
 

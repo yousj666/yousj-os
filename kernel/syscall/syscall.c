@@ -72,6 +72,16 @@ static long sys_read_sock(struct yousj_file *f, uint64_t buf,
                           uint64_t count);  /* M67 */
 static long sys_write_sock(struct yousj_file *f, uint64_t buf,
                            uint64_t len);   /* M67 */
+static long sys_recv_sock(struct yousj_file *f, uint64_t buf,
+                          uint64_t count, long flags); /* M69 */
+static long sys_send_sock(struct yousj_file *f, uint64_t buf,
+                          uint64_t len, long flags);   /* M69 */
+
+/* M69: MSG_* bits (the generic x86-64 values). */
+#define YOUSJ_MSG_PEEK     2
+#define YOUSJ_MSG_DONTWAIT 0x40
+#define YOUSJ_MSG_WAITALL  0x100
+#define YOUSJ_MSG_NOSIGNAL 0x4000
 
 /* Called from sched_schedule() on every switch (weak hook, see
  * sched.c): TSS.rsp0 and cpu_local.kernel_rsp must always name the
@@ -3584,52 +3594,85 @@ static long pipe_write_mem(struct yousj_file *f,
  * ends[] count refined by the shutdown bits; the sleep
  * protocol is the same 2-tick poll + -ERESTARTSYS. */
 
-static long sys_read_sock(struct yousj_file *f, uint64_t buf,
-                          uint64_t count)
+/* M69: the receive core, parameterised by MSG_* flags.
+ * PEEK copies without consuming (later reads see the same
+ * bytes); WAITALL keeps gathering until count is satisfied
+ * or the stream ends; DONTWAIT makes this call nonblocking
+ * even on a blocking file. The M67 read path is flags == 0. */
+static long sys_recv_sock(struct yousj_file *f, uint64_t buf,
+                          uint64_t count, long flags)
 {
     struct task *me = sched_current();
     struct yousj_sockpair *sp = f->spair;
     struct yousj_pipe *ch = &sp->ch[1 - f->spair_end];
     int e = f->spair_end;
+    bool peek = (flags & YOUSJ_MSG_PEEK) != 0;
+    bool waitall = (flags & YOUSJ_MSG_WAITALL) != 0;
+    bool dontwait = (f->flags & YOUSJ_O_NONBLOCK) != 0 ||
+                    (flags & YOUSJ_MSG_DONTWAIT) != 0;
+    uint64_t got = 0;
 
     if (!user_range_ok(buf, count))
         return -YOUSJ_EFAULT;
     if (count == 0)
         return 0;
     for (;;) {
+        uint64_t avail, n, i;
+        uint8_t *dst = (uint8_t *)(uintptr_t)buf;
+
         if (sp->shut[e] & 1)
-            return 0; /* own read side shut down: EOF */
-        if (ch->count > 0) {
-            uint8_t *dst = (uint8_t *)(uintptr_t)buf;
-            uint64_t n = count < ch->count ? count : ch->count;
-            uint64_t i;
+            return (long)got; /* own read side shut: EOF */
+        avail = peek ? (ch->count > got ? ch->count - got : 0)
+                     : ch->count;
+        if (avail > 0) {
+            n = count - got < avail ? count - got : avail;
             for (i = 0; i < n; i++) {
-                dst[i] = ch->buf[ch->head];
-                ch->head = (ch->head + 1) % YOUSJ_PIPE_CAP;
+                uint64_t idx = peek
+                    ? (ch->head + got + i) % YOUSJ_PIPE_CAP
+                    : (ch->head + i) % YOUSJ_PIPE_CAP;
+                dst[got + i] = ch->buf[idx];
             }
-            ch->count -= (uint32_t)n;
-            return (long)n;
+            if (!peek) {
+                ch->head = (ch->head + n) % YOUSJ_PIPE_CAP;
+                ch->count -= (uint32_t)n;
+            }
+            got += n;
+            if (got == count || !waitall)
+                return (long)got;
+            continue;
         }
         if (sp->ends[1 - e] == 0 || (sp->shut[1 - e] & 2))
-            return 0; /* peer gone, or its write side shut */
-        if (f->flags & YOUSJ_O_NONBLOCK)
-            return -YOUSJ_EAGAIN;
+            return (long)got; /* peer gone, or write-shut */
+        if (dontwait)
+            return got > 0 ? (long)got : -YOUSJ_EAGAIN;
         if (signal_deliverable_pending(me)) {
             me->sig_wake = false;
-            return -YOUSJ_ERESTARTSYS;
+            return got > 0 ? (long)got : -YOUSJ_ERESTARTSYS;
         }
         sched_sleep_ticks(2);
     }
 }
 
-static long sys_write_sock(struct yousj_file *f, uint64_t buf,
-                           uint64_t len)
+static long sys_read_sock(struct yousj_file *f, uint64_t buf,
+                          uint64_t count)
+{
+    return sys_recv_sock(f, buf, count, 0);
+}
+
+/* M69: the send core, parameterised by MSG_* flags.
+ * DONTWAIT makes this call nonblocking even on a blocking
+ * file; NOSIGNAL suppresses the SIGPIPE on a dead peer (the
+ * EPIPE return stands). The M67 write path is flags == 0. */
+static long sys_send_sock(struct yousj_file *f, uint64_t buf,
+                          uint64_t len, long flags)
 {
     struct task *me = sched_current();
     struct yousj_sockpair *sp = f->spair;
     struct yousj_pipe *ch = &sp->ch[f->spair_end];
     int e = f->spair_end;
     const uint8_t *src = (const uint8_t *)(uintptr_t)buf;
+    bool dontwait = (f->flags & YOUSJ_O_NONBLOCK) != 0 ||
+                    (flags & YOUSJ_MSG_DONTWAIT) != 0;
     uint64_t written = 0;
 
     if (!user_range_ok(buf, len))
@@ -3641,7 +3684,8 @@ static long sys_write_sock(struct yousj_file *f, uint64_t buf,
         if ((sp->shut[e] & 2) || sp->ends[1 - e] == 0 ||
             (sp->shut[1 - e] & 1)) {
             if (written == 0) {
-                signal_send(me, YOUSJ_SIGPIPE, me->tid);
+                if (!(flags & YOUSJ_MSG_NOSIGNAL))
+                    signal_send(me, YOUSJ_SIGPIPE, me->tid);
                 return -YOUSJ_EPIPE;
             }
             return (long)written;
@@ -3660,7 +3704,7 @@ static long sys_write_sock(struct yousj_file *f, uint64_t buf,
                 return (long)written;
             continue;
         }
-        if (f->flags & YOUSJ_O_NONBLOCK)
+        if (dontwait)
             return written > 0 ? (long)written : -YOUSJ_EAGAIN;
         if (signal_deliverable_pending(me)) {
             me->sig_wake = false;
@@ -3669,6 +3713,12 @@ static long sys_write_sock(struct yousj_file *f, uint64_t buf,
         }
         sched_sleep_ticks(2);
     }
+}
+
+static long sys_write_sock(struct yousj_file *f, uint64_t buf,
+                           uint64_t len)
+{
+    return sys_send_sock(f, buf, len, 0);
 }
 
 static long sys_socketpair(long domain, long type,
@@ -3871,6 +3921,222 @@ static long sys_accept(long fd, uint64_t addr_ptr,
             *(uint32_t *)(uintptr_t)addrlen_ptr = 2;
     }
     return nfd;
+}
+
+/* --- M69: send/recv family and socket names ----------------
+ * musl has no bare send/recv numbers: its send()/recv() call
+ * sendto/recvfrom with a NULL address, so those two plus the
+ * msg forms are the whole surface. On a connected stream
+ * socket they are the M67 cores with MSG_* flags; a dest
+ * address on a connected stream fails EISCONN, an unconnected
+ * endpoint fails ENOTCONN (there is no datagram service
+ * yet). Ancillary data (msg_control) is not carried. */
+
+struct msghdr_k {
+    uint64_t name;
+    int32_t namelen;
+    int32_t pad0;
+    uint64_t iov;
+    uint64_t iovlen;
+    uint64_t control;
+    uint64_t controllen;
+    int32_t flags;
+    int32_t pad1;
+};
+
+/* Fill a user's sockaddr area with an AF_UNIX address: the
+ * bound path for a named endpoint, an empty path otherwise.
+ * The full size is always reported through addrlen_ptr. */
+static long put_sockaddr_un(uint64_t addr_ptr,
+                            uint64_t addrlen_ptr,
+                            const char *path)
+{
+    uint32_t cap, total, n, i;
+    uint8_t *dst;
+
+    if (addr_ptr == 0 || addrlen_ptr == 0)
+        return 0;
+    if (!user_range_ok(addrlen_ptr, 4) ||
+        !user_range_ok(addr_ptr, 2))
+        return -YOUSJ_EFAULT;
+    cap = *(uint32_t *)(uintptr_t)addrlen_ptr;
+    total = 2;
+    if (path != NULL && path[0] != '\0') {
+        uint32_t plen = 0;
+        while (path[plen] != '\0')
+            plen++;
+        total = 2 + plen + 1;
+    }
+    n = cap < total ? cap : total;
+    if (n > 0 && !user_range_ok(addr_ptr, n))
+        return -YOUSJ_EFAULT;
+    dst = (uint8_t *)(uintptr_t)addr_ptr;
+    if (n >= 1)
+        dst[0] = 1; /* AF_UNIX */
+    if (n >= 2)
+        dst[1] = 0;
+    for (i = 2; i < n; i++)
+        dst[i] = (uint8_t)path[i - 2]; /* path + its NUL fit:
+                                        * n <= total */
+    *(uint32_t *)(uintptr_t)addrlen_ptr = total;
+    return 0;
+}
+
+static long sys_sendto(long fd, uint64_t buf, uint64_t len,
+                       long flags, uint64_t addr_ptr)
+{
+    struct yousj_file *f = fd_file_of(sched_current(), fd);
+
+    if (f == NULL)
+        return -YOUSJ_EBADF;
+    if (f->usock != NULL)
+        return -YOUSJ_ENOTCONN;
+    if (f->spair == NULL)
+        return -YOUSJ_ENOTSOCK;
+    if (addr_ptr != 0)
+        return -YOUSJ_EISCONN; /* a stream is already aimed */
+    return sys_send_sock(f, buf, len, flags);
+}
+
+static long sys_recvfrom(long fd, uint64_t buf, uint64_t len,
+                         long flags, uint64_t addr_ptr,
+                         uint64_t addrlen_ptr)
+{
+    struct yousj_file *f = fd_file_of(sched_current(), fd);
+    long rc;
+
+    if (f == NULL)
+        return -YOUSJ_EBADF;
+    if (f->usock != NULL)
+        return -YOUSJ_ENOTCONN;
+    if (f->spair == NULL)
+        return -YOUSJ_ENOTSOCK;
+    rc = sys_recv_sock(f, buf, len, flags);
+    if (rc >= 0)
+        put_sockaddr_un(addr_ptr, addrlen_ptr, NULL);
+    return rc;
+}
+
+static long sys_sendmsg(long fd, uint64_t msg_ptr)
+{
+    struct yousj_file *f = fd_file_of(sched_current(), fd);
+    const struct msghdr_k *mh;
+    uint64_t done_iov = 0;
+    long total = 0;
+
+    if (f == NULL)
+        return -YOUSJ_EBADF;
+    if (f->usock != NULL)
+        return -YOUSJ_ENOTCONN;
+    if (f->spair == NULL)
+        return -YOUSJ_ENOTSOCK;
+    if (!user_range_ok(msg_ptr, sizeof(struct msghdr_k)))
+        return -YOUSJ_EFAULT;
+    mh = (const struct msghdr_k *)(uintptr_t)msg_ptr;
+    if (mh->name != 0)
+        return -YOUSJ_EISCONN;
+    if (mh->controllen != 0)
+        return -YOUSJ_EINVAL; /* no ancillary data yet */
+    if (mh->iovlen > 1024)
+        return -YOUSJ_EINVAL;
+    while (done_iov < mh->iovlen) {
+        struct yousj_iovec chunk[8];
+        uint64_t n = mh->iovlen - done_iov, i;
+        if (n > 8)
+            n = 8;
+        if (!user_range_ok(mh->iov + done_iov * sizeof(chunk[0]),
+                           n * sizeof(chunk[0])))
+            return total > 0 ? total : -YOUSJ_EFAULT;
+        for (i = 0; i < n; i++)
+            chunk[i] = ((const struct yousj_iovec *)
+                        (uintptr_t)mh->iov)[done_iov + i];
+        for (i = 0; i < n; i++) {
+            long rc;
+            if (chunk[i].len == 0)
+                continue;
+            rc = sys_send_sock(f, chunk[i].base, chunk[i].len,
+                               mh->flags);
+            if (rc < 0)
+                return total > 0 ? total : rc;
+            total += rc;
+            if ((uint64_t)rc < chunk[i].len)
+                return total;
+        }
+        done_iov += n;
+    }
+    return total;
+}
+
+static long sys_recvmsg(long fd, uint64_t msg_ptr)
+{
+    struct yousj_file *f = fd_file_of(sched_current(), fd);
+    struct msghdr_k *mh;
+    uint64_t done_iov = 0;
+    long total = 0;
+
+    if (f == NULL)
+        return -YOUSJ_EBADF;
+    if (f->usock != NULL)
+        return -YOUSJ_ENOTCONN;
+    if (f->spair == NULL)
+        return -YOUSJ_ENOTSOCK;
+    if (!user_range_ok(msg_ptr, sizeof(struct msghdr_k)))
+        return -YOUSJ_EFAULT;
+    mh = (struct msghdr_k *)(uintptr_t)msg_ptr;
+    if (mh->iovlen > 1024)
+        return -YOUSJ_EINVAL;
+    while (done_iov < mh->iovlen) {
+        struct yousj_iovec chunk[8];
+        uint64_t n = mh->iovlen - done_iov, i;
+        if (n > 8)
+            n = 8;
+        if (!user_range_ok(mh->iov + done_iov * sizeof(chunk[0]),
+                           n * sizeof(chunk[0])))
+            return total > 0 ? total : -YOUSJ_EFAULT;
+        for (i = 0; i < n; i++)
+            chunk[i] = ((const struct yousj_iovec *)
+                        (uintptr_t)mh->iov)[done_iov + i];
+        for (i = 0; i < n; i++) {
+            long rc;
+            if (chunk[i].len == 0)
+                continue;
+            rc = sys_recv_sock(f, chunk[i].base, chunk[i].len,
+                               mh->flags);
+            if (rc < 0)
+                return total > 0 ? total : rc;
+            total += rc;
+            if ((uint64_t)rc < chunk[i].len) {
+                /* a short read ends the gather */
+                done_iov = mh->iovlen;
+                break;
+            }
+        }
+        done_iov += n;
+    }
+    if (total >= 0) {
+        if (mh->name != 0)
+            put_sockaddr_un(mh->name, msg_ptr + 8,
+                            NULL); /* &mh->namelen */
+        mh->flags = 0; /* no MSG_CTRUNC/EOR reporting yet */
+    }
+    return total;
+}
+
+static long sys_getname(long fd, uint64_t addr_ptr,
+                        uint64_t addrlen_ptr, bool peer)
+{
+    struct yousj_file *f = fd_file_of(sched_current(), fd);
+    const char *path = NULL;
+
+    if (f == NULL)
+        return -YOUSJ_EBADF;
+    if (f->spair == NULL && f->usock == NULL)
+        return -YOUSJ_ENOTSOCK;
+    if (f->usock != NULL && f->usock->state == 0)
+        return -YOUSJ_EINVAL; /* never bound: no name at all */
+    if (!peer && f->usock != NULL)
+        path = f->usock->bound_path;
+    return put_sockaddr_un(addr_ptr, addrlen_ptr, path);
 }
 
 static long sys_shutdown(long fd, long how)
@@ -4861,7 +5127,7 @@ static long dispatch_inner(struct yousj_syscall_ctx *ctx)
 {
     long no = (long)ctx->no;
     uint64_t a1 = ctx->a1, a2 = ctx->a2, a3 = ctx->a3;
-    uint64_t a4 = ctx->a4, a5 = ctx->a5;
+    uint64_t a4 = ctx->a4, a5 = ctx->a5, a6 = ctx->a6;
 
     switch (no) {
     case YOUSJ_SYS_read:
@@ -5004,6 +5270,18 @@ static long dispatch_inner(struct yousj_syscall_ctx *ctx)
                               a4);
     case YOUSJ_SYS_shutdown:
         return sys_shutdown((long)a1, (long)a2);
+    case YOUSJ_SYS_sendto:
+        return sys_sendto((long)a1, a2, a3, (long)a4, a5);
+    case YOUSJ_SYS_recvfrom:
+        return sys_recvfrom((long)a1, a2, a3, (long)a4, a5, a6);
+    case YOUSJ_SYS_sendmsg:
+        return sys_sendmsg((long)a1, a2);
+    case YOUSJ_SYS_recvmsg:
+        return sys_recvmsg((long)a1, a2);
+    case YOUSJ_SYS_getsockname:
+        return sys_getname((long)a1, a2, a3, false);
+    case YOUSJ_SYS_getpeername:
+        return sys_getname((long)a1, a2, a3, true);
     case YOUSJ_SYS_socket:
         return sys_socket((long)a1, (long)a2, (long)a3);
     case YOUSJ_SYS_bind:

@@ -37,8 +37,16 @@
 #define SYS_socket       41
 #define SYS_connect      42
 #define SYS_accept       43
+#define SYS_sendto       44
+#define SYS_recvfrom     45
+#define SYS_sendmsg      46
+#define SYS_recvmsg      47
+#define SYS_shutdown     48
 #define SYS_bind         49
 #define SYS_listen       50
+#define SYS_getsockname  51
+#define SYS_getpeername  52
+#define SYS_socketpair   53
 #define SYS_clone        56
 #define SYS_wait4        61
 #define SYS_unlink       87
@@ -104,6 +112,43 @@ static long sys_call4(long nr, long a1, long a2, long a3, long a4)
                      : "rcx", "r11", "memory");
     return ret;
 }
+
+static long sys_call6(long nr, long a1, long a2, long a3, long a4,
+                      long a5, long a6)
+{
+    long ret;
+    register long r10 __asm__("r10") = a4;
+    register long r8 __asm__("r8") = a5;
+    register long r9 __asm__("r9") = a6;
+    __asm__ volatile("syscall"
+                     : "=a"(ret)
+                     : "a"(nr), "D"(a1), "S"(a2), "d"(a3), "r"(r10),
+                       "r"(r8), "r"(r9)
+                     : "rcx", "r11", "memory");
+    return ret;
+}
+
+#define MSG_PEEK_K     2
+#define MSG_DONTWAIT_K 0x40
+#define MSG_WAITALL_K  0x100
+#define MSG_NOSIGNAL_K 0x4000
+
+struct iovec_k {
+    uint64_t base;
+    uint64_t len;
+};
+
+struct msghdr_k {
+    uint64_t name;
+    int32_t namelen;
+    int32_t pad0;
+    uint64_t iov;
+    uint64_t iovlen;
+    uint64_t control;
+    uint64_t controllen;
+    int32_t flags;
+    int32_t pad1;
+};
 
 static void out(const char *s)
 {
@@ -446,6 +491,133 @@ static void t_fork(void)
     report2("fork", ok, r);
 }
 
+static void t_msgio(void)
+{
+    struct sockaddr_un_k peer;
+    struct iovec_k iov[2];
+    struct msghdr_k mh;
+    char buf[16], b1[4], b2[4];
+    uint32_t plen;
+    int ok = 1;
+    int sv[2];
+    long r, s, pid, st;
+
+    /* the M69 surface rides on an M67 pair */
+    r = sys_call4(SYS_socketpair, AF_UNIX, SOCK_STREAM, 0,
+                  (long)(uintptr_t)sv);
+    ok = ok && r == 0;
+    if (!ok) { report2("msgio", 0, r); return; }
+
+    /* plain sendto/recvfrom, peer address reported */
+    r = sys_call6(SYS_sendto, sv[0], (long)(uintptr_t)"abc", 3,
+                  0, 0, 0);
+    ok = ok && r == 3;
+    plen = sizeof(peer);
+    r = sys_call6(SYS_recvfrom, sv[1], (long)(uintptr_t)buf, 3,
+                  0, (long)(uintptr_t)&peer,
+                  (long)(uintptr_t)&plen);
+    ok = ok && r == 3 && buf[0] == 'a' && buf[2] == 'c' &&
+         plen == 2 && peer.family == AF_UNIX;
+
+    /* a destination on a connected stream: EISCONN */
+    r = sys_call6(SYS_sendto, sv[0], (long)(uintptr_t)"x", 1, 0,
+                  (long)(uintptr_t)&peer, 2);
+    ok = ok && r == -106;
+
+    /* PEEK does not consume; DONTWAIT on a drained pair */
+    r = sys_call6(SYS_sendto, sv[0], (long)(uintptr_t)"peekab",
+                  6, 0, 0, 0);
+    ok = ok && r == 6;
+    r = sys_call6(SYS_recvfrom, sv[1], (long)(uintptr_t)buf, 6,
+                  MSG_PEEK_K, 0, 0);
+    ok = ok && r == 6 && buf[5] == 'b';
+    r = sys_call6(SYS_recvfrom, sv[1], (long)(uintptr_t)buf, 6,
+                  MSG_PEEK_K, 0, 0);
+    ok = ok && r == 6 && buf[0] == 'p';
+    r = sys_call6(SYS_recvfrom, sv[1], (long)(uintptr_t)buf, 6,
+                  0, 0, 0);
+    ok = ok && r == 6;
+    r = sys_call6(SYS_recvfrom, sv[1], (long)(uintptr_t)buf, 6,
+                  MSG_DONTWAIT_K, 0, 0);
+    ok = ok && r == -11; /* EAGAIN */
+
+    /* WAITALL waits for the rest of the message */
+    ok = ok && sys_call3(SYS_write, sv[0],
+                         (long)(uintptr_t)"par", 3) == 3;
+    pid = sys_call4(SYS_clone, 17, 0, 0, 0);
+    if (pid == 0) {
+        sys_call3(SYS_write, sv[0], (long)(uintptr_t)"t!", 2);
+        sys_call3(SYS_exit_group, 0, 0, 0);
+    }
+    ok = ok && pid > 0;
+    r = sys_call6(SYS_recvfrom, sv[1], (long)(uintptr_t)buf, 5,
+                  MSG_WAITALL_K, 0, 0);
+    ok = ok && r == 5 && buf[0] == 'p' && buf[3] == 't' &&
+         buf[4] == '!';
+    st = 0;
+    sys_call4(SYS_wait4, pid, (long)(uintptr_t)&st, 0, 0);
+
+    /* msg forms: gather two iovecs, scatter them back */
+    iov[0].base = (uint64_t)(uintptr_t)"msg-";
+    iov[0].len = 4;
+    iov[1].base = (uint64_t)(uintptr_t)"ok";
+    iov[1].len = 2;
+    mh.name = 0;
+    mh.namelen = 0;
+    mh.pad0 = 0;
+    mh.iov = (uint64_t)(uintptr_t)iov;
+    mh.iovlen = 2;
+    mh.control = 0;
+    mh.controllen = 0;
+    mh.flags = 0;
+    mh.pad1 = 0;
+    r = sys_call3(SYS_sendmsg, sv[0], (long)(uintptr_t)&mh, 0);
+    ok = ok && r == 6;
+    iov[0].base = (uint64_t)(uintptr_t)b1;
+    iov[0].len = 4;
+    iov[1].base = (uint64_t)(uintptr_t)b2;
+    iov[1].len = 2;
+    mh.name = (uint64_t)(uintptr_t)&peer;
+    mh.namelen = (int32_t)sizeof(peer);
+    mh.flags = 0;
+    r = sys_call3(SYS_recvmsg, sv[1], (long)(uintptr_t)&mh, 0);
+    ok = ok && r == 6 && b1[0] == 'm' && b1[3] == '-' &&
+         b2[0] == 'o' && b2[1] == 'k' && mh.namelen == 2 &&
+         peer.family == AF_UNIX;
+
+    /* names: anonymous ends report an empty path, a fresh
+     * socket has no name at all, a bound one reports its own */
+    plen = sizeof(peer);
+    r = sys_call3(SYS_getsockname, sv[0],
+                  (long)(uintptr_t)&peer, (long)(uintptr_t)&plen);
+    ok = ok && r == 0 && plen == 2 && peer.family == AF_UNIX;
+    plen = sizeof(peer);
+    r = sys_call3(SYS_getpeername, sv[0],
+                  (long)(uintptr_t)&peer, (long)(uintptr_t)&plen);
+    ok = ok && r == 0 && plen == 2;
+    s = sys_call3(SYS_socket, AF_UNIX, SOCK_STREAM, 0);
+    plen = sizeof(peer);
+    r = sys_call3(SYS_getsockname, s, (long)(uintptr_t)&peer,
+                  (long)(uintptr_t)&plen);
+    ok = ok && r == -22; /* EINVAL: unbound */
+    ok = ok && do_bind(s, "/s9.sock") == 0;
+    plen = sizeof(peer);
+    r = sys_call3(SYS_getsockname, s, (long)(uintptr_t)&peer,
+                  (long)(uintptr_t)&plen);
+    ok = ok && r == 0 && plen == 11 && peer.path[0] == '/' &&
+         peer.path[7] == 'k'; /* "/s9.sock" + NUL */
+    sys_call3(SYS_close, s, 0, 0);
+    sys_call3(SYS_unlink, (long)(uintptr_t)"/s9.sock", 0, 0);
+
+    /* NOSIGNAL: the EPIPE return without the signal path */
+    sys_call3(SYS_close, sv[1], 0, 0);
+    r = sys_call6(SYS_sendto, sv[0], (long)(uintptr_t)"x", 1,
+                  MSG_NOSIGNAL_K, 0, 0);
+    ok = ok && r == -32;
+    sys_call3(SYS_close, sv[0], 0, 0);
+    report2("msgio", ok, r);
+}
+
 int main(void)
 {
     out("socktest: M68 named AF_UNIX sockets\n");
@@ -457,6 +629,7 @@ int main(void)
     t_nbaccept();
     t_close();
     t_fork();
+    t_msgio();
     out("SOCKTEST DONE\n");
     return failures ? 1 : 0;
 }

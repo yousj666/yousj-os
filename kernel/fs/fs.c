@@ -903,6 +903,13 @@ long fs_usock_bind(struct yousj_file *f, const char *path)
     n->is_sock = true;
     n->sock_owner = u;
     u->node = n;
+    {
+        /* M69: remember the bound path for getsockname. */
+        uint64_t i;
+        for (i = 0; resolved[i] != '\0' && i < 107; i++)
+            u->bound_path[i] = resolved[i];
+        u->bound_path[i] = '\0';
+    }
     u->state = 1;
     return 0;
 }
