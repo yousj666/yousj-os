@@ -16,6 +16,7 @@
 #include <yousj/sched.h> /* M25: tick counters for /proc */
 #include <yousj/vmm.h> /* errno magnitudes + phys_to_virt */
 #include <yousj/user.h> /* M39: user window constants for maps */
+#include <yousj/signal.h> /* M48: blocking inotify reads */
 
 #define YOUSJ_EBADF   9
 #define YOUSJ_EEXIST_L 17
@@ -495,6 +496,7 @@ void file_get(struct yousj_file *f)
 }
 
 static void epoll_release(struct yousj_epoll *ep);
+static void inotify_release(struct yousj_inotify *in);
 
 void file_put(struct yousj_file *f)
 {
@@ -522,6 +524,10 @@ void file_put(struct yousj_file *f)
         if (f->epoll != NULL) {
             epoll_release(f->epoll);
             f->epoll = NULL;
+        }
+        if (f->inotify != NULL) {
+            inotify_release(f->inotify);
+            f->inotify = NULL;
         }
         if (f->backend == 1)
             yfs_note_close(f->yfs_ino);
@@ -684,6 +690,429 @@ bool fs_epoll_entry(struct yousj_file *epf, int idx,
         return false;
     *out = epf->epoll->entries[idx];
     return true;
+}
+
+/* --- M48: inotify -------------------------------------------------
+ * Instances mirror the epoll pattern: a pool, a watch
+ * table keyed by target identity (ramfs node pointer /
+ * yfs inode number), and a fixed-size ring of pending
+ * event records. Mutation entry points in this file
+ * call the notify helpers; delivery filters by each
+ * watch's mask (DELETE_SELF / MOVE_SELF / IGNORED /
+ * Q_OVERFLOW are always delivered, as in Linux). A
+ * deleted object's watches get DELETE_SELF + IGNORED
+ * and are dropped. Blocking reads poll on a 2-tick
+ * sleep like the pipe code. */
+
+#define IN_MODIFY_K        0x00000002u
+#define IN_ATTRIB_K        0x00000004u
+#define IN_CLOSE_WRITE_K   0x00000008u
+#define IN_CLOSE_NOWRITE_K 0x00000010u
+#define IN_MOVED_FROM_K    0x00000040u
+#define IN_MOVED_TO_K      0x00000080u
+#define IN_CREATE_K        0x00000100u
+#define IN_DELETE_K        0x00000200u
+#define IN_DELETE_SELF_K   0x00000400u
+#define IN_MOVE_SELF_K     0x00000800u
+#define IN_Q_OVERFLOW_K    0x00004000u
+#define IN_IGNORED_K       0x00008000u
+#define IN_ISDIR_K         0x40000000u
+
+#define MAX_INOTIFY         8
+#define INOTIFY_MAX_WATCHES 32
+#define INOTIFY_QUEUE       64
+
+struct yousj_inotify_watch {
+    bool in_use;
+    int wd;
+    int backend; /* 0 ramfs, 1 yfs */
+    struct yousj_ramfs_node *node;
+    uint32_t ino;
+    bool is_dir;
+    uint32_t mask;
+};
+
+struct yousj_inotify {
+    bool in_use;
+    int next_wd;
+    struct yousj_inotify_watch watches[INOTIFY_MAX_WATCHES];
+    struct yousj_inotify_event queue[INOTIFY_QUEUE];
+    int q_head;
+    int q_count;
+    bool overflow;
+};
+
+static struct yousj_inotify g_inotifies[MAX_INOTIFY];
+static uint32_t g_inotify_cookie = 1;
+
+/* Defined further down (the M16 resolution layer). */
+static long fs_resolve_links(const char *path, char *out,
+                             bool follow);
+static bool is_proc_path(const char *path);
+
+static void inotify_enqueue(struct yousj_inotify *in,
+                            const struct yousj_inotify_event *ev)
+{
+    if (in->q_count >= INOTIFY_QUEUE) {
+        in->overflow = true;
+        return;
+    }
+    in->queue[(in->q_head + in->q_count) % INOTIFY_QUEUE] =
+        *ev;
+    in->q_count++;
+}
+
+/* Deliver one event to one watch with Linux filtering:
+ * the watch mask gates ordinary events; the self-
+ * destruction family always lands. subject_is_dir
+ * adds IN_ISDIR. A DELETE_SELF also lands IN_IGNORED
+ * and retires the watch. */
+static void inotify_deliver(struct yousj_inotify *in,
+                            struct yousj_inotify_watch *w,
+                            uint32_t events, uint32_t cookie,
+                            const char *name,
+                            bool subject_is_dir)
+{
+    struct yousj_inotify_event ev;
+    uint32_t m = events & w->mask;
+    if (events & (IN_DELETE_SELF_K | IN_MOVE_SELF_K))
+        m = events;
+    if (m == 0)
+        return;
+    if (subject_is_dir)
+        m |= IN_ISDIR_K;
+    mem_zero((uint8_t *)&ev, sizeof(ev));
+    ev.wd = w->wd;
+    ev.mask = m;
+    ev.cookie = cookie;
+    if (name != NULL) {
+        uint64_t nl = str_len(name) + 1;
+        if (nl > 28)
+            nl = 28;
+        mem_copy((uint8_t *)ev.name, (const uint8_t *)name,
+                 nl);
+        ev.len = (uint32_t)((nl + 3) & ~3u);
+    }
+    inotify_enqueue(in, &ev);
+    if (events & IN_DELETE_SELF_K) {
+        mem_zero((uint8_t *)&ev, sizeof(ev));
+        ev.wd = w->wd;
+        ev.mask = IN_IGNORED_K;
+        inotify_enqueue(in, &ev);
+        w->in_use = false;
+    }
+}
+
+static bool watch_matches(struct yousj_inotify_watch *w,
+                          int backend,
+                          struct yousj_ramfs_node *node,
+                          uint32_t ino)
+{
+    if (!w->in_use || w->backend != backend)
+        return false;
+    return backend == 0 ? w->node == node : w->ino == ino;
+}
+
+/* Child event: delivered to watches on the PARENT. */
+static void inotify_child_id(int backend,
+                             struct yousj_ramfs_node *pnode,
+                             uint32_t pino, const char *name,
+                             uint32_t events, uint32_t cookie,
+                             bool subject_is_dir)
+{
+    int i, j;
+    for (i = 0; i < MAX_INOTIFY; i++) {
+        struct yousj_inotify *in = &g_inotifies[i];
+        if (!in->in_use)
+            continue;
+        for (j = 0; j < INOTIFY_MAX_WATCHES; j++) {
+            struct yousj_inotify_watch *w = &in->watches[j];
+            if (watch_matches(w, backend, pnode, pino))
+                inotify_deliver(in, w, events, cookie, name,
+                                subject_is_dir);
+        }
+    }
+}
+
+/* Self event: delivered to watches on the object. */
+static void inotify_self_id(int backend,
+                            struct yousj_ramfs_node *node,
+                            uint32_t ino, uint32_t events,
+                            bool subject_is_dir)
+{
+    int i, j;
+    for (i = 0; i < MAX_INOTIFY; i++) {
+        struct yousj_inotify *in = &g_inotifies[i];
+        if (!in->in_use)
+            continue;
+        for (j = 0; j < INOTIFY_MAX_WATCHES; j++) {
+            struct yousj_inotify_watch *w = &in->watches[j];
+            if (watch_matches(w, backend, node, ino))
+                inotify_deliver(in, w, events, 0, NULL,
+                                subject_is_dir);
+        }
+    }
+}
+
+/* Path-level wrappers for the fs_* entry points.
+ * `resolved` is a link-resolved absolute path. */
+struct target_id {
+    int backend;
+    struct yousj_ramfs_node *node;
+    uint32_t ino;
+    bool is_dir;
+    bool ok;
+};
+
+static void inotify_capture(const char *resolved,
+                            struct target_id *id)
+{
+    id->ok = false;
+    id->node = NULL;
+    id->ino = 0;
+    id->is_dir = false;
+    if (is_data_path(resolved)) {
+        struct yousj_stat_info info;
+        id->backend = 1;
+        if (fs_path_stat2(resolved, false, &info)) {
+            id->ino = (uint32_t)(info.ino - 1000000u);
+            id->is_dir =
+                (info.mode & 0170000u) == 0040000u;
+            id->ok = true;
+        }
+    } else {
+        struct yousj_ramfs_node *n = fs_lookup(resolved);
+        id->backend = 0;
+        if (n != NULL) {
+            id->node = n;
+            id->is_dir = n->is_dir;
+            id->ok = true;
+        }
+    }
+}
+
+static void inotify_child_path(const char *resolved,
+                               uint32_t events,
+                               uint32_t cookie,
+                               bool subject_is_dir)
+{
+    if (is_data_path(resolved)) {
+        const char *rel = data_rel(resolved);
+        char parent[128];
+        const char *slash = NULL;
+        const char *q;
+        long pino;
+        uint64_t i;
+        for (q = rel; *q != '\0'; q++)
+            if (*q == '/')
+                slash = q;
+        if (slash == NULL || slash == rel) {
+            /* parent is the yfs root */
+            inotify_child_id(1, NULL, 0, rel, events,
+                             cookie, subject_is_dir);
+            return;
+        }
+        for (i = 0; rel + i < slash && i < 120; i++)
+            parent[i] = rel[i];
+        parent[i] = '\0';
+        pino = yfs_lookup(parent);
+        if (pino < 0)
+            return;
+        inotify_child_id(1, NULL, (uint32_t)pino, slash + 1,
+                         events, cookie, subject_is_dir);
+    } else {
+        char base[NAME_MAX_LEN + 1];
+        struct yousj_ramfs_node *parent =
+            walk(resolved, true, base);
+        if (parent == NULL)
+            return;
+        inotify_child_id(0, parent, 0, base, events, cookie,
+                         subject_is_dir);
+    }
+}
+
+static void inotify_self_path(const char *resolved,
+                              uint32_t events)
+{
+    struct target_id id;
+    inotify_capture(resolved, &id);
+    if (id.ok)
+        inotify_self_id(id.backend, id.node, id.ino, events,
+                        id.is_dir);
+}
+
+long fs_inotify_create(struct yousj_file **out)
+{
+    int i;
+    struct yousj_file *f;
+    for (i = 0; i < MAX_INOTIFY; i++)
+        if (!g_inotifies[i].in_use)
+            break;
+    if (i == MAX_INOTIFY)
+        return -YOUSJ_ENOSPC;
+    f = file_alloc();
+    if (f == NULL)
+        return -YOUSJ_ENFILE;
+    mem_zero((uint8_t *)&g_inotifies[i],
+             sizeof(g_inotifies[i]));
+    g_inotifies[i].in_use = true;
+    g_inotifies[i].next_wd = 1;
+    f->inotify = &g_inotifies[i];
+    *out = f;
+    return 0;
+}
+
+static void inotify_release(struct yousj_inotify *in)
+{
+    in->in_use = false;
+}
+
+long fs_inotify_add_watch(struct yousj_file *f,
+                          const char *path, uint32_t mask,
+                          int *wd_out)
+{
+    char resolved[PATH_MAX_LEN + 1];
+    struct yousj_inotify *in = f->inotify;
+    struct target_id id;
+    int j;
+    long rc;
+    if (in == NULL)
+        return -YOUSJ_EINVAL;
+    rc = fs_resolve_links(path, resolved, true);
+    if (rc != 0)
+        return rc;
+    if (is_proc_path(resolved))
+        return -YOUSJ_EINVAL;
+    inotify_capture(resolved, &id);
+    if (!id.ok)
+        return -YOUSJ_ENOENT_L;
+    for (j = 0; j < INOTIFY_MAX_WATCHES; j++) {
+        struct yousj_inotify_watch *w = &in->watches[j];
+        if (watch_matches(w, id.backend, id.node, id.ino)) {
+            w->mask = mask;
+            *wd_out = w->wd;
+            return 0;
+        }
+    }
+    for (j = 0; j < INOTIFY_MAX_WATCHES; j++) {
+        struct yousj_inotify_watch *w = &in->watches[j];
+        if (!w->in_use) {
+            w->in_use = true;
+            w->wd = in->next_wd++;
+            w->backend = id.backend;
+            w->node = id.node;
+            w->ino = id.ino;
+            w->is_dir = id.is_dir;
+            w->mask = mask;
+            *wd_out = w->wd;
+            return 0;
+        }
+    }
+    return -YOUSJ_ENOSPC;
+}
+
+long fs_inotify_rm_watch(struct yousj_file *f, int wd)
+{
+    struct yousj_inotify *in = f->inotify;
+    int j;
+    if (in == NULL)
+        return -YOUSJ_EINVAL;
+    for (j = 0; j < INOTIFY_MAX_WATCHES; j++) {
+        struct yousj_inotify_watch *w = &in->watches[j];
+        if (w->in_use && w->wd == wd) {
+            struct yousj_inotify_event ev;
+            mem_zero((uint8_t *)&ev, sizeof(ev));
+            ev.wd = wd;
+            ev.mask = IN_IGNORED_K;
+            inotify_enqueue(in, &ev);
+            w->in_use = false;
+            return 0;
+        }
+    }
+    return -YOUSJ_EINVAL;
+}
+
+uint64_t fs_inotify_pending(struct yousj_file *f)
+{
+    struct yousj_inotify *in = f->inotify;
+    uint64_t bytes = 0;
+    int i;
+    if (in == NULL)
+        return 0;
+    for (i = 0; i < in->q_count; i++) {
+        struct yousj_inotify_event *ev =
+            &in->queue[(in->q_head + i) % INOTIFY_QUEUE];
+        bytes += 16 + ev->len;
+    }
+    return bytes;
+}
+
+long fs_inotify_read(struct yousj_file *f, uint8_t *dst,
+                     uint64_t count)
+{
+    struct yousj_inotify *in = f->inotify;
+    struct task *me = sched_current();
+    if (in == NULL)
+        return -YOUSJ_EINVAL;
+    if (count < 16)
+        return -YOUSJ_EINVAL;
+    for (;;) {
+        if (in->q_count > 0) {
+            uint64_t used = 0;
+            while (in->q_count > 0) {
+                struct yousj_inotify_event *ev =
+                    &in->queue[in->q_head];
+                uint64_t rec = 16 + ev->len;
+                if (used + rec > count)
+                    break;
+                mem_copy(dst + used, (const uint8_t *)ev,
+                         16);
+                if (ev->len > 0)
+                    mem_copy(dst + used + 16,
+                             (const uint8_t *)ev->name,
+                             ev->len);
+                used += rec;
+                in->q_head =
+                    (in->q_head + 1) % INOTIFY_QUEUE;
+                in->q_count--;
+            }
+            if (in->overflow && used + 16 <= count) {
+                struct yousj_inotify_event ev;
+                mem_zero((uint8_t *)&ev, sizeof(ev));
+                ev.wd = -1;
+                ev.mask = IN_Q_OVERFLOW_K;
+                mem_copy(dst + used, (const uint8_t *)&ev,
+                         16);
+                used += 16;
+                in->overflow = false;
+            }
+            return (long)used;
+        }
+        if (f->flags & YOUSJ_O_NONBLOCK)
+            return -11; /* EAGAIN */
+        if (signal_deliverable_pending(me)) {
+            me->sig_wake = false;
+            return -512; /* ERESTARTSYS */
+        }
+        sched_sleep_ticks(2);
+    }
+}
+
+void fs_inotify_note_close(struct yousj_file *f)
+{
+    if (f == NULL || f->pipe != NULL || f->epoll != NULL ||
+        f->inotify != NULL || f->backend == 2)
+        return;
+    if (f->backend == 1)
+        inotify_self_id(1, NULL, f->yfs_ino,
+                        f->written ? IN_CLOSE_WRITE_K
+                                   : IN_CLOSE_NOWRITE_K,
+                        yfs_is_dir(f->yfs_ino));
+    else if (f->node != NULL)
+        inotify_self_id(0, f->node, 0,
+                        f->written ? IN_CLOSE_WRITE_K
+                                   : IN_CLOSE_NOWRITE_K,
+                        f->node->is_dir);
 }
 
 
@@ -886,6 +1315,8 @@ static long ramfs_open_path(const char *path, long flags,
             return -YOUSJ_ENOSPC;
         if (mode_bits != 0)
             n->mode = mode_bits; /* M37: O_CREAT mode */
+        inotify_child_id(0, parent, 0, base, IN_CREATE_K, 0,
+                         false); /* M48 */
     }
     if (n->is_link)
         return -YOUSJ_ELOOP_L; /* resolution missed one */
@@ -932,6 +1363,14 @@ static long yfs_open_path_fs(const char *rel, long flags,
                 return ino;
             if (mode_bits != 0)
                 yfs_set_mode((uint32_t)ino, mode_bits);
+            {
+                long pino = yfs_lookup(parent);
+                if (pino >= 0)
+                    inotify_child_id(1, NULL,
+                                     (uint32_t)pino, name,
+                                     IN_CREATE_K, 0,
+                                     false); /* M48 */
+            }
         }
     }
     if (yfs_type_of((uint32_t)ino) == 3)
@@ -1705,6 +2144,9 @@ long fs_mkdir_path(const char *path, uint32_t mode_bits)
         ino = yfs_mknod(parent, name, true);
         if (ino >= 0 && mode_bits != 0)
             yfs_set_mode((uint32_t)ino, mode_bits);
+        if (ino >= 0)
+            inotify_child_path(path, IN_CREATE_K, 0,
+                               true); /* M48 */
         return ino >= 0 ? 0 : ino;
     }
     rc = ramfs_mkdir_path(path);
@@ -1713,6 +2155,9 @@ long fs_mkdir_path(const char *path, uint32_t mode_bits)
         if (n != NULL)
             n->mode = mode_bits;
     }
+    if (rc == 0)
+        inotify_child_path(path, IN_CREATE_K, 0,
+                           true); /* M48 */
     return rc;
 }
 
@@ -1727,8 +2172,23 @@ long fs_unlink_path(const char *path)
         return -YOUSJ_EACCES_L;
     if (is_data_path(path)) {
         char parent[128], name[40];
+        struct target_id self;
+        long urc;
+        inotify_capture(path, &self);
         split_parent_name(data_rel(path), parent, name);
-        return yfs_unlink(parent, name, false);
+        {
+            bool last = self.ok &&
+                        yfs_nlink(self.ino) <= 1;
+            urc = yfs_unlink(parent, name, false);
+            if (urc == 0) {
+                inotify_child_path(path, IN_DELETE_K, 0,
+                                   false); /* M48 */
+                if (last)
+                    inotify_self_id(1, NULL, self.ino,
+                                    IN_DELETE_SELF_K, false);
+            }
+        }
+        return urc;
     }
     {
         char base[NAME_MAX_LEN + 1];
@@ -1744,9 +2204,18 @@ long fs_unlink_path(const char *path)
             child = dent->node;
             if (child->is_dir)
                 return -YOUSJ_EISDIR;
-            dent_detach(dent);
-            dent_free(dent);
-            node_unname(child);
+            {
+                bool last = child->nlink <= 1;
+                dent_detach(dent);
+                dent_free(dent);
+                node_unname(child);
+                inotify_child_id(0, parent, 0, base,
+                                 IN_DELETE_K, 0,
+                                 false); /* M48 */
+                if (last)
+                    inotify_self_id(0, child, 0,
+                                    IN_DELETE_SELF_K, false);
+            }
         }
         return 0;
     }
@@ -1763,8 +2232,19 @@ long fs_rmdir_path(const char *path)
         return -YOUSJ_EACCES_L;
     if (is_data_path(path)) {
         char parent[128], name[40];
+        struct target_id self;
+        long urc;
+        inotify_capture(path, &self);
         split_parent_name(data_rel(path), parent, name);
-        return yfs_unlink(parent, name, true);
+        urc = yfs_unlink(parent, name, true);
+        if (urc == 0) {
+            inotify_child_path(path, IN_DELETE_K, 0,
+                               true); /* M48 */
+            if (self.ok)
+                inotify_self_id(1, NULL, self.ino,
+                                IN_DELETE_SELF_K, true);
+        }
+        return urc;
     }
     {
         char base[NAME_MAX_LEN + 1];
@@ -1787,6 +2267,10 @@ long fs_rmdir_path(const char *path)
             dent_detach(dent);
             dent_free(dent);
             node_unname(child);
+            inotify_child_id(0, parent, 0, base, IN_DELETE_K,
+                             0, true); /* M48 */
+            inotify_self_id(0, child, 0, IN_DELETE_SELF_K,
+                            true);
         }
         return 0;
     }
@@ -1812,8 +2296,31 @@ long fs_rename_path(const char *old_path, const char *new_path)
 
     if (od != nd)
         return -YOUSJ_EXDEV_L;
-    if (od)
-        return yfs_rename(data_rel(old_path), data_rel(new_path));
+    if (od) {
+        struct target_id srcid, dstid;
+        long rrc;
+        inotify_capture(old_path, &srcid);
+        inotify_capture(new_path, &dstid);
+        rrc = yfs_rename(data_rel(old_path),
+                         data_rel(new_path));
+        if (rrc == 0) {
+            uint32_t cookie = ++g_inotify_cookie;
+            bool isdir = srcid.ok && srcid.is_dir;
+            inotify_child_path(old_path, IN_MOVED_FROM_K,
+                               cookie, isdir); /* M48 */
+            inotify_child_path(new_path, IN_MOVED_TO_K,
+                               cookie, isdir);
+            if (srcid.ok)
+                inotify_self_id(1, NULL, srcid.ino,
+                                IN_MOVE_SELF_K, isdir);
+            if (dstid.ok &&
+                !(srcid.ok && dstid.ino == srcid.ino))
+                inotify_self_id(1, NULL, dstid.ino,
+                                IN_DELETE_SELF_K,
+                                dstid.is_dir);
+        }
+        return rrc;
+    }
     oparent = walk(old_path, true, obase);
     if (oparent == NULL)
         return -YOUSJ_ENOENT;
@@ -1843,6 +2350,8 @@ long fs_rename_path(const char *old_path, const char *new_path)
             oparent, obase, str_len(obase));
         struct yousj_dent *ddent = node_find_dent(
             nparent, nbase, str_len(nbase));
+        struct yousj_ramfs_node *victim = NULL;
+        bool victim_last = false;
         if (ddent != NULL && ddent->node == src)
             return 0;
         if (ddent != NULL) {
@@ -1855,6 +2364,8 @@ long fs_rename_path(const char *old_path, const char *new_path)
             } else if (src->is_dir) {
                 return -YOUSJ_ENOTDIR;
             }
+            victim = dst;
+            victim_last = dst->nlink <= 1;
             dent_detach(ddent);
             dent_free(ddent);
             node_unname(dst);
@@ -1868,6 +2379,21 @@ long fs_rename_path(const char *old_path, const char *new_path)
         dent_attach(nparent, sdent);
         if (src->is_dir)
             src->parent = nparent;
+        {
+            uint32_t cookie = ++g_inotify_cookie;
+            inotify_child_id(0, oparent, 0, obase,
+                             IN_MOVED_FROM_K, cookie,
+                             src->is_dir); /* M48 */
+            inotify_child_id(0, nparent, 0, nbase,
+                             IN_MOVED_TO_K, cookie,
+                             src->is_dir);
+            inotify_self_id(0, src, 0, IN_MOVE_SELF_K,
+                            src->is_dir);
+            if (victim != NULL && victim_last)
+                inotify_self_id(0, victim, 0,
+                                IN_DELETE_SELF_K,
+                                victim->is_dir);
+        }
     }
     src->ctime = (uint32_t)yousj_now_unix(); /* M26 */
     return 0;
@@ -1892,10 +2418,16 @@ long fs_link_path(const char *old_path, const char *new_path,
         return -YOUSJ_EACCES_L;
     {
         bool od = is_data_path(ro), nd = is_data_path(rn);
+        long lrc;
         if (od != nd)
             return -YOUSJ_EXDEV_L;
-        if (od)
-            return yfs_link(data_rel(ro), data_rel(rn));
+        if (od) {
+            lrc = yfs_link(data_rel(ro), data_rel(rn));
+            if (lrc == 0)
+                inotify_child_path(rn, IN_CREATE_K, 0,
+                                   false); /* M48 */
+            return lrc;
+        }
     }
     {
         struct yousj_ramfs_node *src = fs_lookup(ro);
@@ -1921,6 +2453,8 @@ long fs_link_path(const char *old_path, const char *new_path,
         src->nlink++;
         src->ctime = (uint32_t)yousj_now_unix();
         dent_attach(parent, d);
+        inotify_child_id(0, parent, 0, base, IN_CREATE_K, 0,
+                         false); /* M48 */
         return 0;
     }
 }
@@ -2014,6 +2548,9 @@ long fs_symlink_path(const char *target, const char *linkpath)
         char parent[128], name[40];
         split_parent_name(data_rel(resolved), parent, name);
         rc = yfs_symlink(parent, name, target);
+        if (rc >= 0)
+            inotify_child_path(resolved, IN_CREATE_K, 0,
+                               false); /* M48 */
         return rc >= 0 ? 0 : rc;
     }
     {
@@ -2033,6 +2570,8 @@ long fs_symlink_path(const char *target, const char *linkpath)
         if (node_pwrite(n, 0, (const uint8_t *)target,
                         str_len(target)) < 0)
             return -YOUSJ_ENOSPC;
+        inotify_child_id(0, parent, 0, base, IN_CREATE_K, 0,
+                         false); /* M48 */
         return 0;
     }
 }
@@ -2469,6 +3008,8 @@ long fs_chmod_path(const char *path, uint32_t bits,
         if (ino < 0)
             return -YOUSJ_ENOENT_L;
         yfs_set_mode((uint32_t)ino, bits);
+        inotify_self_id(1, NULL, (uint32_t)ino, IN_ATTRIB_K,
+                        yfs_is_dir((uint32_t)ino)); /* M48 */
         return 0;
     }
     if (is_proc_path(path))
@@ -2479,6 +3020,8 @@ long fs_chmod_path(const char *path, uint32_t bits,
             return -YOUSJ_ENOENT_L;
         n->mode = bits & 07777u;
         n->ctime = (uint32_t)yousj_now_unix();
+        inotify_self_id(0, n, 0, IN_ATTRIB_K,
+                        n->is_dir); /* M48 */
         return 0;
     }
 }
@@ -2491,11 +3034,15 @@ long fs_chmod_file(struct yousj_file *f, uint32_t bits)
         return -YOUSJ_EACCES_L;
     if (f->backend == 1) {
         yfs_set_mode(f->yfs_ino, bits);
+        inotify_self_id(1, NULL, f->yfs_ino, IN_ATTRIB_K,
+                        yfs_is_dir(f->yfs_ino)); /* M48 */
         return 0;
     }
     if (f->node != NULL) {
         f->node->mode = bits & 07777u;
         f->node->ctime = (uint32_t)yousj_now_unix();
+        inotify_self_id(0, f->node, 0, IN_ATTRIB_K,
+                        f->node->is_dir); /* M48 */
         return 0;
     }
     return -YOUSJ_EINVAL; /* pipes, epoll, console */
@@ -2639,8 +3186,12 @@ long file_write(struct yousj_file *f, const uint8_t *src,
             f->offset = yfs_size(f->yfs_ino);
         n = yfs_pwrite(f->yfs_ino, (uint32_t)f->offset, src,
                        (uint32_t)count);
-        if (n > 0)
+        if (n > 0) {
             f->offset += (uint64_t)n;
+            f->written = true; /* M48 */
+            inotify_self_id(1, NULL, f->yfs_ino,
+                            IN_MODIFY_K, false);
+        }
         return n;
     }
     if (f == NULL || f->node == NULL || f->pipe != NULL)
@@ -2654,8 +3205,11 @@ long file_write(struct yousj_file *f, const uint8_t *src,
     if (f->flags & YOUSJ_O_APPEND)
         f->offset = f->node->size;
     n = node_pwrite(f->node, f->offset, src, count);
-    if (n > 0)
+    if (n > 0) {
         f->offset += (uint64_t)n;
+        f->written = true; /* M48 */
+        inotify_self_id(0, f->node, 0, IN_MODIFY_K, false);
+    }
     return n;
 }
 
@@ -2736,6 +3290,15 @@ long fs_pwrite_file(struct yousj_file *f, uint64_t off,
         if (n < 0)
             return done > 0 ? (long)done : n;
         done += (uint64_t)n;
+    }
+    if (done > 0) { /* M48 */
+        f->written = true;
+        if (f->backend == 1)
+            inotify_self_id(1, NULL, f->yfs_ino,
+                            IN_MODIFY_K, false);
+        else if (f->node != NULL)
+            inotify_self_id(0, f->node, 0, IN_MODIFY_K,
+                            false);
     }
     return (long)done;
 }

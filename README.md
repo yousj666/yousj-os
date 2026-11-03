@@ -691,7 +691,33 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   段不同/stat 类型）。定位中一枚实现 bug：
   建设备时误把 walk 的父目录当 /dev 本身，
   设备建到了根目录——已改 fs_lookup。
-- ⏳ 下一步候选：inotify 盘点。
+- ✅ inotify M48（2026-11-04）：inotify_
+  init1（253/294/254/255 全号）转正。实例
+  池 8、每实例 32 监视（目标按 ramfs 节点
+  指针 / yfs inode 号键入，同目标重加返回
+  同 wd 并更新掩码）、64 记录事件环。事件
+  源挂在 fs 层各突变点：建文件/目录/符号
+  链接/硬链接（CREATE）、写（MODIFY）、
+  chmod（ATTRIB）、close（CLOSE_WRITE/
+  NOWRITE，按 file 的 written 标记区分）、
+  rename（MOVED_FROM/TO 同 cookie＋
+  MOVE_SELF＋被覆写者 DELETE_SELF）、
+  unlink/rmdir（DELETE＋nlink 归零时
+  DELETE_SELF＋IGNORED 并撤监视）；rm_
+  watch 发 IGNORED，队列溢出补 Q_OVERFLOW。
+  阻塞读走 2-tick 轮询＋ERESTARTSYS，与
+  管道同协议；poll/epoll 就绪按队列非空。
+  已知简化：OPEN/ACCESS 事件不发、ftruncate
+  不发 MODIFY、exchange 不发 MOVE_SELF。
+  验收：新增 inotifytest（10 场景）与
+  qemu-inotify-test.py 套件（回归扩为 18
+  套）。接线教训：新测试程序的 Makefile
+  规则曾误插进 pidtest 规则与配方之间，
+  inotifytest.elf 被 pidtest 源码覆写——靠
+  两 elf 的 md5 相同当场抓出。
+- ⏳ 下一步候选：fd 层小缺口扫尾
+  （/proc/self/fd 打开控制台链接）、
+  splice 余项与 utimens 的 ATTRIB 补挂。
 
 ## 从零构建
 

@@ -55,11 +55,16 @@ struct yousj_pipe {
 };
 
 struct yousj_epoll; /* M18: defined in fs.c */
+struct yousj_inotify; /* M48: defined in fs.c */
 
 struct yousj_file {
     struct yousj_ramfs_node *node; /* NULL and pipe NULL: console */
     struct yousj_pipe *pipe;       /* non-NULL: a pipe end (M10) */
     struct yousj_epoll *epoll;     /* non-NULL: an epoll set (M18) */
+    struct yousj_inotify *inotify; /* non-NULL: an inotify
+                                      instance (M48) */
+    bool written;                  /* M48: any successful
+                                      write (CLOSE_WRITE) */
     int backend;                   /* 0 ramfs, 1 yfs (M12),
                                       2 proc (M25) */
     uint32_t yfs_ino;              /* valid when backend == 1 */
@@ -141,6 +146,26 @@ long fs_epoll_ctl(struct yousj_file *epf, long op, int fd,
 int  fs_epoll_count(struct yousj_file *epf);
 bool fs_epoll_entry(struct yousj_file *epf, int idx,
                     struct yousj_epoll_entry *out);
+
+/* M48: inotify. One serialized event record; the name
+ * field is present (padded to 4) only for directory
+ * watch events. Masks use the Linux bit values. */
+struct yousj_inotify_event {
+    int32_t wd;
+    uint32_t mask;
+    uint32_t cookie;
+    uint32_t len; /* name bytes incl. padding */
+    char name[32];
+};
+long fs_inotify_create(struct yousj_file **out);
+long fs_inotify_add_watch(struct yousj_file *f,
+                          const char *path, uint32_t mask,
+                          int *wd_out);
+long fs_inotify_rm_watch(struct yousj_file *f, int wd);
+long fs_inotify_read(struct yousj_file *f, uint8_t *dst,
+                     uint64_t count);
+uint64_t fs_inotify_pending(struct yousj_file *f);
+void fs_inotify_note_close(struct yousj_file *f);
 
 /* M12: mount the yfs data disk at /data when one is present.
  * Returns yfs_mount's code (1 mounted, 2 formatted, 0 none,

@@ -113,4 +113,9 @@
 #define YOUSJ_SYS_NATIVE_PS_SNAPSHOT (YOUSJ_SYS_NATIVE_BASE + 0)
 #define YOUSJ_SYS_NATIVE_PMM_FREE    (YOUSJ_SYS_NATIVE_BASE + 1)
 
+#define YOUSJ_SYS_inotify_init     253 /* M48 */
+#define YOUSJ_SYS_inotify_add_watch 254 /* M48 */
+#define YOUSJ_SYS_inotify_rm_watch 255 /* M48 */
+#define YOUSJ_SYS_inotify_init1    294 /* M48 */
+
 #endif /* YOUSJ_SYSCALL_H */

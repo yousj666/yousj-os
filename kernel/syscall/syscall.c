@@ -1000,6 +1000,14 @@ static long sys_read(long fd, uint64_t buf, uint64_t count)
         return -YOUSJ_EBADF;
     if (f->pipe != NULL)
         return sys_read_pipe(f, buf, count);
+    if (f->inotify != NULL) { /* M48 */
+        if (count == 0)
+            return 0;
+        if (!user_range_ok(buf, count))
+            return -YOUSJ_EFAULT;
+        return fs_inotify_read(f, (uint8_t *)(uintptr_t)buf,
+                               count);
+    }
     if (f->backend == 0 && f->node == NULL)
         return sys_read_console(buf, count);
     if (count == 0)
@@ -1090,6 +1098,7 @@ static long sys_close(long fd)
         return -YOUSJ_EBADF;
     }
     me->fd_file[fd] = NULL;
+    fs_inotify_note_close(f); /* M48: CLOSE_WRITE / NOWRITE */
     file_put(f);
     return 0;
 }
@@ -1688,6 +1697,61 @@ struct epoll_event_k {
     uint64_t data;
 };
 
+/* --- M48: inotify ------------------------------------------------
+ * init1 flags are the O_CLOEXEC / O_NONBLOCK values. */
+static long sys_inotify_init1(long flags)
+{
+    struct task *me = sched_current();
+    struct yousj_file *f;
+    long rc, fd;
+    if (flags & ~(long)(YOUSJ_O_CLOEXEC | YOUSJ_O_NONBLOCK))
+        return -YOUSJ_EINVAL;
+    rc = fs_inotify_create(&f);
+    if (rc != 0)
+        return rc;
+    if (flags & YOUSJ_O_NONBLOCK)
+        f->flags |= YOUSJ_O_NONBLOCK;
+    fd = fd_alloc(me, f);
+    if (fd < 0) {
+        file_put(f);
+        return fd;
+    }
+    if (flags & YOUSJ_O_CLOEXEC)
+        me->fd_cloexec |= (uint16_t)(1u << fd);
+    return fd;
+}
+
+static long sys_inotify_add_watch(long fd, uint64_t path_ptr,
+                                  uint64_t mask)
+{
+    struct task *me = sched_current();
+    struct yousj_file *f = fd_file_of(me, fd);
+    static char pb[256], resolved[256];
+    int wd = -1;
+    long rc;
+    if (f == NULL || f->inotify == NULL)
+        return -YOUSJ_EBADF;
+    if (copy_user_string(path_ptr, pb, sizeof pb) != 0)
+        return -YOUSJ_EFAULT;
+    rc = resolve_at(me, YOUSJ_AT_FDCWD, pb, resolved);
+    if (rc != 0)
+        return rc;
+    rc = fs_inotify_add_watch(f, resolved, (uint32_t)mask,
+                              &wd);
+    if (rc != 0)
+        return rc;
+    return wd;
+}
+
+static long sys_inotify_rm_watch(long fd, long wd)
+{
+    struct task *me = sched_current();
+    struct yousj_file *f = fd_file_of(me, fd);
+    if (f == NULL || f->inotify == NULL)
+        return -YOUSJ_EBADF;
+    return fs_inotify_rm_watch(f, (int)wd);
+}
+
 static long sys_epoll_create1(long flags)
 {
     struct task *me = sched_current();
@@ -1869,6 +1933,11 @@ static short fd_ready_file(struct yousj_file *f, long fd,
         return POLLNVAL_K;
     if (f->epoll != NULL)
         return 0; /* epoll sets are never ready themselves */
+    if (f->inotify != NULL) { /* M48 */
+        if ((events & POLLIN_K) && fs_inotify_pending(f) > 0)
+            rev |= POLLIN_K;
+        return rev;
+    }
     if (f->pipe == NULL && f->backend == 0 && f->node == NULL) {
         /* the console: fd 0 is the readable side */
         if (fd == 0) {
@@ -3325,6 +3394,14 @@ static long dispatch_inner(struct yousj_syscall_ctx *ctx)
         return sys_utimensat((long)a1, a2, a3, (long)a4);
     case YOUSJ_SYS_epoll_create1:
         return sys_epoll_create1((long)a1);
+    case YOUSJ_SYS_inotify_init:
+        return sys_inotify_init1(0);
+    case YOUSJ_SYS_inotify_init1:
+        return sys_inotify_init1((long)a1);
+    case YOUSJ_SYS_inotify_add_watch:
+        return sys_inotify_add_watch((long)a1, a2, a3);
+    case YOUSJ_SYS_inotify_rm_watch:
+        return sys_inotify_rm_watch((long)a1, (long)a2);
     case YOUSJ_SYS_epoll_ctl:
         return sys_epoll_ctl((long)a1, (long)a2, (long)a3, a4);
     case YOUSJ_SYS_epoll_wait:
