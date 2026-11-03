@@ -819,6 +819,11 @@ static long sys_execve(uint64_t path_ptr, uint64_t argv_ptr,
     struct vmm_space *space, *old;
     uint64_t entry = 0, img_brk = 0, heap_base, new_sp = 0;
     uint64_t ephdr = 0, ephnum = 0; /* M56: for the auxv */
+    /* M58: dynamic-loader staging. */
+    static char ipath[192];
+    long ilen = -1;
+    uint64_t istage_phys = 0, istage_len = 0, istage_pages = 0;
+    uint64_t interp_base = 0, start_entry = 0;
 
     if (me->mm == NULL)
         return -YOUSJ_EINVAL;
@@ -862,6 +867,46 @@ static long sys_execve(uint64_t path_ptr, uint64_t argv_ptr,
         }
         stage_len = len;
         stage_pages = pages;
+        /* M58: a PT_INTERP image needs its loader staged as
+         * well. Missing loader -> ENOENT, malformed -> the
+         * generic exec failure, both with the old image
+         * untouched, as on Linux. */
+        ilen = elf_scan_interp(
+            (const uint8_t *)yousj_phys_to_virt(stage_phys),
+            stage_len, ipath, sizeof(ipath));
+        if (ilen > 0) {
+            static char iresolved[256];
+            bool idir = false;
+            uint64_t ilenf = 0, ipages;
+            long igot;
+            resolve_path(me, ipath, iresolved);
+            if (!fs_path_stat(iresolved, &idir, &ilenf)) {
+                pmm_free_pages(stage_phys, stage_pages);
+                return -YOUSJ_ENOENT;
+            }
+            if (idir || ilenf == 0) {
+                pmm_free_pages(stage_phys, stage_pages);
+                return -YOUSJ_ENOEXEC_L;
+            }
+            ipages = (ilenf + YOUSJ_PAGE_SIZE - 1) /
+                     YOUSJ_PAGE_SIZE;
+            istage_phys = pmm_alloc_pages(ipages);
+            if (istage_phys == 0) {
+                pmm_free_pages(stage_phys, stage_pages);
+                return -YOUSJ_ENOMEM;
+            }
+            igot = fs_read_all_path(
+                iresolved,
+                (uint8_t *)yousj_phys_to_virt(istage_phys),
+                ilenf);
+            if (igot != (long)ilenf) {
+                pmm_free_pages(istage_phys, ipages);
+                pmm_free_pages(stage_phys, stage_pages);
+                return igot < 0 ? igot : -YOUSJ_EIO_L;
+            }
+            istage_len = ilenf;
+            istage_pages = ipages;
+        }
     }
 
     /* Copy argv/envp out of the old image BEFORE building the
@@ -913,17 +958,37 @@ static long sys_execve(uint64_t path_ptr, uint64_t argv_ptr,
         goto fail_release;
     if (elf_load_user_image(
             (const uint8_t *)yousj_phys_to_virt(stage_phys),
-            stage_len, space, &entry, &img_brk,
+            stage_len, space, ~0ULL, &entry, &img_brk,
             &ephdr, &ephnum) != 0) {
         pmm_free_pages(stage_phys, stage_pages);
         goto fail_destroy;
     }
     pmm_free_pages(stage_phys, stage_pages); /* the loader copied
                                               * everything out */
+    stage_phys = 0; /* fail_release must not free it twice */
+    start_entry = entry;
+    /* M58: load the interpreter above the main image and
+     * hand it control: AT_ENTRY/AT_PHDR still describe the
+     * MAIN program, AT_BASE points at the loader, and the
+     * first instruction executed is the loader's entry. The
+     * program break stays the main image's. */
+    if (ilen > 0) {
+        uint64_t ientry = 0, ibrk = 0;
+        interp_base = YOUSJ_USER_BASE + 0x400000ULL;
+        if (elf_load_user_image(
+                (const uint8_t *)yousj_phys_to_virt(istage_phys),
+                istage_len, space, interp_base, &ientry, &ibrk,
+                NULL, NULL) != 0) {
+            goto fail_destroy;
+        }
+        pmm_free_pages(istage_phys, istage_pages);
+        istage_phys = 0;
+        start_entry = ientry;
+    }
     heap_base = (img_brk + YOUSJ_PAGE_SIZE - 1) & ~(YOUSJ_PAGE_SIZE - 1);
     if (elf_build_initial_stack(space, YOUSJ_INIT_STACK_TOP,
                                 argv_k, envp_k, ephdr, ephnum,
-                                entry, &new_sp) != 0)
+                                entry, interp_base, &new_sp) != 0)
         goto fail_destroy;
 
     /* Commit: swap the space, drop the old one, land. This
@@ -1039,7 +1104,7 @@ static long sys_execve(uint64_t path_ptr, uint64_t argv_ptr,
         space_drop(old);
     }
     user_gs_normalize();
-    enter_user_mode(entry, new_sp);
+    enter_user_mode(start_entry, new_sp);
     __builtin_unreachable();
 
 fail_destroy:
@@ -1048,6 +1113,8 @@ fail_destroy:
 fail_release:
     if (stage_phys != 0)
         pmm_free_pages(stage_phys, stage_pages);
+    if (istage_phys != 0)
+        pmm_free_pages(istage_phys, istage_pages);
     vmm_space_release(space);
     return -YOUSJ_ENOMEM;
 }
@@ -3567,8 +3634,13 @@ static long sys_mprotect(uint64_t addr, uint64_t len,
     len = (len + YOUSJ_PAGE_SIZE - 1) & ~(YOUSJ_PAGE_SIZE - 1ULL);
     end = addr + len;
     /* Coverage: every page of the range must belong to a
-     * VMA (Linux: ENOMEM). The ELF image and stacks are not
-     * VMAs here, so protecting them reports ENOMEM. */
+     * VMA (Linux: ENOMEM). M58: ELF image segments are not
+     * VMAs here, but a dynamic loader must mprotect its
+     * RELRO region, which lives inside a loaded segment.
+     * A range with no VMA coverage falls back to raw page-
+     * table protection when EVERY page is present; the VMA
+     * bookkeeping divergence matches the rest of the image
+     * model (image areas are invisible to munmap too). */
     cur = addr;
     while (cur < end) {
         struct yousj_vma *hit = NULL;
@@ -3580,8 +3652,17 @@ static long sys_mprotect(uint64_t addr, uint64_t len,
                 break;
             }
         }
-        if (hit == NULL)
-            return -YOUSJ_ENOMEM;
+        if (hit == NULL) {
+            uint64_t pg;
+            for (pg = addr; pg < end; pg += YOUSJ_PAGE_SIZE) {
+                uint64_t fr;
+                uint32_t fl;
+                if (vmm_translate(me->mm, pg, &fr, &fl) != 0)
+                    return -YOUSJ_ENOMEM;
+            }
+            vma_apply_prot(me, addr, end, (uint32_t)prot);
+            return 0;
+        }
         cur = hit->base + hit->len;
     }
     /* Split at the edges and set the covered prot. */

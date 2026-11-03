@@ -600,15 +600,16 @@ static uint64_t fetch_map_and_build(struct yousj_boot_info *info,
 }
 
 /* ---------------------------------------------------------------- */
-/* Hand-off page tables (M6). Six pages, allocated as               */
+/* Hand-off page tables (M6). Nine pages, allocated as              */
 /* EFI_LOADER_DATA so the converted memory map calls them           */
 /* BOOTLOADER and the kernel PMM never hands them out:              */
 /*   [0] PML4:  [0] -> identity PDPT, [511] -> kernel PDPT          */
 /*   [1] identity PDPT: [0] -> identity PD                          */
 /*   [2] identity PD: 512 x 2 MiB pages covering [0, 1 GiB)         */
 /*   [3] kernel PDPT: [510] -> kernel PD                            */
-/*   [4] kernel PD: [0] -> kernel PT                                */
-/*   [5] kernel PT: the image window at 4 KiB granularity           */
+/*   [4] kernel PD: [0..3] -> kernel PTs                            */
+/*   [5..8] kernel PTs: the image window at 4 KiB granularity,      */
+/*          8 MiB total (M58: grew with the initramfs payload)      */
 /* The identity half exists only so this loader's own code, its     */
 /* stack and the boot_info page stay reachable between loading CR3  */
 /* and jumping; the kernel discards these tables at vmm_hw_init()   */
@@ -618,7 +619,7 @@ static uint64_t fetch_map_and_build(struct yousj_boot_info *info,
 /* land in the entry's reserved field and fault).                   */
 /* ---------------------------------------------------------------- */
 
-#define HANDOFF_TABLE_PAGES 6
+#define HANDOFF_TABLE_PAGES 9
 static uint64_t g_handoff_pml4; /* physical; set by the builder */
 
 static void build_handoff_tables(const struct kernel_image_info *kimg,
@@ -629,11 +630,11 @@ static void build_handoff_tables(const struct kernel_image_info *kimg,
     uint64_t *pd_i   = (uint64_t *)(uintptr_t)(tables_phys + 2 * EFI_PAGE_SIZE);
     uint64_t *pdpt_k = (uint64_t *)(uintptr_t)(tables_phys + 3 * EFI_PAGE_SIZE);
     uint64_t *pd_k   = (uint64_t *)(uintptr_t)(tables_phys + 4 * EFI_PAGE_SIZE);
-    uint64_t *pt_k   = (uint64_t *)(uintptr_t)(tables_phys + 5 * EFI_PAGE_SIZE);
     uint64_t i, pages = kimg->length / EFI_PAGE_SIZE;
+    uint64_t c;
 
-    if (pages > 512)
-        fail("kernel image exceeds the 2 MiB hand-off window",
+    if (pages > 2048)
+        fail("kernel image exceeds the 8 MiB hand-off window",
              ~(efi_status_t)0);
 
     mem_zero(pml4, HANDOFF_TABLE_PAGES * EFI_PAGE_SIZE);
@@ -643,9 +644,14 @@ static void build_handoff_tables(const struct kernel_image_info *kimg,
     pdpt_i[0] = (tables_phys + 2 * EFI_PAGE_SIZE) | 0x3;
     pml4[0] = (tables_phys + 1 * EFI_PAGE_SIZE) | 0x3;
 
-    for (i = 0; i < pages; i++)
-        pt_k[i] = (kimg->base + i * EFI_PAGE_SIZE) | 0x3;
-    pd_k[0] = (tables_phys + 5 * EFI_PAGE_SIZE) | 0x3;
+    for (c = 0; c < 4; c++) {
+        uint64_t *pt_k = (uint64_t *)(uintptr_t)(tables_phys +
+                             (5 + c) * EFI_PAGE_SIZE);
+        for (i = 0; i < 512 && c * 512 + i < pages; i++)
+            pt_k[i] = (kimg->base + (c * 512 + i) *
+                       EFI_PAGE_SIZE) | 0x3;
+        pd_k[c] = (tables_phys + (5 + c) * EFI_PAGE_SIZE) | 0x3;
+    }
     pdpt_k[510] = (tables_phys + 4 * EFI_PAGE_SIZE) | 0x3;
     pml4[511] = (tables_phys + 3 * EFI_PAGE_SIZE) | 0x3;
 

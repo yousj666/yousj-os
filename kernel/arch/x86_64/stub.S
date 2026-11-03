@@ -14,9 +14,8 @@
  *      pages) PLUS the kernel image mapped at its higher-half
  *      link base 0xFFFFFFFF80000000 (4 KiB pages from physical
  *      1 MiB: the image is only 1 MiB-aligned, so a 2 MiB page
- *      cannot represent it; the PT covers a 2 MiB window, which
- *      the kernel build enforces as the maximum image span) --
- *      and enters long mode;
+ *      cannot represent it; four PTs cover an 8 MiB window,
+ *      the maximum image span) -- and enters long mode;
  *   3. stores the boot_info pointer at physical 0x9008 and
  *      far-jumps to a 64-bit trampoline (below) that jumps to the
  *      full 64-bit entry address.
@@ -56,6 +55,12 @@ stub_pdpt_hi:
 stub_pd_hi:
     .skip 4096
 stub_pt_hi:
+    .skip 4096
+stub_pt_hi2:
+    .skip 4096
+stub_pt_hi3:
+    .skip 4096
+stub_pt_hi4:
     .skip 4096
 
     .align 8
@@ -119,12 +124,45 @@ _stub_start:
     movl $0, stub_pml4 + 4
 
     /* Higher-half image map: PDPT index 510 of PML4 entry 511
-     * covers [0xFFFFFFFF80000000, +1 GiB); PD entry 0 points at
-     * a PT whose 512 entries map the image's 2 MiB window from
-     * physical 1 MiB at 4 KiB granularity (1 MiB is not 2 MiB
-     * aligned, so a huge page cannot be used here). */
+     * covers [0xFFFFFFFF80000000, +1 GiB); PD entries 0..3
+     * point at PTs whose 512 entries each map 2 MiB of the
+     * image from physical 1 MiB at 4 KiB granularity (1 MiB
+     * is not 2 MiB aligned, so huge pages cannot be used
+     * here). M58: the window grew 2 MiB -> 8 MiB when the
+     * initramfs (musl loader aboard) pushed the image span
+     * past 2 MiB. */
     mov $stub_pt_hi, %edi
     mov $0x100003, %eax
+    mov $512, %ecx
+1:
+    mov %eax, (%edi)
+    movl $0, 4(%edi)
+    add $0x1000, %eax
+    add $8, %edi
+    loop 1b
+
+    mov $stub_pt_hi2, %edi
+    mov $0x300003, %eax
+    mov $512, %ecx
+1:
+    mov %eax, (%edi)
+    movl $0, 4(%edi)
+    add $0x1000, %eax
+    add $8, %edi
+    loop 1b
+
+    mov $stub_pt_hi3, %edi
+    mov $0x500003, %eax
+    mov $512, %ecx
+1:
+    mov %eax, (%edi)
+    movl $0, 4(%edi)
+    add $0x1000, %eax
+    add $8, %edi
+    loop 1b
+
+    mov $stub_pt_hi4, %edi
+    mov $0x700003, %eax
     mov $512, %ecx
 1:
     mov %eax, (%edi)
@@ -137,6 +175,18 @@ _stub_start:
     or $0x3, %eax
     mov %eax, stub_pd_hi
     movl $0, stub_pd_hi + 4
+    mov $stub_pt_hi2, %eax
+    or $0x3, %eax
+    mov %eax, stub_pd_hi + 8
+    movl $0, stub_pd_hi + 12
+    mov $stub_pt_hi3, %eax
+    or $0x3, %eax
+    mov %eax, stub_pd_hi + 16
+    movl $0, stub_pd_hi + 20
+    mov $stub_pt_hi4, %eax
+    or $0x3, %eax
+    mov %eax, stub_pd_hi + 24
+    movl $0, stub_pd_hi + 28
 
     mov $stub_pd_hi, %eax
     or $0x3, %eax

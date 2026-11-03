@@ -131,7 +131,7 @@ $(BUILD)/ata.o: kernel/drivers/ata.c kernel/include/yousj/*.h
 	mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(BUILD)/initramfs.cpio: $(BUILD)/yousj-init.elf $(BUILD)/hello.elf $(BUILD)/sh.elf $(BUILD)/sigtest.elf $(BUILD)/fxtest.elf $(BUILD)/fstest.elf $(BUILD)/cat.elf $(BUILD)/pipetest.elf $(BUILD)/mkdir.elf $(BUILD)/ls.elf $(BUILD)/rm.elf $(BUILD)/rmdir.elf $(BUILD)/mv.elf $(BUILD)/bigfile.elf $(BUILD)/mmtest.elf $(BUILD)/polltest.elf $(BUILD)/ln.elf $(BUILD)/readlink.elf $(BUILD)/epolltest.elf $(BUILD)/churn.elf $(BUILD)/stattest.elf $(BUILD)/brktest.elf $(BUILD)/timetest.elf $(BUILD)/faulttest.elf $(BUILD)/proctest.elf $(BUILD)/utimetest.elf $(BUILD)/orphantest.elf $(BUILD)/pidtest.elf $(BUILD)/dirfdtest.elf $(BUILD)/inotifytest.elf $(BUILD)/futextest.elf $(BUILD)/musltest.elf tools/mkinitramfs.py $(wildcard rootfs/etc/*)
+$(BUILD)/initramfs.cpio: $(BUILD)/yousj-init.elf $(BUILD)/hello.elf $(BUILD)/sh.elf $(BUILD)/sigtest.elf $(BUILD)/fxtest.elf $(BUILD)/fstest.elf $(BUILD)/cat.elf $(BUILD)/pipetest.elf $(BUILD)/mkdir.elf $(BUILD)/ls.elf $(BUILD)/rm.elf $(BUILD)/rmdir.elf $(BUILD)/mv.elf $(BUILD)/bigfile.elf $(BUILD)/mmtest.elf $(BUILD)/polltest.elf $(BUILD)/ln.elf $(BUILD)/readlink.elf $(BUILD)/epolltest.elf $(BUILD)/churn.elf $(BUILD)/stattest.elf $(BUILD)/brktest.elf $(BUILD)/timetest.elf $(BUILD)/faulttest.elf $(BUILD)/proctest.elf $(BUILD)/utimetest.elf $(BUILD)/orphantest.elf $(BUILD)/pidtest.elf $(BUILD)/dirfdtest.elf $(BUILD)/inotifytest.elf $(BUILD)/futextest.elf $(BUILD)/musltest.elf $(BUILD)/dyntest.elf $(BUILD)/musl/.stamp tools/mkinitramfs.py $(wildcard rootfs/etc/*)
 	python3 tools/mkinitramfs.py $(BUILD)
 
 $(BUILD)/initramfs_bin.o: $(BUILD)/initramfs.cpio
@@ -237,14 +237,34 @@ $(BUILD)/futextest.elf: userland/futextest.c userland/crt0.S userland/init.ld
 	mkdir -p $(BUILD)
 	gcc -ffreestanding -fno-stack-protector -fno-pie -static -nostdlib -mno-sse -mno-sse2 -mno-mmx -mcmodel=large -O2 -Wall -Wextra -Wl,-T,userland/init.ld -Wl,--build-id=none -o $@ userland/crt0.S userland/futextest.c
 
+# M58: fetch + extract the musl packages once (dev tree for
+# headers/static libs, runtime for the dynamic loader).
+$(BUILD)/musl/.stamp:
+	curl -s -o $(BUILD)/musl-dev.apk https://dl-cdn.alpinelinux.org/alpine/v3.20/main/x86_64/musl-dev-1.2.5-r4.apk
+	curl -s -o $(BUILD)/musl-rt.apk https://dl-cdn.alpinelinux.org/alpine/v3.20/main/x86_64/musl-1.2.5-r4.apk
+	mkdir -p $(BUILD)/musl $(BUILD)/muslrt $(BUILD)/musl/lib
+	tar -xzf $(BUILD)/musl-dev.apk -C $(BUILD)/musl 2>/dev/null || true
+	tar -xzf $(BUILD)/musl-rt.apk -C $(BUILD)/muslrt 2>/dev/null || true
+	cp $(BUILD)/muslrt/lib/ld-musl-x86_64.so.1 $(BUILD)/musl/lib/
+	touch $@
+
 # M56: musltest is a REAL libc binary (musl 1.2.5, static),
 # built against the extracted Alpine musl-dev tree in
 # build/musl/usr (fetch: musl-dev apk from dl-cdn.alpinelinux.org,
 # see README). Not a freestanding program.
 MUSL_USR = $(CURDIR)/build/musl/usr
-$(BUILD)/musltest.elf: userland/musltest.c $(MUSL_USR)/lib/libc.a
+$(BUILD)/musltest.elf: userland/musltest.c $(BUILD)/musl/.stamp
 	mkdir -p $(BUILD)
 	gcc -static-pie -fpie -O2 -nostdinc -isystem $(MUSL_USR)/include -nostdlib $(MUSL_USR)/lib/rcrt1.o $(MUSL_USR)/lib/crti.o userland/musltest.c -L$(MUSL_USR)/lib -lc $(MUSL_USR)/lib/crtn.o -o $@
+
+# M58: dyntest is dynamically linked; its PT_INTERP names
+# /lib/ld-musl-x86_64.so.1, which the initramfs carries.
+$(BUILD)/dyntest.o: userland/dyntest.c $(BUILD)/musl/.stamp
+	mkdir -p $(BUILD)
+	gcc -fpie -O2 -nostdinc -isystem $(MUSL_USR)/include -c userland/dyntest.c -o $@
+
+$(BUILD)/dyntest.elf: $(BUILD)/dyntest.o $(BUILD)/musl/.stamp
+	ld -pie -dynamic-linker /lib/ld-musl-x86_64.so.1 -o $@ $(MUSL_USR)/lib/crt1.o $(MUSL_USR)/lib/crti.o $(BUILD)/dyntest.o -L$(MUSL_USR)/lib -lc $(MUSL_USR)/lib/crtn.o
 
 $(BUILD)/orphantest.elf: userland/orphantest.c userland/crt0.S userland/init.ld
 	mkdir -p $(BUILD)

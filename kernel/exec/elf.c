@@ -59,8 +59,51 @@ static uint32_t seg_vmm_flags(const struct elf64_phdr *ph)
     return f;
 }
 
+/* M58: copy out the PT_INTERP path, if any. Returns the
+ * path length (>= 0) on success, -1 when the image has no
+ * interpreter or is not a plausible ELF at all. The path is
+ * always NUL-terminated when the return is >= 0. */
+long elf_scan_interp(const uint8_t *image, uint64_t size,
+                     char *buf, uint64_t cap)
+{
+    const struct elf64_ehdr *eh;
+    uint32_t i;
+
+    if (image == NULL || buf == NULL || cap < 2 ||
+        size < sizeof(*eh))
+        return -1;
+    eh = (const struct elf64_ehdr *)image;
+    if (eh->ident[0] != 0x7F || eh->ident[1] != 'E' ||
+        eh->ident[2] != 'L' || eh->ident[3] != 'F' ||
+        eh->ident[4] != ELFCLASS64 || eh->ident[5] != ELFDATA2LSB ||
+        eh->machine != EM_X86_64 ||
+        eh->phentsize != sizeof(struct elf64_phdr) ||
+        eh->phoff > size ||
+        (uint64_t)eh->phnum * sizeof(struct elf64_phdr) >
+            size - eh->phoff)
+        return -1;
+    for (i = 0; i < eh->phnum; i++) {
+        const struct elf64_phdr *ph = (const struct elf64_phdr *)
+            (image + eh->phoff + (uint64_t)i * sizeof(*ph));
+        uint64_t n, j;
+        if (ph->type != PT_INTERP)
+            continue;
+        if (ph->filesz < 2 || ph->offset > size ||
+            ph->filesz > size - ph->offset)
+            return -1;
+        n = ph->filesz - 1; /* drop the terminator */
+        if (n >= cap)
+            n = cap - 1;
+        for (j = 0; j < n; j++)
+            buf[j] = (char)image[ph->offset + j];
+        buf[n] = '\0';
+        return (long)n;
+    }
+    return -1;
+}
+
 int elf_load_user_image(const uint8_t *image, uint64_t size,
-                        struct vmm_space *space,
+                        struct vmm_space *space, uint64_t bias_req,
                         uint64_t *entry_out, uint64_t *brk_out,
                         uint64_t *phdr_out, uint64_t *phnum_out)
 {
@@ -87,11 +130,19 @@ int elf_load_user_image(const uint8_t *image, uint64_t size,
         return -1;
     /* M56: ET_DYN (static PIE) loads at the window base;
      * the image relocates itself at startup from AT_PHDR,
-     * exactly as on Linux. ET_EXEC keeps its linked VAs. */
-    if (eh->type == ET_DYN)
-        bias = YOUSJ_USER_BASE;
-    else if (eh->type != ET_EXEC)
+     * exactly as on Linux. ET_EXEC keeps its linked VAs.
+     * M58: an explicit bias_req (the dynamic loader's slot)
+     * overrides the default placement; only ET_DYN images
+     * may take one. */
+    if (eh->type != ET_DYN && eh->type != ET_EXEC)
         return -1;
+    if (bias_req != ~0ULL) {
+        if (eh->type != ET_DYN)
+            return -1;
+        bias = bias_req;
+    } else if (eh->type == ET_DYN) {
+        bias = YOUSJ_USER_BASE;
+    }
     if (eh->entry + bias < YOUSJ_USER_BASE ||
         eh->entry + bias >= YOUSJ_USER_LIMIT)
         return -1;
@@ -102,10 +153,9 @@ int elf_load_user_image(const uint8_t *image, uint64_t size,
         uint64_t seg_start, seg_end, page;
         uint32_t want;
 
-        if (ph->type == PT_INTERP)
-            return -1; /* no dynamic loader yet (M56) */
         if (ph->type != PT_LOAD)
-            continue;
+            continue; /* PT_INTERP included: the exec layer
+                       * loads the interpreter separately (M58) */
         /* M56: if this segment's file range covers the
          * program-header table, the headers land in memory
          * with it -- remember where, for AT_PHDR. */
@@ -194,6 +244,7 @@ int elf_load_user_image(const uint8_t *image, uint64_t size,
 #define YOUSJ_AT_PHENT  4
 #define YOUSJ_AT_PHNUM  5
 #define YOUSJ_AT_PAGESZ 6
+#define YOUSJ_AT_BASE   7
 #define YOUSJ_AT_ENTRY  9
 #define YOUSJ_AT_UID    11
 #define YOUSJ_AT_EUID   12
@@ -209,7 +260,8 @@ int elf_build_initial_stack(struct vmm_space *space, uint64_t stack_top,
                             const char *const *argv,
                             const char *const *envp,
                             uint64_t phdr_va, uint64_t phnum,
-                            uint64_t entry, uint64_t *sp_out)
+                            uint64_t entry, uint64_t interp_base,
+                            uint64_t *sp_out)
 {
     uint64_t top_frame = pmm_alloc_page();
     uint8_t *page;
@@ -272,8 +324,9 @@ int elf_build_initial_stack(struct vmm_space *space, uint64_t stack_top,
     /* The block sits below the strings, 16-byte aligned.
      * M56: the auxv carries the full set a real libc asks
      * for (program headers for TLS discovery, ids, the
-     * AT_RANDOM pointer) -- 14 pairs incl. AT_NULL. */
-    block_qwords = 1 + argc + 1 + envc + 1 + 28;
+     * AT_RANDOM pointer); M58 adds AT_BASE for the dynamic
+     * loader -- 15 pairs incl. AT_NULL at most. */
+    block_qwords = 1 + argc + 1 + envc + 1 + 30;
     block_off = ((str_off & ~15ULL) - block_qwords * 8) & ~15ULL;
     block = (uint64_t *)yousj_phys_to_virt(top_frame + block_off);
     i = 0;
@@ -297,6 +350,10 @@ int elf_build_initial_stack(struct vmm_space *space, uint64_t stack_top,
     }
     block[i++] = YOUSJ_AT_PAGESZ;
     block[i++] = YOUSJ_PAGE_SIZE;
+    if (interp_base != 0) {
+        block[i++] = YOUSJ_AT_BASE;
+        block[i++] = interp_base;
+    }
     block[i++] = YOUSJ_AT_ENTRY;
     block[i++] = entry;
     block[i++] = YOUSJ_AT_UID;

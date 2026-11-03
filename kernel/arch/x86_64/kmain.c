@@ -298,6 +298,7 @@ static void boot_launcher_thread(void *arg)
                     (long)isize)
                     ok = 0;
                 if (ok && elf_load_user_image(ibuf, isize, &ispace,
+                                              ~0ULL,
                                               &entry, &img_brk,
                                               &iphdr, &iphnum) != 0)
                     ok = 0;
@@ -311,7 +312,7 @@ static void boot_launcher_thread(void *arg)
             static const char *const init_argv[] = { "/init", NULL };
             if (elf_build_initial_stack(&ispace, YOUSJ_INIT_STACK_TOP,
                                         init_argv, NULL,
-                                        iphdr, iphnum, entry,
+                                        iphdr, iphnum, entry, 0,
                                         &istart.sp) != 0)
                 ok = 0;
         }

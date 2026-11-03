@@ -935,11 +935,36 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   从 /proc 消失。musltest 全程
   绿（真 libc 的 exit() 正走
   这条路）。
+- ✅ 动态链接 M58（2026-11-04）：
+  execve 识别 PT_INTERP，把解释
+  器（/lib/ld-musl-x86_64.so.1）
+  一并暂存并加载到主镜像上方
+  （窗口基址＋4MiB），以它为启
+  动入口、主程序的 AT_PHDR/
+  AT_ENTRY 照旧、新增 AT_BASE
+  指向加载器——真实的 ld-musl
+  1.2.5 在 Yousj OS 上完成自身
+  与主程序的重定位并跑起动态链
+  接的 dyntest（stdio/malloc/两
+  线程）。ld-musl 的 SONAME 即
+  libc 名，自满足 libc 依赖，
+  initramfs 只放一份。连带三修：
+  ① mprotect 对无 VMA 覆盖但页
+  全在位的区间（如镜像内的
+  RELRO）改走页表直改——加载器
+  的 RELRO 保护必需；② ramfs 单
+  文件上限 256KiB→1MiB（加载器
+  650KiB 此前被截断）；③ 镜像跨
+  度越过 Multiboot 桩的 2MiB 高
+  半区窗口后开机即三重故障，窗
+  口扩至 8MiB（四张 PT）。musl
+  包的下载/解压收进 Makefile 戳
+  规则，一次取齐 dev＋运行时。
 - ⏳ 下一步候选：robust futex，
   或 inotify 事件补完（ftruncate
   的 MODIFY、exchange 的
-  MOVE_SELF），或动态链接第一
-  步（PT_INTERP＋ld-musl）。
+  MOVE_SELF），或试跑 Alpine 的
+  真 busybox（动态版）。
 
 ## 从零构建
 

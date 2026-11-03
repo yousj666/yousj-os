@@ -21,7 +21,7 @@ ROOTFS = os.path.join(REPO, "rootfs")
 OUT = os.path.join(BUILD, "initramfs.cpio")
 
 PROGRAMS = ["hello", "sh", "sigtest", "fxtest", "fstest",
-            "cat", "pipetest", "mkdir", "ls", "rm", "rmdir", "mv", "bigfile", "mmtest", "polltest", "ln", "readlink", "epolltest", "churn", "stattest", "brktest", "timetest", "faulttest", "proctest", "utimetest", "orphantest", "pidtest", "dirfdtest", "inotifytest", "futextest", "musltest"]
+            "cat", "pipetest", "mkdir", "ls", "rm", "rmdir", "mv", "bigfile", "mmtest", "polltest", "ln", "readlink", "epolltest", "churn", "stattest", "brktest", "timetest", "faulttest", "proctest", "utimetest", "orphantest", "pidtest", "dirfdtest", "inotifytest", "futextest", "musltest", "dyntest"]
 
 DIR_MODE = 0o040755
 FILE_MODE = 0o100644
@@ -61,6 +61,20 @@ def main():
     for prog in PROGRAMS:
         with open(os.path.join(BUILD, prog + ".elf"), "rb") as f:
             arc.add("bin/" + prog, EXEC_MODE, f.read())
+
+    # M58: the dynamic loader, one copy only. Its SONAME
+    # is libc.musl-x86_64.so.1, so it satisfies a musl
+    # program's libc DT_NEEDED by itself -- no second file
+    # under the libc name is needed (verified on the host),
+    # and the kernel image must stay inside the stub's
+    # 2 MiB higher-half window.
+    ld = os.path.join(BUILD, "musl", "lib",
+                      "ld-musl-x86_64.so.1")
+    if os.path.exists(ld):
+        with open(ld, "rb") as f:
+            blob = f.read()
+        arc.add("lib", DIR_MODE)
+        arc.add("lib/ld-musl-x86_64.so.1", EXEC_MODE, blob)
 
     seen_dirs = {"bin", "etc"}
     for dirpath, dirnames, filenames in os.walk(ROOTFS):

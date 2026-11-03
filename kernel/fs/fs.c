@@ -77,7 +77,8 @@ static void split_parent_name(const char *rel, char *parent,
 
 #define MAX_NODES      128
 #define NAME_MAX_LEN   31
-#define MAX_FILE_PAGES 64 /* 256 KiB per ramfs file */
+#define MAX_FILE_PAGES 256 /* 1 MiB per ramfs file (M58: the
+                            * 650 KiB dynamic loader must fit) */
 #define MAX_FILES      96
 #define PATH_MAX_LEN   255
 

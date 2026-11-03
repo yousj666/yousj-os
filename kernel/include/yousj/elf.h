@@ -5,10 +5,11 @@
  * ELF64, little-endian, x86-64, PT_LOAD segments only.
  * ET_EXEC loads at its linked addresses; ET_DYN (static
  * PIE, M56) loads at the user-window base and relocates
- * itself from AT_PHDR. PT_INTERP images are refused --
- * there is no dynamic loader yet.
- * No dynamic linking, no PIE relocation, no interpreter: anything
- * fancier is rejected, not half-loaded. The image bytes come from
+ * itself from AT_PHDR. PT_INTERP images are supported from
+ * M58: elf_scan_interp reports the interpreter path and the
+ * exec layer loads that image too, at a caller-chosen bias,
+ * handing it control with AT_BASE set.
+ * The image bytes come from
  * memory (in stage 1, an init ELF embedded in the kernel image;
  * the same entry point serves a ramdisk image later).
  *
@@ -46,11 +47,21 @@ int elf_build_initial_stack(struct vmm_space *space,
                             const char *const *argv,
                             const char *const *envp,
                             uint64_t phdr_va, uint64_t phnum,
-                            uint64_t entry, uint64_t *sp_out);
+                            uint64_t entry, uint64_t interp_base,
+                            uint64_t *sp_out);
 
+/* bias_req: an explicit load bias for ET_DYN images (the
+ * dynamic loader's slot, M58), or ~0ULL for the default
+ * placement (ET_DYN at the window base, ET_EXEC at its
+ * linked addresses). */
 int elf_load_user_image(const uint8_t *image, uint64_t size,
-                        struct vmm_space *space,
+                        struct vmm_space *space, uint64_t bias_req,
                         uint64_t *entry_out, uint64_t *brk_out,
                         uint64_t *phdr_out, uint64_t *phnum_out);
+
+/* M58: copy the PT_INTERP path (NUL-terminated) into buf.
+ * Returns its length, or -1 when the image has none. */
+long elf_scan_interp(const uint8_t *image, uint64_t size,
+                     char *buf, uint64_t cap);
 
 #endif /* YOUSJ_ELF_H */
