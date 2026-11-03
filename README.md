@@ -1105,11 +1105,42 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   的父进程下次 wait 时按戳
   补报）。pidtest 新增
   stopcont 场景（共 19）。
-- ⏳ 下一步候选：把默认
-  /bin/sh 的体验向 busybox
-  sh 靠拢的准备工作，或
-  sockets 基础（socketpair
-  起步）。
+- ✅ socketpair M67
+  （2026-11-04）：socket 面
+  起步——socketpair(53) 只做
+  AF_UNIX＋SOCK_STREAM：一
+  对由两条单向环形通道组成
+  的全双工端点（复用 pipe 的
+  环结构，端存活看 ends[]
+  计数而非 readers/writers），
+  双向读写走与 pipe 相同的
+  2-tick 轮询＋ERESTARTSYS
+  协议；shutdown(52) 按端置
+  读/写关闭位（SHUT_RD/WR/
+  RDWR），对端排空后 EOF、
+  写入已关方向回 SIGPIPE＋
+  EPIPE；fstat 报 S_IFSOCK；
+  poll/epoll/select 就绪已接
+  （数据/EOF 可读、对端消失
+  带 HUP|ERR）。家族/类型/
+  协议不对分别回
+  EAFNOSUPPORT/EPROTO-
+  NOSUPPORT。连带修：
+  fd_ready_file 的控制台分
+  支会把 backend 0/node 空
+  的 socket 文件误判成控制
+  台（poll 恒不就绪），条件
+  已排除 spair。未做（留待
+  后续）：socket/bind/listen/
+  accept/connect 命名套接
+  字、send/recv 的 MSG 语
+  义。pipetest 新增 sockpair
+  场景（共 12）。
+- ⏳ 下一步候选：命名
+  AF_UNIX 套接字（socket/
+  bind/listen/accept/
+  connect），或 send/recv
+  与 MSG 语义。
 
 ## 从零构建
 

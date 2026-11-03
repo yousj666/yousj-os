@@ -68,6 +68,10 @@ static long sys_write_pipe(struct yousj_file *f, uint64_t buf, uint64_t len);
 static long pipe_write_mem(struct yousj_file *f,
                            const uint8_t *src, uint64_t len,
                            bool nonblock);
+static long sys_read_sock(struct yousj_file *f, uint64_t buf,
+                          uint64_t count);  /* M67 */
+static long sys_write_sock(struct yousj_file *f, uint64_t buf,
+                           uint64_t len);   /* M67 */
 
 /* Called from sched_schedule() on every switch (weak hook, see
  * sched.c): TSS.rsp0 and cpu_local.kernel_rsp must always name the
@@ -163,6 +167,9 @@ void syscall_init(void)
 #define YOUSJ_EAGAIN 11  /* M10 */
 #define YOUSJ_ESPIPE 29  /* M9 */
 #define YOUSJ_EPIPE 32   /* M10 */
+#define YOUSJ_ENOTSOCK 88      /* M67 */
+#define YOUSJ_EPROTONOSUPPORT 93 /* M67 */
+#define YOUSJ_EAFNOSUPPORT 97  /* M67 */
 #define YOUSJ_ERANGE 34  /* M9 */
 #define YOUSJ_ENOSYS 38
 #define YOUSJ_ETIMEDOUT 110 /* M50 */
@@ -249,6 +256,8 @@ static long sys_write(long fd, uint64_t buf, uint64_t len)
         return -YOUSJ_EBADF;
     if (f->pipe != NULL)
         return sys_write_pipe(f, buf, len);
+    if (f->spair != NULL) /* M67 */
+        return sys_write_sock(f, buf, len);
     if (f->backend == 0 && f->node == NULL)
         return sys_write_console(buf, len);
     if (len == 0)
@@ -1461,6 +1470,8 @@ static long sys_read(long fd, uint64_t buf, uint64_t count)
         return -YOUSJ_EBADF;
     if (f->pipe != NULL)
         return sys_read_pipe(f, buf, count);
+    if (f->spair != NULL) /* M67 */
+        return sys_read_sock(f, buf, count);
     if (f->inotify != NULL) { /* M48 */
         if (count == 0)
             return 0;
@@ -2737,7 +2748,8 @@ static short fd_ready_file(struct yousj_file *f, long fd,
             rev |= POLLIN_K;
         return rev;
     }
-    if (f->pipe == NULL && f->backend == 0 && f->node == NULL) {
+    if (f->pipe == NULL && f->spair == NULL && f->backend == 0 &&
+        f->node == NULL) {
         /* the console: fd 0 is the readable side */
         if (fd == 0) {
             if ((events & POLLIN_K) && serial_rx_ready())
@@ -2763,6 +2775,22 @@ static short fd_ready_file(struct yousj_file *f, long fd,
                 rev |= POLLOUT_K;
         }
         /* ERR/HUP/NVAL are reported regardless of the mask */
+        return (short)((rev & (POLLERR_K | POLLHUP_K)) |
+                       (rev & events));
+    }
+    if (f->spair != NULL) { /* M67 */
+        struct yousj_sockpair *sp = f->spair;
+        int e = f->spair_end;
+        int peer_gone = sp->ends[1 - e] == 0;
+        if (sp->ch[1 - e].count > 0 || peer_gone ||
+            (sp->shut[1 - e] & 2) || (sp->shut[e] & 1))
+            rev |= POLLIN_K; /* data, or a read that returns
+                              * EOF at once */
+        if (peer_gone)
+            rev |= POLLHUP_K | POLLERR_K;
+        else if (!(sp->shut[e] & 2) && !(sp->shut[1 - e] & 1) &&
+                 sp->ch[e].count < YOUSJ_PIPE_CAP)
+            rev |= POLLOUT_K;
         return (short)((rev & (POLLERR_K | POLLHUP_K)) |
                        (rev & events));
     }
@@ -3531,6 +3559,162 @@ static long pipe_write_mem(struct yousj_file *f,
         }
         sched_sleep_ticks(2);
     }
+}
+
+/* --- M67: socketpair I/O ----------------------------------
+ * The pipe loops' shape, on a pair of channels: end e
+ * reads ch[1-e] and writes ch[e]. Peer presence is the
+ * ends[] count refined by the shutdown bits; the sleep
+ * protocol is the same 2-tick poll + -ERESTARTSYS. */
+
+static long sys_read_sock(struct yousj_file *f, uint64_t buf,
+                          uint64_t count)
+{
+    struct task *me = sched_current();
+    struct yousj_sockpair *sp = f->spair;
+    struct yousj_pipe *ch = &sp->ch[1 - f->spair_end];
+    int e = f->spair_end;
+
+    if (!user_range_ok(buf, count))
+        return -YOUSJ_EFAULT;
+    if (count == 0)
+        return 0;
+    for (;;) {
+        if (sp->shut[e] & 1)
+            return 0; /* own read side shut down: EOF */
+        if (ch->count > 0) {
+            uint8_t *dst = (uint8_t *)(uintptr_t)buf;
+            uint64_t n = count < ch->count ? count : ch->count;
+            uint64_t i;
+            for (i = 0; i < n; i++) {
+                dst[i] = ch->buf[ch->head];
+                ch->head = (ch->head + 1) % YOUSJ_PIPE_CAP;
+            }
+            ch->count -= (uint32_t)n;
+            return (long)n;
+        }
+        if (sp->ends[1 - e] == 0 || (sp->shut[1 - e] & 2))
+            return 0; /* peer gone, or its write side shut */
+        if (f->flags & YOUSJ_O_NONBLOCK)
+            return -YOUSJ_EAGAIN;
+        if (signal_deliverable_pending(me)) {
+            me->sig_wake = false;
+            return -YOUSJ_ERESTARTSYS;
+        }
+        sched_sleep_ticks(2);
+    }
+}
+
+static long sys_write_sock(struct yousj_file *f, uint64_t buf,
+                           uint64_t len)
+{
+    struct task *me = sched_current();
+    struct yousj_sockpair *sp = f->spair;
+    struct yousj_pipe *ch = &sp->ch[f->spair_end];
+    int e = f->spair_end;
+    const uint8_t *src = (const uint8_t *)(uintptr_t)buf;
+    uint64_t written = 0;
+
+    if (!user_range_ok(buf, len))
+        return -YOUSJ_EFAULT;
+    if (len == 0)
+        return 0;
+    for (;;) {
+        uint64_t space, chunk, i;
+        if ((sp->shut[e] & 2) || sp->ends[1 - e] == 0 ||
+            (sp->shut[1 - e] & 1)) {
+            if (written == 0) {
+                signal_send(me, YOUSJ_SIGPIPE, me->tid);
+                return -YOUSJ_EPIPE;
+            }
+            return (long)written;
+        }
+        space = YOUSJ_PIPE_CAP - ch->count;
+        if (space > 0) {
+            chunk = len - written < space ? len - written
+                                          : space;
+            for (i = 0; i < chunk; i++) {
+                ch->buf[ch->tail] = src[written + i];
+                ch->tail = (ch->tail + 1) % YOUSJ_PIPE_CAP;
+            }
+            ch->count += (uint32_t)chunk;
+            written += chunk;
+            if (written == len)
+                return (long)written;
+            continue;
+        }
+        if (f->flags & YOUSJ_O_NONBLOCK)
+            return written > 0 ? (long)written : -YOUSJ_EAGAIN;
+        if (signal_deliverable_pending(me)) {
+            me->sig_wake = false;
+            return written > 0 ? (long)written
+                               : -YOUSJ_ERESTARTSYS;
+        }
+        sched_sleep_ticks(2);
+    }
+}
+
+static long sys_socketpair(long domain, long type,
+                           long protocol, uint64_t sv_ptr)
+{
+    struct task *me = sched_current();
+    struct yousj_file *a, *b;
+    long rc, fda, fdb;
+    int32_t *out;
+
+    if (domain != 1) /* AF_UNIX only -- there is no stack */
+        return -YOUSJ_EAFNOSUPPORT;
+    if ((type & ~(0x800L | 0x80000L)) != 1 || protocol != 0)
+        return -YOUSJ_EPROTONOSUPPORT; /* SOCK_STREAM only */
+    if (!user_range_ok(sv_ptr, 8))
+        return -YOUSJ_EFAULT;
+    rc = fs_sockpair_create(&a, &b);
+    if (rc != 0)
+        return rc;
+    if (type & 0x800L) { /* SOCK_NONBLOCK */
+        a->flags |= YOUSJ_O_NONBLOCK;
+        b->flags |= YOUSJ_O_NONBLOCK;
+    }
+    fda = fd_alloc(me, a);
+    if (fda < 0) {
+        file_put(a);
+        file_put(b);
+        return fda;
+    }
+    fdb = fd_alloc(me, b);
+    if (fdb < 0) {
+        me->files->fd_file[fda] = NULL;
+        file_put(a);
+        file_put(b);
+        return fdb;
+    }
+    if (type & 0x80000L) { /* SOCK_CLOEXEC */
+        me->files->fd_cloexec |= (uint16_t)(1u << fda);
+        me->files->fd_cloexec |= (uint16_t)(1u << fdb);
+    }
+    out = (int32_t *)(uintptr_t)sv_ptr;
+    out[0] = (int32_t)fda;
+    out[1] = (int32_t)fdb;
+    return 0;
+}
+
+static long sys_shutdown(long fd, long how)
+{
+    struct yousj_file *f = fd_file_of(sched_current(), fd);
+
+    if (f == NULL)
+        return -YOUSJ_EBADF;
+    if (f->spair == NULL)
+        return -YOUSJ_ENOTSOCK;
+    if (how < 0 || how > 2)
+        return -YOUSJ_EINVAL;
+    if (how == 0)
+        f->spair->shut[f->spair_end] |= 1; /* SHUT_RD */
+    else if (how == 1)
+        f->spair->shut[f->spair_end] |= 2; /* SHUT_WR */
+    else
+        f->spair->shut[f->spair_end] |= 3; /* SHUT_RDWR */
+    return 0;
 }
 
 static long sys_pipe2_sys(uint64_t fds_ptr, long flags)
@@ -4639,6 +4823,11 @@ static long dispatch_inner(struct yousj_syscall_ctx *ctx)
         return sys_rmdir_sys(a1);
     case YOUSJ_SYS_rename:
         return sys_rename_sys(a1, a2);
+    case YOUSJ_SYS_socketpair:
+        return sys_socketpair((long)a1, (long)a2, (long)a3,
+                              a4);
+    case YOUSJ_SYS_shutdown:
+        return sys_shutdown((long)a1, (long)a2);
     case YOUSJ_SYS_pipe:
         return sys_pipe2_sys(a1, 0);
     case YOUSJ_SYS_pipe2:

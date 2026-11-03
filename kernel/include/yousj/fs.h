@@ -54,12 +54,27 @@ struct yousj_pipe {
     bool in_use;
 };
 
+/* M67: an AF_UNIX stream socketpair. Two pipe-shaped
+ * channels: ch[i] carries the bytes end i writes and end
+ * 1-i reads. ends[] counts open FILE OBJECTS per end (dup
+ * and fork share the object, like pipes); shut[] holds
+ * per-end shutdown bits (1 = read side, 2 = write side). */
+struct yousj_sockpair {
+    struct yousj_pipe ch[2];
+    int ends[2];
+    uint8_t shut[2];
+    bool in_use;
+};
+
 struct yousj_epoll; /* M18: defined in fs.c */
 struct yousj_inotify; /* M48: defined in fs.c */
 
 struct yousj_file {
     struct yousj_ramfs_node *node; /* NULL and pipe NULL: console */
     struct yousj_pipe *pipe;       /* non-NULL: a pipe end (M10) */
+    struct yousj_sockpair *spair;  /* non-NULL: a socketpair
+                                      end (M67) */
+    int spair_end;                 /* M67: 0 or 1 */
     struct yousj_epoll *epoll;     /* non-NULL: an epoll set (M18) */
     struct yousj_inotify *inotify; /* non-NULL: an inotify
                                       instance (M48) */
@@ -128,6 +143,11 @@ struct yousj_file *fs_console_file(void);
  * 0 or a negative errno. */
 long fs_pipe_create(struct yousj_file **rd_out,
                     struct yousj_file **wr_out);
+
+/* M67: create a socketpair and its two end objects (each
+ * refcount 1, both O_RDWR). 0 or a negative errno. */
+long fs_sockpair_create(struct yousj_file **a_out,
+                        struct yousj_file **b_out);
 
 /* M18: epoll instances. ctl ops mirror Linux: ADD 1, DEL 2,
  * MOD 3. Entries pin their target file (a reference is

@@ -39,6 +39,9 @@
 #define SYS_wait4        61
 #define SYS_exit_group   231
 #define SYS_pipe2        293
+#define SYS_socketpair   53
+#define SYS_shutdown     52
+#define SYS_poll         7
 
 #define O_RDONLY  0
 #define O_WRONLY  1
@@ -293,6 +296,132 @@ static int exec_child_mode(int argc, char **argv)
     r2 = sys_call3(SYS_lseek, ffd, 0, SEEK_CUR);
     exit_now((r1 == -9 && r2 >= 0) ? 0 : 5);
     return 0;
+}
+
+/* M67: socketpair -- bidirectional stream, shutdown
+ * semantics, close/EOF/EPIPE, poll readiness, and a
+ * cross-process exchange through fork inheritance. */
+struct pfd_k {
+    int32_t fd;
+    int16_t events, revents;
+};
+
+static void t_sockpair(void)
+{
+    struct k_sigaction act;
+    int sv[2] = { -1, -1 };
+    int sv2[2] = { -1, -1 };
+    char buf[16];
+    long n;
+    int ok = 1;
+    struct pfd_k pfd;
+
+    act.handler = SIG_IGN; /* SIGPIPE must not kill us */
+    act.flags = 0;
+    act.reserved = 0;
+    act.restorer = 0;
+    act.mask = 0;
+    sys_call4(SYS_rt_sigaction, SIGPIPE,
+              (long)(uintptr_t)&act, 0, 8);
+
+    /* rejects: wrong family, wrong type */
+    ok = ok && sys_call4(SYS_socketpair, 2, 1, 0,
+                         (long)(uintptr_t)sv) == -97;
+    ok = ok && sys_call4(SYS_socketpair, 1, 2, 0,
+                         (long)(uintptr_t)sv) == -93;
+    if (sys_call4(SYS_socketpair, 1, 1, 0,
+                  (long)(uintptr_t)sv) != 0) {
+        report2("sockpair", 0, -1);
+        return;
+    }
+    ok = ok && sv[0] >= 0 && sv[1] >= 0 && sv[0] != sv[1];
+
+    /* both directions */
+    ok = ok && sys_call3(SYS_write, sv[0],
+                         (long)(uintptr_t)"ping", 4) == 4;
+    n = sys_call3(SYS_read, sv[1], (long)(uintptr_t)buf, 4);
+    ok = ok && n == 4 && buf[0] == 'p' && buf[3] == 'g';
+    ok = ok && sys_call3(SYS_write, sv[1],
+                         (long)(uintptr_t)"pong!", 5) == 5;
+    n = sys_call3(SYS_read, sv[0], (long)(uintptr_t)buf, 5);
+    ok = ok && n == 5 && buf[0] == 'p' && buf[4] == '!';
+
+    /* poll */
+    ok = ok && sys_call3(SYS_write, sv[0],
+                         (long)(uintptr_t)"z", 1) == 1;
+    pfd.fd = sv[1];
+    pfd.events = 1; /* POLLIN */
+    pfd.revents = 0;
+    ok = ok && sys_call3(SYS_poll, (long)(uintptr_t)&pfd,
+                         1, 0) == 1 && (pfd.revents & 1);
+    pfd.fd = sv[0];
+    pfd.revents = 0;
+    ok = ok && sys_call3(SYS_poll, (long)(uintptr_t)&pfd,
+                         1, 0) == 0;
+    n = sys_call3(SYS_read, sv[1], (long)(uintptr_t)buf, 1);
+    ok = ok && n == 1 && buf[0] == 'z';
+
+    /* shutdown(WR) on sv[0]: sv[1] drains then EOFs,
+     * while the reverse direction stays open */
+    ok = ok && sys_call3(SYS_write, sv[0],
+                         (long)(uintptr_t)"end", 3) == 3;
+    ok = ok && sys_call3(SYS_shutdown, sv[0], 1, 0) == 0;
+    n = sys_call3(SYS_read, sv[1], (long)(uintptr_t)buf, 8);
+    ok = ok && n == 3 && buf[0] == 'e';
+    n = sys_call3(SYS_read, sv[1], (long)(uintptr_t)buf, 8);
+    ok = ok && n == 0; /* EOF */
+    ok = ok && sys_call3(SYS_write, sv[1],
+                         (long)(uintptr_t)"back", 4) == 4;
+    n = sys_call3(SYS_read, sv[0], (long)(uintptr_t)buf, 4);
+    ok = ok && n == 4 && buf[0] == 'b';
+
+    /* shutdown RD */
+    ok = ok && sys_call3(SYS_shutdown, sv[1], 0, 0) == 0;
+    ok = ok && sys_call3(SYS_write, sv[0],
+                         (long)(uintptr_t)"x", 1) == -32;
+    sys_call3(SYS_close, sv[0], 0, 0);
+    sys_call3(SYS_close, sv[1], 0, 0);
+
+    /* close */
+    if (sys_call4(SYS_socketpair, 1, 1, 0,
+                  (long)(uintptr_t)sv2) != 0) {
+        report2("sockpair", 0, -2);
+        return;
+    }
+    sys_call3(SYS_close, sv2[1], 0, 0);
+    n = sys_call3(SYS_read, sv2[0], (long)(uintptr_t)buf,
+                  4);
+    ok = ok && n == 0;
+    ok = ok && sys_call3(SYS_write, sv2[0],
+                         (long)(uintptr_t)"x", 1) == -32;
+    sys_call3(SYS_close, sv2[0], 0, 0);
+
+    /* across fork */
+    if (sys_call4(SYS_socketpair, 1, 1, 0,
+                  (long)(uintptr_t)sv2) != 0) {
+        report2("sockpair", 0, -3);
+        return;
+    }
+    {
+        long c = sys_call4(SYS_clone, 17, 0, 0, 0);
+        if (c == 0) {
+            sys_call3(SYS_write, sv2[1],
+                      (long)(uintptr_t)"kid", 3);
+            sys_call3(SYS_exit_group, 0, 0, 0);
+        }
+        {
+            long st = 0;
+            n = sys_call3(SYS_read, sv2[0],
+                          (long)(uintptr_t)buf, 3);
+            ok = ok && n == 3 && buf[0] == 'k' &&
+                 buf[2] == 'd';
+            sys_call4(SYS_wait4, c, (long)(uintptr_t)&st,
+                      0, 0);
+        }
+    }
+    sys_call3(SYS_close, sv2[0], 0, 0);
+    sys_call3(SYS_close, sv2[1], 0, 0);
+    report2("sockpair", ok, 0);
 }
 
 static void t_cloexec(void)
@@ -580,6 +709,7 @@ int main(int argc, char **argv)
     t_full();
     t_dup();
     t_cloexec();
+    t_sockpair();
     out("PIPETEST DONE\n");
     return g_fails == 0 ? 0 : 1;
 }

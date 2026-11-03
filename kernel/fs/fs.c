@@ -559,6 +559,15 @@ void file_put(struct yousj_file *f)
                 p->in_use = false;
             f->pipe = NULL;
         }
+        if (f->spair != NULL) {
+            /* M67: drop this end; the pair dies when both
+             * ends are gone. Peers poll ends[], like pipes. */
+            struct yousj_sockpair *sp = f->spair;
+            sp->ends[f->spair_end]--;
+            if (sp->ends[0] <= 0 && sp->ends[1] <= 0)
+                sp->in_use = false;
+            f->spair = NULL;
+        }
         if (f->node != NULL) {
             node_ref_dec(f->node);
             f->node = NULL;
@@ -717,6 +726,51 @@ long fs_pipe_create(struct yousj_file **rd_out,
     wr->flags = YOUSJ_O_WRONLY;
     *rd_out = rd;
     *wr_out = wr;
+    return 0;
+}
+
+/* --- M67: socketpairs ------------------------------------ */
+
+#define MAX_SOCKPAIRS 8
+static struct yousj_sockpair g_sockpairs[MAX_SOCKPAIRS];
+
+long fs_sockpair_create(struct yousj_file **a_out,
+                        struct yousj_file **b_out)
+{
+    struct yousj_sockpair *sp = NULL;
+    struct yousj_file *a, *b;
+    int i;
+
+    for (i = 0; i < MAX_SOCKPAIRS; i++) {
+        if (!g_sockpairs[i].in_use) {
+            sp = &g_sockpairs[i];
+            break;
+        }
+    }
+    if (sp == NULL)
+        return -YOUSJ_ENFILE;
+    mem_zero((uint8_t *)sp, sizeof(*sp));
+    sp->in_use = true;
+    sp->ends[0] = 1;
+    sp->ends[1] = 1;
+    a = file_alloc();
+    b = file_alloc();
+    if (a == NULL || b == NULL) {
+        if (a != NULL)
+            a->in_use = false;
+        if (b != NULL)
+            b->in_use = false;
+        sp->in_use = false;
+        return -YOUSJ_ENFILE;
+    }
+    a->spair = sp;
+    a->spair_end = 0;
+    a->flags = YOUSJ_O_RDWR;
+    b->spair = sp;
+    b->spair_end = 1;
+    b->flags = YOUSJ_O_RDWR;
+    *a_out = a;
+    *b_out = b;
     return 0;
 }
 
@@ -3072,6 +3126,15 @@ bool fs_file_stat(struct yousj_file *f,
     }
     if (f->pipe != NULL) {
         info->mode = S_IFIFO_K | 0644u;
+        info->mtime = 0;
+        info->atime = 0;
+        info->ctime = 0;
+        info->size = 0;
+        info->ino = 0;
+        return true;
+    }
+    if (f->spair != NULL) { /* M67 */
+        info->mode = 0140000u | 0666u; /* S_IFSOCK */
         info->mtime = 0;
         info->atime = 0;
         info->ctime = 0;

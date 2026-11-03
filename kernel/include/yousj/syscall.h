@@ -147,6 +147,8 @@
 #define YOUSJ_SYS_getrandom   318   /* M63 */
 #define YOUSJ_SYS_vfork       58    /* M64 */
 #define YOUSJ_SYS_fork        57    /* M65: = clone(SIGCHLD) */
+#define YOUSJ_SYS_shutdown    52    /* M67 */
+#define YOUSJ_SYS_socketpair  53    /* M67 */
 #define YOUSJ_SYS_setpgid     109   /* M65 */
 #define YOUSJ_SYS_getpgrp     111   /* M65 */
 #define YOUSJ_SYS_setsid      112   /* M65 */
