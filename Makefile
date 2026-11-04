@@ -9,7 +9,7 @@ CFLAGS  := -DYOUSJ_KERNEL -ffreestanding -fno-stack-protector -fno-pic -m64 -mno
 HOSTCFLAGS := -Wall -Wextra -I kernel/include
 BUILD   := build
 
-KERNEL_OBJS := $(BUILD)/kmain.o $(BUILD)/pmm.o $(BUILD)/vmm.o $(BUILD)/vmm_arch.o $(BUILD)/fpu.o $(BUILD)/fs.o $(BUILD)/yfs.o $(BUILD)/ata.o $(BUILD)/pci.o $(BUILD)/virtio_net.o $(BUILD)/fb.o $(BUILD)/ps2kbd.o $(BUILD)/ps2mouse.o $(BUILD)/net.o $(BUILD)/syscall.o $(BUILD)/signal.o $(BUILD)/time.o $(BUILD)/syscall_entry.o $(BUILD)/m3_user_bin.o $(BUILD)/elf.o $(BUILD)/initramfs_bin.o $(BUILD)/serial.o $(BUILD)/sched.o $(BUILD)/context_switch.o $(BUILD)/interrupts.o $(BUILD)/isr.o $(BUILD)/gdt.o
+KERNEL_OBJS := $(BUILD)/kmain.o $(BUILD)/pmm.o $(BUILD)/vmm.o $(BUILD)/vmm_arch.o $(BUILD)/fpu.o $(BUILD)/fs.o $(BUILD)/yfs.o $(BUILD)/ata.o $(BUILD)/pci.o $(BUILD)/virtio_net.o $(BUILD)/fb.o $(BUILD)/ps2kbd.o $(BUILD)/ps2mouse.o $(BUILD)/wm.o $(BUILD)/net.o $(BUILD)/syscall.o $(BUILD)/signal.o $(BUILD)/time.o $(BUILD)/syscall_entry.o $(BUILD)/m3_user_bin.o $(BUILD)/elf.o $(BUILD)/initramfs_bin.o $(BUILD)/serial.o $(BUILD)/sched.o $(BUILD)/context_switch.o $(BUILD)/interrupts.o $(BUILD)/isr.o $(BUILD)/gdt.o
 
 .PHONY: check test clean
 check: $(KERNEL_OBJS)
@@ -148,6 +148,10 @@ $(BUILD)/ps2kbd.o: kernel/drivers/ps2kbd.c kernel/include/yousj/*.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD)/ps2mouse.o: kernel/drivers/ps2mouse.c kernel/include/yousj/*.h kernel/drivers/serial.h
+	mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD)/wm.o: kernel/drivers/wm.c kernel/include/yousj/*.h
 	mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -337,7 +341,7 @@ STUB := $(BUILD)/yousj-stub.elf
 CFLAGS32 := -m32 -ffreestanding -fno-stack-protector -fno-pic -mno-red-zone \
             -Wall -Wextra -I kernel/include -I kernel
 KERNEL_LINK_OBJS := $(BUILD)/entry64.o $(BUILD)/kmain.o \
-                    $(BUILD)/serial.o $(BUILD)/pmm.o $(BUILD)/vmm.o $(BUILD)/vmm_arch.o $(BUILD)/fpu.o $(BUILD)/fs.o $(BUILD)/yfs.o $(BUILD)/ata.o $(BUILD)/pci.o $(BUILD)/virtio_net.o $(BUILD)/fb.o $(BUILD)/ps2kbd.o $(BUILD)/ps2mouse.o $(BUILD)/net.o $(BUILD)/syscall.o $(BUILD)/signal.o $(BUILD)/time.o $(BUILD)/syscall_entry.o $(BUILD)/m3_user_bin.o $(BUILD)/elf.o $(BUILD)/initramfs_bin.o \
+                    $(BUILD)/serial.o $(BUILD)/pmm.o $(BUILD)/vmm.o $(BUILD)/vmm_arch.o $(BUILD)/fpu.o $(BUILD)/fs.o $(BUILD)/yfs.o $(BUILD)/ata.o $(BUILD)/pci.o $(BUILD)/virtio_net.o $(BUILD)/fb.o $(BUILD)/ps2kbd.o $(BUILD)/ps2mouse.o $(BUILD)/wm.o $(BUILD)/net.o $(BUILD)/syscall.o $(BUILD)/signal.o $(BUILD)/time.o $(BUILD)/syscall_entry.o $(BUILD)/m3_user_bin.o $(BUILD)/elf.o $(BUILD)/initramfs_bin.o \
                     $(BUILD)/sched.o $(BUILD)/context_switch.o $(BUILD)/interrupts.o $(BUILD)/isr.o $(BUILD)/gdt.o
 STUB_LINK_OBJS := $(BUILD)/stub.o $(BUILD)/stub_main.o $(BUILD)/stub_bootinfo.o
 

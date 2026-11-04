@@ -17,6 +17,7 @@
 #include <yousj/ps2mouse.h>
 #include <yousj/ps2kbd.h>
 #include <yousj/fb.h>
+#include <yousj/wm.h> /* M85: clicks and drags route to windows */
 
 #define KBD_STATUS 0x64
 #define KBD_DATA   0x60
@@ -155,8 +156,10 @@ void input_poll(void)
     g_m.x = nx;
     g_m.y = ny;
     fb_cursor_move((uint32_t)nx, (uint32_t)ny);
-    if ((g_m.buttons & 1) && !(g_m.prev_buttons & 1))
-        fb_click_mark((uint32_t)nx, (uint32_t)ny);
+    /* M85: the window layer sees every position/button change
+     * (it owns hit testing, dragging, closing; desktop clicks
+     * still land as markers from inside wm_mouse). */
+    wm_mouse((uint32_t)nx, (uint32_t)ny, g_m.buttons);
     g_m.prev_buttons = g_m.buttons;
 }
 

@@ -17,6 +17,7 @@
 #include <yousj/boot.h>
 #include <yousj/vmm.h>
 #include <yousj/fb.h>
+#include <yousj/wm.h> /* M85: occlusion + repair hooks */
 #include <drivers/serial.h>
 
 #include "font8x16.h"
@@ -192,12 +193,33 @@ static void fb_banner(void)
 #define FB_CON_TOP 192u
 #define FB_CON_BOTTOM_MARGIN 140u
 
+#define FB_CON_MAX_COLS 256
+#define FB_CON_MAX_ROWS 128
+
 static struct {
     int      active;
     uint32_t cx, cy;
     uint32_t cols, rows;
     uint32_t top;      /* pixel y of row 0 */
+    /* M85: the character backing store. The window layer can
+     * cover part of the console; what is underneath survives
+     * here, and repainting a rectangle redraws from this grid.
+     * putc() writes cells even for occluded positions, so text
+     * flows correctly while hidden. */
+    uint8_t  cells[FB_CON_MAX_ROWS][FB_CON_MAX_COLS];
 } g_con;
+
+/* Is this cell's pixel rectangle covered by the window? */
+static int con_cell_occluded(uint32_t cx, uint32_t cy)
+{
+    uint32_t wx, wy, ww, wh;
+    uint32_t px = 8 + cx * 8;
+    uint32_t py = g_con.top + cy * 16;
+    if (!wm_window_rect(&wx, &wy, &ww, &wh))
+        return 0;
+    return px + 8 > wx && px < wx + ww &&
+           py + 16 > wy && py < wy + wh;
+}
 
 static uint32_t con_cell_x(uint32_t cx)
 {
@@ -211,6 +233,8 @@ static uint32_t con_cell_y(uint32_t cy)
 
 static void con_cursor(int on)
 {
+    if (con_cell_occluded(g_con.cx, g_con.cy))
+        return; /* under the window: no painting there at all */
     fb_fill_rect(con_cell_x(g_con.cx), con_cell_y(g_con.cy) + 13,
                  8, 2, on ? FB_CON_FG : FB_CON_BG);
 }
@@ -218,7 +242,7 @@ static void con_cursor(int on)
 static void con_scroll(void)
 {
     uint32_t bottom = g_con.top + g_con.rows * 16;
-    uint32_t y;
+    uint32_t y, r, c;
     for (y = g_con.top; y < bottom - 16; y++) {
         uint8_t *dst = (uint8_t *)g_fb.px + (uint64_t)y * g_fb.pitch;
         const uint8_t *src = dst + (uint64_t)16 * g_fb.pitch;
@@ -227,6 +251,15 @@ static void con_scroll(void)
             dst[i] = src[i];
     }
     fb_fill_rect(0, bottom - 16, g_fb.width, 16, FB_CON_BG);
+    /* the backing store scrolls with the pixels */
+    for (r = 0; r + 1 < g_con.rows; r++)
+        for (c = 0; c < g_con.cols; c++)
+            g_con.cells[r][c] = g_con.cells[r + 1][c];
+    for (c = 0; c < g_con.cols; c++)
+        g_con.cells[g_con.rows - 1][c] = ' ';
+    /* the pixel move smeared whatever the window showed;
+     * the window layer redraws itself on top */
+    wm_repair();
 }
 
 static void con_newline(void)
@@ -252,11 +285,17 @@ void fb_console_putc(char c)
         if (g_con.cx >= g_con.cols)
             con_newline();
     } else if (c >= 32 && c < 127) {
-        char buf[2];
-        buf[0] = c;
-        buf[1] = '\0';
-        fb_draw_text(con_cell_x(g_con.cx), con_cell_y(g_con.cy),
-                     buf, FB_CON_FG, FB_CON_BG, 1);
+        /* the backing store always advances; pixels only where
+         * the window is not covering this cell (M85) */
+        if (g_con.cy < FB_CON_MAX_ROWS && g_con.cx < FB_CON_MAX_COLS)
+            g_con.cells[g_con.cy][g_con.cx] = (uint8_t)c;
+        if (!con_cell_occluded(g_con.cx, g_con.cy)) {
+            char buf[2];
+            buf[0] = c;
+            buf[1] = '\0';
+            fb_draw_text(con_cell_x(g_con.cx), con_cell_y(g_con.cy),
+                         buf, FB_CON_FG, FB_CON_BG, 1);
+        }
         g_con.cx++;
         if (g_con.cx >= g_con.cols)
             con_newline();
@@ -281,10 +320,56 @@ static void con_activate(void)
     if (g_con.cols == 0 || g_con.rows == 0)
         return;
     fb_fill_rect(0, g_con.top, g_fb.width, g_con.rows * 16, FB_CON_BG);
+    {
+        uint32_t r, c;
+        for (r = 0; r < FB_CON_MAX_ROWS; r++)
+            for (c = 0; c < FB_CON_MAX_COLS; c++)
+                g_con.cells[r][c] = ' ';
+    }
     g_con.cx = 0;
     g_con.cy = 0;
     g_con.active = 1;
     con_cursor(1);
+}
+
+/* M85: repaint a pixel rectangle of the console from the
+ * backing store -- what a window uncovers when it moves or
+ * closes. Fills with the field color first (the whole screen
+ * shares it), then redraws every cell the rectangle touches. */
+void fb_console_repaint_rect(uint32_t rx, uint32_t ry,
+                             uint32_t rw, uint32_t rh)
+{
+    uint32_t cx0, cy0, cx1, cy1, cx, cy;
+    if (!g_con.active)
+        return;
+    fb_fill_rect(rx, ry, rw, rh, FB_CON_BG);
+    if (rx >= g_fb.width || ry + rh <= g_con.top)
+        return;
+    cx0 = rx <= 8 ? 0 : (rx - 8) / 8;
+    cy0 = ry <= g_con.top ? 0 : (ry - g_con.top) / 16;
+    cx1 = (rx + rw - 8 + 7) / 8;
+    cy1 = (ry + rh - g_con.top + 15) / 16;
+    if (cx1 > g_con.cols)
+        cx1 = g_con.cols;
+    if (cy1 > g_con.rows)
+        cy1 = g_con.rows;
+    for (cy = cy0; cy < cy1; cy++) {
+        for (cx = cx0; cx < cx1; cx++) {
+            uint8_t ch = (cy < FB_CON_MAX_ROWS && cx < FB_CON_MAX_COLS)
+                             ? g_con.cells[cy][cx]
+                             : (uint8_t)' ';
+            char buf[2];
+            if (ch < 32 || ch >= 127)
+                ch = ' ';
+            buf[0] = (char)ch;
+            buf[1] = '\0';
+            fb_draw_text(con_cell_x(cx), con_cell_y(cy), buf,
+                         FB_CON_FG, FB_CON_BG, 1);
+        }
+    }
+    if (g_con.cx >= cx0 && g_con.cx < cx1 &&
+        g_con.cy >= cy0 && g_con.cy < cy1)
+        con_cursor(1);
 }
 
 /* ---------------------------------------------------------------- */

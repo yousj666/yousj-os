@@ -52,6 +52,12 @@ uint32_t fb_height(void);
  * region below the M81 banner. No-op while inactive. */
 void fb_console_putc(char c);
 
+/* Repaint a pixel rectangle of the console from its character
+ * backing store (M85): what a window uncovers when it moves or
+ * closes is restored from here. */
+void fb_console_repaint_rect(uint32_t rx, uint32_t ry,
+                             uint32_t rw, uint32_t rh);
+
 /* Mouse arrow (M84): a 12x17 arrow with save-under, so it can
  * wander over the console without erasing it. fb_cursor_move()
  * restores the previous spot and paints at the new one. */

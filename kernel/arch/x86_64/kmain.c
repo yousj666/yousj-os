@@ -20,6 +20,7 @@
 #include <yousj/net.h>
 #include <yousj/fb.h>
 #include <yousj/ps2mouse.h>
+#include <yousj/wm.h>
 #include <drivers/serial.h> /* kernel/drivers/serial.h; -I kernel in Makefile */
 
 /* M1 demo threads (SCHED_DESIGN.md milestone M1): two cooperative
@@ -530,6 +531,7 @@ void kmain(struct yousj_boot_info *boot_info)
         net_init(); /* M72: probe the NIC (absent is fine) */
         fb_init(&boot_fb); /* M81: light the screen if GOP gave one */
         ps2mouse_init(); /* M84: AUX port on, mouse reporting */
+        wm_init(); /* M85: open the demonstration window */
         if (fs_load_initramfs() < 0) {
             serial_puts("Yousj OS: initramfs FAILED (corrupt archive)\n");
             halt_forever();

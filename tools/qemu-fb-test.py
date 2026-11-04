@@ -273,18 +273,54 @@ def main():
               "centre now:", gone)
         check("arrow followed the mouse", moved > 10)
         check("arrow vacated the centre (save-under)", gone < 5)
+        # click on the desktop (below the M85 window) for a marker.
+        # NOTE: HMP mouse_move sends its arguments as RELATIVE
+        # deltas for the PS/2 mouse (verified against dumps:
+        # the applied motion equals the arguments, not a delta
+        # from any tracked absolute position).
+        mon_cmd("mouse_move 276 376", 0.8)  # guest now at 1500,1500
         mon_cmd("mouse_button 1", 0.5)
         mon_cmd("mouse_button 0", 0.3)
         w2, h2, body = dump(os.path.join(ROOT, "build", "fb_m2.ppm"))
         mark = 0
-        for yy in range(h // 2 + 100, h // 2 + 140):
-            for xx in range(w // 2 + 200, w // 2 + 240):
+        for yy in range(1500, 1545):
+            for xx in range(1500, 1545):
                 r, g, b = px(body, w, xx, yy)
                 if r > 240 and 190 < g < 240 and b < 140:
                     mark += 1
         print("click marker px:", mark)
         check("click dropped its marker", mark > 10)
         save_png(os.path.join(ROOT, "build", "fb_mouse.png"), w, h, body)
+
+        # --- M85: the window exists, drags, and closes ---
+        check("window body present",
+              close(px(body, w, 1330, 1264), (0x24, 0x46, 0x6B)))
+        check("window title bar present",
+              close(px(body, w, 1330, 1094), (0x2E, 0x5E, 0x8C)))
+        check("window close box present",
+              close(px(body, w, 1589, 1087), (0xC0, 0x39, 0x2B)))
+        # grab the title at (1200,1094): from (1500,1500)
+        mon_cmd("mouse_move -300 -406", 0.8)
+        mon_cmd("mouse_button 1", 0.5)
+        mon_cmd("mouse_move 150 120", 0.8)  # drag by (+150,+120)
+        mon_cmd("mouse_button 0", 0.4)
+        w2, h2, body = dump(os.path.join(ROOT, "build", "fb_w1.ppm"))
+        check("window followed the drag",
+              close(px(body, w, 1480, 1384), (0x24, 0x46, 0x6B)))
+        check("window title moved too",
+              close(px(body, w, 1480, 1214), (0x2E, 0x5E, 0x8C)))
+        check("old window spot repainted to console",
+              close(px(body, w, 1100, 1130), (0x10, 0x24, 0x3E)))
+        save_png(os.path.join(ROOT, "build", "fb_win.png"), w, h, body)
+        # close it: box centre now at (1746,1214): from (1350,1214)
+        mon_cmd("mouse_move 396 0", 0.8)
+        mon_cmd("mouse_button 1", 0.5)
+        mon_cmd("mouse_button 0", 0.4)
+        w2, h2, body = dump(os.path.join(ROOT, "build", "fb_w2.ppm"))
+        check("window closed, console restored",
+              close(px(body, w, 1480, 1384), (0x10, 0x24, 0x3E)))
+        save_png(os.path.join(ROOT, "build", "fb_closed.png"), w, h,
+                 body)
     finally:
         qemu.terminate()
         try:
