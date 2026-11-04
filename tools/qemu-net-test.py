@@ -225,6 +225,52 @@ check('nettest ping sent', 'ping-sent' in seg)
 m = re.search(r'ping_replied=(\d+)', seg)
 check('netinfo counts the ping reply', m is not None and int(m.group(1)) >= 1)
 
+# 7. (M74) UDP on the wire: the harness sends a datagram to
+# the guest's bound port; nettest answers it.
+def udp_packet(src_ip, dst_ip, sport, dport, data):
+    seg = struct.pack('>HHHH', sport, dport, 8 + len(data), 0) + data
+    pseudo = src_ip + dst_ip + struct.pack('>BBH', 0, 17, len(seg))
+    seg = seg[:6] + struct.pack('>H', csum(pseudo + seg)) + seg[8:]
+    return ip_packet(src_ip, dst_ip, 17, seg)
+
+frames.clear()
+mark = len(buf)
+send('nettest udp')
+check('nettest udp loopback', until('NETTEST udp-loop PASS', 30, mark))
+check('nettest udp ready', until('NETTEST udp-ready', 30, mark))
+send_frame(eth(GUEST_MAC, PEER_MAC, 0x0800,
+               udp_packet(PEER_IP, GUEST_IP, 9999, 7777,
+                          b'wire-hello')))
+rep = wait_frame(lambda f: len(f) >= 14 and f[12:14] == b'\x08\x00', 12)
+ok = rep is not None
+if ok:
+    ip = rep[14:]
+    u = ip[20:]
+    ulen = struct.unpack('>H', u[4:6])[0]
+    pseudo = ip[12:16] + ip[16:20] + struct.pack('>BBH', 0, 17, ulen)
+    ok = (ip[16:20] == PEER_IP and
+          struct.unpack('>HH', u[0:4]) == (7777, 9999) and
+          u[8:ulen] == b'yousj-udp-pong' and
+          csum(pseudo + u[:ulen]) == 0 and csum(ip[:20]) == 0)
+check('guest answers a UDP datagram correctly', ok)
+check('nettest done (udp)', until('NETTEST DONE', 30, mark))
+
+# 8. A datagram to an unbound port earns ICMP port
+# unreachable with the original packet quoted.
+frames.clear()
+send_frame(eth(GUEST_MAC, PEER_MAC, 0x0800,
+               udp_packet(PEER_IP, GUEST_IP, 9999, 7999,
+                          b'anyone?')))
+rep = wait_frame(lambda f: len(f) >= 14 and f[12:14] == b'\x08\x00', 12)
+ok = rep is not None
+if ok:
+    ip = rep[14:]
+    ic = ip[20:]
+    ok = (ip[9] == 1 and ic[0] == 3 and ic[1] == 3 and
+          ic[8 + 9] == 17 and
+          ic[8 + 20 + 2:8 + 20 + 4] == struct.pack('>H', 7999))
+check('unbound port earns ICMP unreachable', ok)
+
 f1 = free_pages(len(buf))
 check('PMM steady state', f0 is not None and f0 == f1)
 

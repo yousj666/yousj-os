@@ -126,6 +126,8 @@ struct yousj_file {
                                       the syscall layer) */
     int32_t so_rcvbuf;             /* M71: 0 = unset */
     int32_t so_sndbuf;             /* M71: 0 = unset */
+    struct yousj_udp_ep *udp_ep;   /* M74: an AF_INET datagram
+                                      endpoint (net layer) */
     struct yousj_epoll *epoll;     /* non-NULL: an epoll set (M18) */
     struct yousj_inotify *inotify; /* non-NULL: an inotify
                                       instance (M48) */
@@ -203,6 +205,11 @@ long fs_sockpair_create(struct yousj_file **a_out,
 /* M68: named AF_UNIX stream sockets. All take an absolute,
  * link-resolved path. 0 or a negative errno. */
 long fs_usock_create(struct yousj_file **out, int type);
+
+/* M74: wrap a net-layer UDP endpoint in a file object. */
+struct yousj_udp_ep;
+long fs_udp_file_create(struct yousj_udp_ep *ep,
+                        struct yousj_file **out);
 long fs_usock_bind(struct yousj_file *f, const char *path);
 long fs_usock_listen(struct yousj_file *f, long backlog);
 long fs_usock_connect(struct yousj_file *f, const char *path);

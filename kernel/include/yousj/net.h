@@ -31,6 +31,32 @@ void net_arp_request(uint32_t who);
  * request. Returns 0 when the request went out. */
 long net_ping(uint32_t who);
 
+/* M74: UDP endpoints for the AF_INET datagram socket face.
+ * The endpoint object lives in the net layer; the file layer
+ * holds only this opaque pointer. Addresses are host order.
+ * Error returns are negative Linux errnos. */
+struct yousj_udp_ep;
+#define YOUSJ_UDP_MAX 1400 /* single-datagram payload cap */
+long net_udp_create(struct yousj_udp_ep **out);
+void net_udp_release(struct yousj_udp_ep *ep);
+long net_udp_bind(struct yousj_udp_ep *ep, uint32_t ip,
+                  uint16_t port);
+void net_udp_connect(struct yousj_udp_ep *ep, uint32_t ip,
+                     uint16_t port);
+void net_udp_local(struct yousj_udp_ep *ep, uint32_t *ip,
+                   uint16_t *port);
+bool net_udp_peer(struct yousj_udp_ep *ep, uint32_t *ip,
+                  uint16_t *port);
+long net_udp_send(struct yousj_udp_ep *ep, uint32_t dst_ip,
+                  uint16_t dst_port, const uint8_t *data,
+                  uint32_t len);
+long net_udp_recv_try(struct yousj_udp_ep *ep, uint8_t *dst,
+                      uint64_t cap, bool peek,
+                      uint32_t *real_len_out,
+                      uint32_t *src_ip_out,
+                      uint16_t *src_port_out);
+uint64_t net_udp_dropped(void);
+
 /* Text snapshot for the native netinfo syscall. Returns the
  * number of bytes written (excluding the NUL). */
 uint64_t net_snapshot(char *buf, uint64_t len);

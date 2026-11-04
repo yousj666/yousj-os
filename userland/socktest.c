@@ -247,7 +247,7 @@ static void t_reject(void)
     char buf[4];
 
     r = sys_call3(SYS_socket, 2, SOCK_STREAM, 0);
-    ok = ok && r == -97; /* AF_INET: EAFNOSUPPORT */
+    ok = ok && r == -93; /* INET stream: no TCP yet (M75) */
     if (!ok) { report2("reject", 0, r); return; }
     r = sys_call3(SYS_socket, AF_UNIX, 3, 0);
     ok = ok && r == -93; /* SOCK_RAW: EPROTONOSUPPORT */

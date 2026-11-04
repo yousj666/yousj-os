@@ -1306,9 +1306,36 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   ping 我们、我们 ping
   网关、坏校验和包被丢
   且计数。
-- ⏳ 下一步候选：UDP
-  与 AF_INET 数据报
-  socket 面，然后 TCP；
+- ✅ UDP＋AF_INET 数
+  据报 M74（2026-11-
+  04）：协议层——UDP
+  校验和（伪头）验证与
+  生成、按端口投递、连
+  接过滤、本机回环不走
+  线、无人接收的端口回
+  ICMP 端口不可达；端
+  点由 net 层管理（包
+  队列保边界、记来源），
+  file 只持不透明指针；
+  发送前自动 ARP 解析，
+  首发自动占临时端口。
+  socket 面：socket(2,
+  SOCK_DGRAM)、bind（端
+  口冲突 EADDRINUSE）、
+  connect 默认对端、
+  sendto/recvfrom/send
+  msg/recvmsg/read/
+  write/getsockname/
+  getpeername/poll 就
+  绪全部接通。socktest
+  的 reject 期望随新契
+  约更新（INET 流式回
+  EPROTONOSUPPORT，等
+  M75 的 TCP）。
+- ⏳ 下一步候选：TCP
+  （M75 起：握手/字节
+  流/关闭），然后 AF_
+  INET 流式 socket 面；
   网卡中断与 modern
   virtio 后置；SCM_
   RIGHTS 与抽象地址留

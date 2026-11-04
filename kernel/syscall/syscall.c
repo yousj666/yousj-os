@@ -83,6 +83,16 @@ static long sys_send_dgram(struct yousj_file *f, uint64_t buf,
 static long sys_recv_dgram(struct yousj_file *f, uint64_t buf,
                            uint64_t len, long flags,
                            char *from_out);              /* M70 */
+static long fetch_inet_addr(uint64_t addr_ptr, long addrlen,
+                            uint32_t *ip_out,
+                            uint16_t *port_out);         /* M74 */
+static long sys_send_udp(struct yousj_file *f, uint64_t buf,
+                         uint64_t len, uint32_t dst_ip,
+                         uint16_t dst_port);             /* M74 */
+static long sys_recv_udp(struct yousj_file *f, uint64_t buf,
+                         uint64_t len, long flags,
+                         uint32_t *src_ip_out,
+                         uint16_t *src_port_out);        /* M74 */
 
 /* M69: MSG_* bits (the generic x86-64 values). */
 #define YOUSJ_MSG_PEEK     2
@@ -284,6 +294,13 @@ static long sys_write(long fd, uint64_t buf, uint64_t len)
         return sys_write_pipe(f, buf, len);
     if (f->spair != NULL) /* M67 */
         return sys_write_sock(f, buf, len);
+    if (f->udp_ep != NULL) { /* M74 */
+        uint32_t ip;
+        uint16_t port;
+        if (!net_udp_peer(f->udp_ep, &ip, &port))
+            return -YOUSJ_EDESTADDRREQ;
+        return sys_send_udp(f, buf, len, ip, port);
+    }
     if (f->usock != NULL) /* M68/M70 */
         return f->usock->type == 2
                    ? sys_send_dgram(f, buf, len, 0, NULL)
@@ -1502,6 +1519,8 @@ static long sys_read(long fd, uint64_t buf, uint64_t count)
         return sys_read_pipe(f, buf, count);
     if (f->spair != NULL) /* M67 */
         return sys_read_sock(f, buf, count);
+    if (f->udp_ep != NULL) /* M74 */
+        return sys_recv_udp(f, buf, count, 0, NULL, NULL);
     if (f->usock != NULL) /* M68/M70 */
         return f->usock->type == 2
                    ? sys_recv_dgram(f, buf, count, 0, NULL)
@@ -2828,6 +2847,15 @@ static short fd_ready_file(struct yousj_file *f, long fd,
         return (short)((rev & (POLLERR_K | POLLHUP_K)) |
                        (rev & events));
     }
+    if (f->udp_ep != NULL) { /* M74: same datagram shape */
+        uint32_t real, sip;
+        uint16_t sport;
+        if (net_udp_recv_try(f->udp_ep, NULL, 0, true, &real,
+                             &sip, &sport) != -YOUSJ_EAGAIN)
+            rev |= POLLIN_K;
+        rev |= POLLOUT_K;
+        return (short)(rev & events);
+    }
     if (f->usock != NULL) { /* M68/M70: a listening socket is
                              * readable with a pending
                              * connection; a datagram socket is
@@ -3839,7 +3867,31 @@ static long sys_socket(long domain, long type, long protocol)
     long base = type & ~(0x800L | 0x80000L);
     long rc, fd;
 
-    if (domain != 1) /* AF_UNIX only */
+    if (domain == 2) { /* M74: AF_INET, datagrams only so far */
+        struct yousj_udp_ep *ep;
+
+        if (base != 2 || protocol != 0)
+            return -YOUSJ_EPROTONOSUPPORT; /* TCP: M75 */
+        rc = net_udp_create(&ep);
+        if (rc != 0)
+            return rc;
+        rc = fs_udp_file_create(ep, &f);
+        if (rc != 0) {
+            net_udp_release(ep);
+            return rc;
+        }
+        fd = fd_alloc(me, f);
+        if (fd < 0) {
+            file_put(f);
+            return fd;
+        }
+        if (type & 0x800L)
+            f->flags |= YOUSJ_O_NONBLOCK;
+        if (type & 0x80000L)
+            me->files->fd_cloexec |= (uint16_t)(1u << fd);
+        return fd;
+    }
+    if (domain != 1) /* AF_UNIX */
         return -YOUSJ_EAFNOSUPPORT;
     if ((base != 1 && base != 2) || protocol != 0)
         return -YOUSJ_EPROTONOSUPPORT; /* STREAM or DGRAM */
@@ -3867,6 +3919,14 @@ static long sys_bind(long fd, uint64_t addr_ptr, long addrlen)
 
     if (f == NULL)
         return -YOUSJ_EBADF;
+    if (f->udp_ep != NULL) { /* M74 */
+        uint32_t ip;
+        uint16_t port;
+        rc = fetch_inet_addr(addr_ptr, addrlen, &ip, &port);
+        if (rc != 0)
+            return rc;
+        return net_udp_bind(f->udp_ep, ip, port);
+    }
     if (f->usock == NULL)
         return -YOUSJ_ENOTSOCK;
     rc = sock_resolve(me, addr_ptr, addrlen, resolved);
@@ -3897,6 +3957,15 @@ static long sys_connect(long fd, uint64_t addr_ptr, long addrlen)
 
     if (f == NULL)
         return -YOUSJ_EBADF;
+    if (f->udp_ep != NULL) { /* M74: set the default peer */
+        uint32_t ip;
+        uint16_t port;
+        rc = fetch_inet_addr(addr_ptr, addrlen, &ip, &port);
+        if (rc != 0)
+            return rc;
+        net_udp_connect(f->udp_ep, ip, port);
+        return 0;
+    }
     if (f->spair != NULL)
         return -YOUSJ_EISCONN;
     if (f->usock == NULL)
@@ -4109,6 +4178,126 @@ static long sys_recv_dgram(struct yousj_file *f, uint64_t buf,
     return (flags & YOUSJ_MSG_TRUNC) != 0 ? (long)real : rc;
 }
 
+/* --- M74: AF_INET address handling --------------------------
+ * sockaddr_in: family(2, host order), port(2, network
+ * order), address(4, network order), padding(8). */
+
+static long fetch_inet_addr(uint64_t addr_ptr, long addrlen,
+                            uint32_t *ip_out, uint16_t *port_out)
+{
+    const uint8_t *a;
+    uint16_t fam;
+
+    if (addr_ptr == 0 || addrlen < 16)
+        return -YOUSJ_EINVAL;
+    if (!user_range_ok(addr_ptr, 16))
+        return -YOUSJ_EFAULT;
+    a = (const uint8_t *)(uintptr_t)addr_ptr;
+    fam = (uint16_t)(a[0] | (a[1] << 8));
+    if (fam != 2) /* AF_INET */
+        return -YOUSJ_EAFNOSUPPORT;
+    *port_out = (uint16_t)(((uint16_t)a[2] << 8) | a[3]);
+    *ip_out = ((uint32_t)a[4] << 24) | ((uint32_t)a[5] << 16) |
+              ((uint32_t)a[6] << 8) | (uint32_t)a[7];
+    return 0;
+}
+
+static long put_sockaddr_in(uint64_t addr_ptr,
+                            uint64_t addrlen_ptr, uint32_t ip,
+                            uint16_t port)
+{
+    uint32_t cap, n, i;
+    uint8_t *dst;
+
+    if (addr_ptr == 0 || addrlen_ptr == 0)
+        return 0;
+    if (!user_range_ok(addrlen_ptr, 4) ||
+        !user_range_ok(addr_ptr, 2))
+        return -YOUSJ_EFAULT;
+    cap = *(uint32_t *)(uintptr_t)addrlen_ptr;
+    n = cap < 16 ? cap : 16;
+    if (n > 0 && !user_range_ok(addr_ptr, n))
+        return -YOUSJ_EFAULT;
+    dst = (uint8_t *)(uintptr_t)addr_ptr;
+    {
+        uint8_t full[16];
+        mem_fill(full, 0, sizeof(full));
+        full[0] = 2;
+        full[1] = 0;
+        full[2] = (uint8_t)(port >> 8);
+        full[3] = (uint8_t)port;
+        full[4] = (uint8_t)(ip >> 24);
+        full[5] = (uint8_t)(ip >> 16);
+        full[6] = (uint8_t)(ip >> 8);
+        full[7] = (uint8_t)ip;
+        for (i = 0; i < n; i++)
+            dst[i] = full[i];
+    }
+    *(uint32_t *)(uintptr_t)addrlen_ptr = 16;
+    return 0;
+}
+
+/* M74: INET datagram cores. The payload is staged on the
+ * stack as with the unix datagram core (blocking sends may
+ * sleep in ARP resolution while another task runs). */
+static long sys_send_udp(struct yousj_file *f, uint64_t buf,
+                         uint64_t len, uint32_t dst_ip,
+                         uint16_t dst_port)
+{
+    uint8_t kbuf[YOUSJ_UDP_MAX];
+    uint64_t i;
+
+    if (len > YOUSJ_UDP_MAX)
+        return -YOUSJ_EMSGSIZE;
+    if (!user_range_ok(buf, len))
+        return -YOUSJ_EFAULT;
+    for (i = 0; i < len; i++)
+        kbuf[i] = ((const uint8_t *)(uintptr_t)buf)[i];
+    return net_udp_send(f->udp_ep, dst_ip, dst_port, kbuf,
+                        (uint32_t)len);
+}
+
+static long sys_recv_udp(struct yousj_file *f, uint64_t buf,
+                         uint64_t len, long flags,
+                         uint32_t *src_ip_out,
+                         uint16_t *src_port_out)
+{
+    struct task *me = sched_current();
+    uint8_t kbuf[YOUSJ_UDP_MAX];
+    bool dontwait = (f->flags & YOUSJ_O_NONBLOCK) != 0 ||
+                    (flags & YOUSJ_MSG_DONTWAIT) != 0;
+    uint32_t real = 0, sip = 0;
+    uint16_t sport = 0;
+    uint64_t i;
+    long rc;
+
+    if (len > 0 && !user_range_ok(buf, len))
+        return -YOUSJ_EFAULT;
+    for (;;) {
+        rc = net_udp_recv_try(f->udp_ep, kbuf, len,
+                              (flags & YOUSJ_MSG_PEEK) != 0,
+                              &real, &sip, &sport);
+        if (rc != -YOUSJ_EAGAIN)
+            break;
+        if (dontwait)
+            return -YOUSJ_EAGAIN;
+        if (signal_deliverable_pending(me)) {
+            me->sig_wake = false;
+            return -YOUSJ_ERESTARTSYS;
+        }
+        sched_sleep_ticks(2);
+    }
+    if (rc < 0)
+        return rc;
+    for (i = 0; i < (uint64_t)rc; i++)
+        ((uint8_t *)(uintptr_t)buf)[i] = kbuf[i];
+    if (src_ip_out != NULL) {
+        *src_ip_out = sip;
+        *src_port_out = sport;
+    }
+    return (flags & YOUSJ_MSG_TRUNC) != 0 ? (long)real : rc;
+}
+
 static long sys_sendto(long fd, uint64_t buf, uint64_t len,
                        long flags, uint64_t addr_ptr,
                        long addrlen)
@@ -4118,6 +4307,18 @@ static long sys_sendto(long fd, uint64_t buf, uint64_t len,
 
     if (f == NULL)
         return -YOUSJ_EBADF;
+    if (f->udp_ep != NULL) { /* M74 */
+        uint32_t ip;
+        uint16_t port;
+        if (addr_ptr != 0) {
+            long rc = fetch_inet_addr(addr_ptr, addrlen, &ip,
+                                       &port);
+            if (rc != 0)
+                return rc;
+        } else if (!net_udp_peer(f->udp_ep, &ip, &port))
+            return -YOUSJ_EDESTADDRREQ;
+        return sys_send_udp(f, buf, len, ip, port);
+    }
     if (f->usock != NULL) {
         if (f->usock->type != 2)
             return -YOUSJ_ENOTCONN; /* a stream endpoint */
@@ -4146,6 +4347,14 @@ static long sys_recvfrom(long fd, uint64_t buf, uint64_t len,
 
     if (f == NULL)
         return -YOUSJ_EBADF;
+    if (f->udp_ep != NULL) { /* M74 */
+        uint32_t sip;
+        uint16_t sport;
+        rc = sys_recv_udp(f, buf, len, flags, &sip, &sport);
+        if (rc >= 0)
+            put_sockaddr_in(addr_ptr, addrlen_ptr, sip, sport);
+        return rc;
+    }
     if (f->usock != NULL) {
         char from[108];
         if (f->usock->type != 2)
@@ -4174,6 +4383,31 @@ static long sys_sendmsg(long fd, uint64_t msg_ptr)
 
     if (f == NULL)
         return -YOUSJ_EBADF;
+    if (f->udp_ep != NULL) { /* M74: same single-packet shape */
+        uint32_t ip;
+        uint16_t port;
+        long rc;
+
+        if (!user_range_ok(msg_ptr, sizeof(struct msghdr_k)))
+            return -YOUSJ_EFAULT;
+        mh = (const struct msghdr_k *)(uintptr_t)msg_ptr;
+        if (mh->controllen != 0 || mh->iovlen != 1)
+            return -YOUSJ_EINVAL;
+        if (!user_range_ok(mh->iov, sizeof(struct yousj_iovec)))
+            return -YOUSJ_EFAULT;
+        if (mh->name != 0) {
+            rc = fetch_inet_addr(mh->name, mh->namelen, &ip,
+                                 &port);
+            if (rc != 0)
+                return rc;
+        } else if (!net_udp_peer(f->udp_ep, &ip, &port))
+            return -YOUSJ_EDESTADDRREQ;
+        {
+            const struct yousj_iovec *kv =
+                (const struct yousj_iovec *)(uintptr_t)mh->iov;
+            return sys_send_udp(f, kv->base, kv->len, ip, port);
+        }
+    }
     if (f->usock != NULL && f->usock->type != 2)
         return -YOUSJ_ENOTCONN;
     if (f->usock == NULL && f->spair == NULL)
@@ -4254,6 +4488,33 @@ static long sys_recvmsg(long fd, uint64_t msg_ptr)
 
     if (f == NULL)
         return -YOUSJ_EBADF;
+    if (f->udp_ep != NULL) { /* M74 */
+        uint32_t sip;
+        uint16_t sport;
+        long rc;
+
+        if (!user_range_ok(msg_ptr, sizeof(struct msghdr_k)))
+            return -YOUSJ_EFAULT;
+        mh = (struct msghdr_k *)(uintptr_t)msg_ptr;
+        if (mh->iovlen < 1)
+            return -YOUSJ_EINVAL;
+        if (!user_range_ok(mh->iov, sizeof(struct yousj_iovec)))
+            return -YOUSJ_EFAULT;
+        {
+            const struct yousj_iovec *kv =
+                (const struct yousj_iovec *)(uintptr_t)mh->iov;
+            rc = sys_recv_udp(f, kv->base, kv->len, mh->flags,
+                              &sip, &sport);
+        }
+        if (rc >= 0) {
+            if (mh->name != 0)
+                put_sockaddr_in(mh->name, msg_ptr + 8, sip,
+                                sport);
+            mh->flags = 0;
+            mh->controllen = 0;
+        }
+        return rc;
+    }
     if (f->usock != NULL && f->usock->type != 2)
         return -YOUSJ_ENOTCONN;
     if (f->usock == NULL && f->spair == NULL)
@@ -4337,6 +4598,17 @@ static long sys_getname(long fd, uint64_t addr_ptr,
 
     if (f == NULL)
         return -YOUSJ_EBADF;
+    if (f->udp_ep != NULL) { /* M74 */
+        uint32_t ip;
+        uint16_t port;
+
+        if (peer) {
+            if (!net_udp_peer(f->udp_ep, &ip, &port))
+                return -YOUSJ_ENOTCONN;
+        } else
+            net_udp_local(f->udp_ep, &ip, &port);
+        return put_sockaddr_in(addr_ptr, addrlen_ptr, ip, port);
+    }
     if (f->spair == NULL && f->usock == NULL)
         return -YOUSJ_ENOTSOCK;
     if (peer && f->usock != NULL && f->usock->type == 2) {
@@ -4407,7 +4679,8 @@ static int so_bit_for(long optname)
 
 static bool file_is_socket(struct yousj_file *f)
 {
-    return f->spair != NULL || f->usock != NULL;
+    return f->spair != NULL || f->usock != NULL ||
+           f->udp_ep != NULL; /* M74 */
 }
 
 static long sys_setsockopt(long fd, long level, long optname,
@@ -4469,7 +4742,9 @@ static long sys_getsockopt(long fd, long level, long optname,
         return -YOUSJ_ENOPROTOOPT;
     bit = so_bit_for(optname);
     if (optname == YOUSJ_SO_TYPE)
-        val = f->usock != NULL ? f->usock->type : 1;
+        val = f->udp_ep != NULL
+                  ? 2
+                  : (f->usock != NULL ? f->usock->type : 1);
     else if (optname == YOUSJ_SO_ERROR)
         val = 0; /* no pending error is ever recorded */
     else if (optname == YOUSJ_SO_RCVBUF)
@@ -4500,6 +4775,13 @@ static long sys_shutdown(long fd, long how)
 
     if (f == NULL)
         return -YOUSJ_EBADF;
+    if (f->udp_ep != NULL) { /* M74: accepted, a ledger no-op
+                              * beyond direction bits we do
+                              * not model for datagrams */
+        if (how < 0 || how > 2)
+            return -YOUSJ_EINVAL;
+        return 0;
+    }
     if (f->spair == NULL)
         return f->usock != NULL ? -YOUSJ_ENOTCONN
                                 : -YOUSJ_ENOTSOCK;

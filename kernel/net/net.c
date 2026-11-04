@@ -201,6 +201,9 @@ static bool ip_send(uint8_t *f, uint32_t dst_ip, uint8_t proto,
 }
 
 #define PROTO_ICMP 1
+#define PROTO_UDP 17
+static void udp_input(const uint8_t *frame, const uint8_t *ip,
+                      uint32_t ip_tot); /* M74, below */
 static uint8_t g_icmp_out[1600];
 
 static void icmp_input(const uint8_t *frame, const uint8_t *ip,
@@ -252,8 +255,10 @@ static void ip_input(const uint8_t *frame, uint32_t len)
     g_ip_rx++;
     if (ip[9] == PROTO_ICMP)
         icmp_input(frame, ip, tot);
+    else if (ip[9] == 17 /* UDP */)
+        udp_input(frame, ip, tot);
     else
-        g_dropped++; /* UDP/TCP: later milestones */
+        g_dropped++; /* TCP: a later milestone */
 }
 
 static void net_input(const uint8_t *frame, uint32_t len)
@@ -386,6 +391,327 @@ long net_ping(uint32_t who)
     return 0;
 }
 
+/* ------------------------------------------------------------------ */
+/* M74: UDP. An endpoint owns a packet queue (boundaries kept,
+ * sender recorded), indexed in a small registry for delivery.
+ * Sending resolves the neighbour (ARP waits as in ping),
+ * loopback addresses are delivered internally without the
+ * wire, and a packet for a port nobody bound earns an ICMP
+ * port-unreachable, like a real stack. */
+
+#define UDP_EP_MAX 8
+#define UDP_QUEUE 8
+#define UDP_MAX YOUSJ_UDP_MAX
+
+struct udp_pkt {
+    uint32_t len;
+    uint32_t src_ip;
+    uint16_t src_port;
+    uint8_t data[UDP_MAX];
+};
+
+struct yousj_udp_ep {
+    bool in_use;
+    uint32_t local_ip;   /* 0 = any local address */
+    uint16_t local_port; /* 0 = unbound */
+    uint32_t peer_ip;
+    uint16_t peer_port;
+    bool connected;
+    struct udp_pkt rxq[UDP_QUEUE];
+    int rx_head;
+    int rx_count;
+};
+
+static struct yousj_udp_ep g_udp_eps[UDP_EP_MAX];
+static uint16_t g_eph_port = 49152;
+static uint64_t g_udp_dropped, g_udp_rx, g_udp_tx;
+static uint8_t g_udp_seg[12 + 8 + UDP_MAX]; /* pseudo + segment */
+static uint8_t g_udp_verify[12 + 1600];
+
+#define N_EADDRINUSE 98
+#define N_EADDRNOTAVAIL 99
+#define N_EMSGSIZE 90
+#define N_EHOSTUNREACH 113
+#define N_ENFILE 23
+
+long net_udp_create(struct yousj_udp_ep **out)
+{
+    int i;
+
+    for (i = 0; i < UDP_EP_MAX; i++) {
+        if (!g_udp_eps[i].in_use) {
+            mem_set((uint8_t *)&g_udp_eps[i], 0,
+                    sizeof(g_udp_eps[i]));
+            g_udp_eps[i].in_use = true;
+            *out = &g_udp_eps[i];
+            return 0;
+        }
+    }
+    return -N_ENFILE;
+}
+
+void net_udp_release(struct yousj_udp_ep *ep)
+{
+    ep->in_use = false;
+    ep->local_port = 0;
+    ep->rx_count = 0;
+    ep->rx_head = 0;
+    ep->connected = false;
+}
+
+static bool port_taken(uint16_t port, struct yousj_udp_ep *self)
+{
+    int i;
+
+    for (i = 0; i < UDP_EP_MAX; i++)
+        if (g_udp_eps[i].in_use && &g_udp_eps[i] != self &&
+            g_udp_eps[i].local_port == port)
+            return true;
+    return false;
+}
+
+long net_udp_bind(struct yousj_udp_ep *ep, uint32_t ip,
+                  uint16_t port)
+{
+    if (ip != 0 && ip != OUR_IP && ip != 0x7F000001u)
+        return -N_EADDRNOTAVAIL;
+    if (port != 0 && port_taken(port, ep))
+        return -N_EADDRINUSE;
+    ep->local_ip = ip;
+    ep->local_port = port;
+    return 0;
+}
+
+void net_udp_connect(struct yousj_udp_ep *ep, uint32_t ip,
+                     uint16_t port)
+{
+    ep->peer_ip = ip;
+    ep->peer_port = port;
+    ep->connected = true;
+}
+
+void net_udp_local(struct yousj_udp_ep *ep, uint32_t *ip,
+                   uint16_t *port)
+{
+    *ip = ep->local_ip != 0 ? ep->local_ip : OUR_IP;
+    *port = ep->local_port;
+}
+
+bool net_udp_peer(struct yousj_udp_ep *ep, uint32_t *ip,
+                  uint16_t *port)
+{
+    if (!ep->connected)
+        return false;
+    *ip = ep->peer_ip;
+    *port = ep->peer_port;
+    return true;
+}
+
+uint64_t net_udp_dropped(void)
+{
+    return g_udp_dropped;
+}
+
+/* Resolve a neighbour, ARP-begging on ticks as ping does. */
+static bool resolve_wait(uint32_t onward)
+{
+    int tries;
+
+    if (neigh_lookup(onward) != NULL)
+        return true;
+    for (tries = 0; tries < 20; tries++) {
+        arp_send(g_frame_out2, 1, NULL, onward);
+        sched_sleep_ticks(5);
+        if (neigh_lookup(onward) != NULL)
+            return true;
+    }
+    return false;
+}
+
+static void udp_deliver(struct yousj_udp_ep *ep, uint32_t src_ip,
+                        uint16_t src_port, const uint8_t *data,
+                        uint32_t len)
+{
+    struct udp_pkt *p;
+
+    if (ep->connected && (ep->peer_ip != src_ip ||
+                          ep->peer_port != src_port))
+        return; /* the connected filter */
+    if (ep->rx_count >= UDP_QUEUE) {
+        g_udp_dropped++;
+        return;
+    }
+    p = &ep->rxq[(ep->rx_head + ep->rx_count) % UDP_QUEUE];
+    p->len = len;
+    p->src_ip = src_ip;
+    p->src_port = src_port;
+    mem_copy(p->data, data, len);
+    ep->rx_count++;
+    g_udp_rx++;
+}
+
+static struct yousj_udp_ep *udp_find(uint32_t dst_ip,
+                                     uint16_t dst_port)
+{
+    int i;
+
+    for (i = 0; i < UDP_EP_MAX; i++) {
+        struct yousj_udp_ep *ep = &g_udp_eps[i];
+        if (!ep->in_use || ep->local_port != dst_port)
+            continue;
+        if (ep->local_ip == 0 || ep->local_ip == dst_ip ||
+            dst_ip == 0x0A0002FFu || dst_ip == 0xFFFFFFFFu ||
+            dst_ip == 0x7F000001u)
+            return ep;
+    }
+    return NULL;
+}
+
+/* ICMP type 3 code 3 for a packet with no home. The reply
+ * quotes the offending IP header + 8 bytes, as required. */
+static void icmp_unreachable(const uint8_t *frame,
+                             const uint8_t *ip, uint32_t ip_tot)
+{
+    uint8_t out[8 + 20 + 8];
+    uint32_t src = rd32(ip + 12);
+    uint32_t q = ip_tot < 28 ? ip_tot : 28;
+
+    mem_set(out, 0, sizeof(out));
+    out[0] = 3;
+    out[1] = 3;
+    mem_copy(out + 8, ip, q);
+    wr16(out + 2, csum16(out, 8 + q));
+    ip_send_to_mac(g_frame_out, frame + 6, src, PROTO_ICMP, out,
+                   8 + q);
+}
+
+static void udp_input(const uint8_t *frame, const uint8_t *ip,
+                      uint32_t ip_tot)
+{
+    const uint8_t *u = ip + 20;
+    uint32_t src = rd32(ip + 12), dst = rd32(ip + 16);
+    uint16_t sport, dport, ulen;
+    struct yousj_udp_ep *ep;
+
+    if (ip_tot < 28) {
+        g_dropped++;
+        return;
+    }
+    ulen = rd16(u + 4);
+    if (ulen < 8 || 20u + ulen > ip_tot) {
+        g_dropped++;
+        return;
+    }
+    if (rd16(u + 6) != 0) {
+        /* Verify against the pseudo-header. */
+        uint8_t *v = g_udp_verify;
+        wr32(v, src);
+        wr32(v + 4, dst);
+        v[8] = 0;
+        v[9] = PROTO_UDP;
+        wr16(v + 10, ulen);
+        mem_copy(v + 12, u, ulen);
+        if (csum16(v, 12 + ulen) != 0) {
+            g_dropped++;
+            return;
+        }
+    }
+    sport = rd16(u);
+    dport = rd16(u + 2);
+    ep = udp_find(dst, dport);
+    if (ep == NULL) {
+        if (dst == OUR_IP) /* no ICMP for broadcasts */
+            icmp_unreachable(frame, ip, ip_tot);
+        g_udp_dropped++;
+        return;
+    }
+    udp_deliver(ep, src, sport, u + 8, (uint32_t)(ulen - 8));
+}
+
+long net_udp_send(struct yousj_udp_ep *ep, uint32_t dst_ip,
+                  uint16_t dst_port, const uint8_t *data,
+                  uint32_t len)
+{
+    uint32_t src_ip;
+    uint16_t ulen;
+    uint8_t *seg = g_udp_seg + 12; /* UDP header starts here */
+
+    if (len > UDP_MAX)
+        return -N_EMSGSIZE;
+    if (ep->local_port == 0) {
+        /* First send binds an ephemeral port, as usual. */
+        uint16_t p = g_eph_port;
+        while (port_taken(p, ep))
+            p = (uint16_t)(p + 1);
+        g_eph_port = (uint16_t)(p + 1);
+        ep->local_port = p;
+    }
+    src_ip = ep->local_ip != 0 && ep->local_ip != 0x7F000001u
+                 ? ep->local_ip
+                 : OUR_IP;
+    ulen = (uint16_t)(8 + len);
+    wr16(seg, ep->local_port);
+    wr16(seg + 2, dst_port);
+    wr16(seg + 4, ulen);
+    wr16(seg + 6, 0);
+    mem_copy(seg + 8, data, len);
+    /* Pseudo-header sits in front of the segment. */
+    wr32(g_udp_seg, src_ip);
+    wr32(g_udp_seg + 4, dst_ip);
+    g_udp_seg[8] = 0;
+    g_udp_seg[9] = PROTO_UDP;
+    wr16(g_udp_seg + 10, ulen);
+    wr16(seg + 6, csum16(g_udp_seg, 12 + ulen));
+
+    if (dst_ip == OUR_IP || dst_ip == 0x7F000001u) {
+        struct yousj_udp_ep *dst_ep = udp_find(dst_ip, dst_port);
+        if (dst_ep != NULL)
+            udp_deliver(dst_ep, src_ip, ep->local_port, data,
+                        len);
+        else
+            g_udp_dropped++;
+        g_udp_tx++;
+        return (long)len;
+    }
+    {
+        uint32_t onward = (dst_ip & 0xFFFFFF00u) ==
+                                  (OUR_IP & 0xFFFFFF00u)
+                              ? dst_ip
+                              : OUR_GATEWAY;
+        if (!resolve_wait(onward))
+            return -N_EHOSTUNREACH;
+    }
+    if (!ip_send(g_frame_out2, dst_ip, PROTO_UDP, seg, ulen))
+        return -N_EHOSTUNREACH;
+    g_udp_tx++;
+    return (long)len;
+}
+
+long net_udp_recv_try(struct yousj_udp_ep *ep, uint8_t *dst,
+                      uint64_t cap, bool peek,
+                      uint32_t *real_len_out,
+                      uint32_t *src_ip_out,
+                      uint16_t *src_port_out)
+{
+    struct udp_pkt *p;
+    uint64_t n, i;
+
+    if (ep->rx_count == 0)
+        return -11; /* EAGAIN */
+    p = &ep->rxq[ep->rx_head];
+    *real_len_out = p->len;
+    *src_ip_out = p->src_ip;
+    *src_port_out = p->src_port;
+    n = cap < p->len ? cap : p->len;
+    for (i = 0; i < n; i++)
+        dst[i] = p->data[i];
+    if (!peek) {
+        ep->rx_head = (ep->rx_head + 1) % UDP_QUEUE;
+        ep->rx_count--;
+    }
+    return (long)n;
+}
+
 /* -- the snapshot: deliberately textual, like ps ------------ */
 
 static uint64_t snap_puts(char *buf, uint64_t len, uint64_t at,
@@ -463,6 +789,12 @@ uint64_t net_snapshot(char *buf, uint64_t len)
     at = snap_put_u64(buf, len, at, g_ping_sent);
     at = snap_puts(buf, len, at, " ping_replied=");
     at = snap_put_u64(buf, len, at, g_ping_replied);
+    at = snap_puts(buf, len, at, " udp_rx=");
+    at = snap_put_u64(buf, len, at, g_udp_rx);
+    at = snap_puts(buf, len, at, " udp_tx=");
+    at = snap_put_u64(buf, len, at, g_udp_tx);
+    at = snap_puts(buf, len, at, " udp_dropped=");
+    at = snap_put_u64(buf, len, at, g_udp_dropped);
     at = snap_puts(buf, len, at, "\n");
     if (at < len)
         buf[at] = '\0';

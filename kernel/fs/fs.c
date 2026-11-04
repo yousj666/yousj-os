@@ -17,6 +17,7 @@
 #include <yousj/vmm.h> /* errno magnitudes + phys_to_virt */
 #include <yousj/user.h> /* M39: user window constants for maps */
 #include <yousj/signal.h> /* M48: blocking inotify reads */
+#include <yousj/net.h> /* M74: UDP endpoint release */
 #include <drivers/serial.h> /* M49: /dev/console I/O */
 
 #define YOUSJ_EBADF   9
@@ -600,6 +601,11 @@ void file_put(struct yousj_file *f)
             usock_release(f);
             f->usock = NULL;
         }
+        if (f->udp_ep != NULL) {
+            /* M74: same rule for INET datagram endpoints. */
+            net_udp_release(f->udp_ep);
+            f->udp_ep = NULL;
+        }
         if (f->node != NULL) {
             node_ref_dec(f->node);
             f->node = NULL;
@@ -884,6 +890,19 @@ long fs_usock_create(struct yousj_file **out, int type)
     u->state = 0;
     u->type = (uint8_t)type;
     f->usock = u;
+    f->flags = YOUSJ_O_RDWR;
+    *out = f;
+    return 0;
+}
+
+long fs_udp_file_create(struct yousj_udp_ep *ep,
+                        struct yousj_file **out)
+{
+    struct yousj_file *f = file_alloc();
+
+    if (f == NULL)
+        return -YOUSJ_ENFILE;
+    f->udp_ep = ep;
     f->flags = YOUSJ_O_RDWR;
     *out = f;
     return 0;
@@ -3509,7 +3528,8 @@ bool fs_file_stat(struct yousj_file *f,
         info->ino = 0;
         return true;
     }
-    if (f->spair != NULL || f->usock != NULL) { /* M67/M68 */
+    if (f->spair != NULL || f->usock != NULL ||
+        f->udp_ep != NULL) { /* M67/M68/M74 */
         info->mode = 0140000u | 0666u; /* S_IFSOCK */
         info->mtime = 0;
         info->atime = 0;
