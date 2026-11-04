@@ -55,22 +55,34 @@ static uint32_t g_head, g_tail; /* head = write, tail = read */
 static int g_inited;
 static int g_shift, g_caps, g_ctrl, g_e0;
 
+static void ring_push_raw(uint8_t c)
+{
+    uint32_t next = (g_head + 1) & 127;
+    if (next == g_tail)
+        return; /* full: drop */
+    g_ring[g_head] = c;
+    g_head = next;
+}
+
 static void ring_push(uint8_t c)
 {
     /* M88: while a user window holds keyboard focus, decoded
      * bytes go to its queue instead of the console ring --
      * the two never share a keystroke. */
     int target = wm_key_target();
-    uint32_t next;
     if (target >= 0) {
         wm_key_push(target, c);
         return;
     }
-    next = (g_head + 1) & 127;
-    if (next == g_tail)
-        return; /* full: drop */
-    g_ring[g_head] = c;
-    g_head = next;
+    ring_push_raw(c);
+}
+
+void ps2kbd_inject(const char *s)
+{
+    while (*s != '\0') {
+        ring_push_raw((uint8_t)*s);
+        s++;
+    }
 }
 
 static void decode(uint8_t code)

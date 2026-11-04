@@ -28,4 +28,10 @@ int ps2kbd_ready(void);
  * mouse driver). Called per timer tick by input_poll (M84). */
 void ps2_poll(void);
 
+/* M89: inject bytes straight into the console ring, as if
+ * typed (the start menu's Terminal entry types `gterm` for
+ * the user). Bypasses window focus routing on purpose: the
+ * command belongs to the console shell. */
+void ps2kbd_inject(const char *s);
+
 #endif /* YOUSJ_PS2KBD_H */

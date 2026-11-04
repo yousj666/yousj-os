@@ -426,7 +426,7 @@ def main():
         w2, h2, body = dump(os.path.join(ROOT, "build", "fb_d1.ppm"))
         check("start menu opened",
               close(px(body, w, 200, 2000), (0x24, 0x46, 0x6B)))
-        goto(100, 1984, (56, 2028))
+        goto(100, 1946, (56, 2028))
         mon_cmd("mouse_button 1", 0.5)
         mon_cmd("mouse_button 0", 0.4)
         w2, h2, body = dump(os.path.join(ROOT, "build", "fb_d2.ppm"))
@@ -483,7 +483,7 @@ def main():
         save_png(os.path.join(ROOT, "build", "fb_term.png"),
                  w, h, body)
 
-        goto(1166, 310, (100, 1984))
+        goto(1166, 310, (100, 1946))
         mon_cmd("mouse_button 1", 0.5)
         mon_cmd("mouse_button 0", 0.4)
         time.sleep(1.5)
@@ -501,6 +501,47 @@ def main():
               back_ok)
         if not back_ok:
             print("serial tail:", repr(ser.text()[-600:]))
+
+        # --- M89: the start menu launches a terminal --------
+        # Open the menu, click "Terminal": the kernel types
+        # `gterm` into the console ring and the shell runs it.
+        goto(56, 2028, (1166, 310))
+        mon_cmd("mouse_button 1", 0.5)
+        mon_cmd("mouse_button 0", 0.4)
+        w2, h2, body = dump(os.path.join(ROOT, "build",
+                                         "fb_m1.ppm"))
+        check("start menu opened (two entries)",
+              close(px(body, w, 200, 2000), (0x24, 0x46, 0x6B)))
+        goto(100, 1988, (56, 2028))
+        mon_cmd("mouse_button 1", 0.5)
+        mon_cmd("mouse_button 0", 0.4)
+        time.sleep(2.5)
+        w2, h2, body = dump(os.path.join(ROOT, "build",
+                                         "fb_m2.ppm"))
+        check("menu Terminal entry opened a terminal window",
+              close(px(body, w, 500, 310), (0x2E, 0x5E, 0x8C)))
+        check("taskbar chip names the menu-launched terminal",
+              close(px(body, w, 150, 2028), (0x24, 0x46, 0x6B)))
+        save_png(os.path.join(ROOT, "build", "fb_menu.png"),
+                 w, h, body)
+        goto(1166, 310, (100, 1988))
+        mon_cmd("mouse_button 1", 0.5)
+        mon_cmd("mouse_button 0", 0.4)
+        time.sleep(1.5)
+        w2, h2, body = dump(os.path.join(ROOT, "build",
+                                         "fb_m3.ppm"))
+        check("menu-launched terminal closed by its red box",
+              not close(px(body, w, 1100, 800),
+                        (0x24, 0x46, 0x6B)))
+        for key in ("e", "c", "h", "o", "spc", "shift-m",
+                    "shift-e", "shift-n", "shift-u", "8", "9"):
+            sendkey(key)
+        sendkey("ret")
+        menu_ok = ser.until("MENU89", 30)
+        check("console shell live after menu launch (MENU89)",
+              menu_ok)
+        if not menu_ok:
+            print("serial tail:", repr(ser.text()[-400:]))
     finally:
         qemu.terminate()
         try:

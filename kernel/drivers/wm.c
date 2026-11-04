@@ -15,6 +15,7 @@
 #include <yousj/types.h>
 #include <yousj/wm.h>
 #include <yousj/fb.h>
+#include <yousj/ps2kbd.h> /* M89: the menu's Terminal entry */
 
 #define WIN_W 560u
 #define WIN_H 340u
@@ -40,7 +41,8 @@
 #define CHIP_X     116u
 #define CHIP_W     170u
 #define MENU_W     220u
-#define MENU_H     48u
+#define MENU_H     84u /* M89: two entries since the menu
+                          grew a Terminal launcher */
 
 /* --- the demonstration window (M85) ---------------------- */
 static struct {
@@ -127,7 +129,9 @@ static void menu_draw(void)
     fb_fill_rect(8, my + MENU_H - 1, MENU_W, 1, COL_BORDER);
     fb_fill_rect(8, my, 1, MENU_H, COL_BORDER);
     fb_fill_rect(8 + MENU_W - 1, my, 1, MENU_H, COL_BORDER);
-    fb_draw_text(24, my + 16, "Open the window", COL_TEXT,
+    fb_draw_text(24, my + 14, "Open the window", COL_TEXT,
+                 COL_BODY, 1);
+    fb_draw_text(24, my + 48, "Terminal", COL_TEXT,
                  COL_BODY, 1);
 }
 
@@ -304,6 +308,16 @@ int wm_gui_open(int owner, const char *title, uint32_t w,
     }
     if (u == NULL)
         return -28; /* ENOSPC */
+    {
+        /* With no user window standing, the cascade starts
+         * over -- a fresh desktop corner for a fresh open. */
+        int i2, any = 0;
+        for (i2 = 0; i2 < MAXUWIN; i2++)
+            if (g_uw[i2].in_use)
+                any = 1;
+        if (!any)
+            g_cascade = 0;
+    }
     if (w < 240)
         w = 240;
     if (w > fb_width())
@@ -542,8 +556,16 @@ void wm_mouse(uint32_t mx, uint32_t my, int buttons)
                 my < myy + MENU_H) {
                 g_win.menu_open = 0;
                 menu_erase();
-                if (!g_win.open)
-                    window_open();
+                if (my < myy + 42) {
+                    /* entry 0: reopen the demo window */
+                    if (!g_win.open)
+                        window_open();
+                } else {
+                    /* entry 1 (M89): launch a terminal --
+                     * type the command into the console
+                     * ring; the shell does the rest. */
+                    ps2kbd_inject("gterm\n");
+                }
                 consumed = 1;
             } else if (!on_button) {
                 g_win.menu_open = 0;
