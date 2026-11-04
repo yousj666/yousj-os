@@ -150,6 +150,12 @@ irq0_stub:
     push %r10
     push %r11
     call irq0_handler
+    /* M79: the return path below is shared with the generic
+     * IRQ stubs (irq_stub_1..15): they enter with the same
+     * register state irq0_stub has at this point (9 saved
+     * registers above the hardware frame) and jump here
+     * after calling irq_dispatch(). */
+irq_return:
     /* Canonicalize a ring-3 frame's selectors before iretq.
      * QEMU's sysret derives CS/SS from the wrong STAR field,
      * so a task resumed from a syscall runs in ring 3 with
@@ -231,7 +237,59 @@ irq0_stub:
 9:
     iretq
 
+    /* Generic IRQ stubs (M79): one per PIC line 1..15.
+     * Entry mirrors irq0_stub exactly (GS discipline, the
+     * same 9 caller-saved registers), the line number goes
+     * to irq_dispatch() in %edi, and the shared irq_return
+     * above handles canonicalization, the signal gate and
+     * the iretq. Devices register through irq_register();
+     * until then every line stays masked in the PIC. */
+    .macro IRQ_STUB n
+    .globl irq_stub_\n
+irq_stub_\n:
+    testb $3, 8(%rsp)
+    jz 9f
+    swapgs
+9:
+    push %rax
+    push %rcx
+    push %rdx
+    push %rsi
+    push %rdi
+    push %r8
+    push %r9
+    push %r10
+    push %r11
+    mov $\n, %edi
+    call irq_dispatch
+    jmp irq_return
+    .endm
+
+    .set i, 1
+    .rept 15
+    IRQ_STUB %i
+    .set i, i+1
+    .endr
+
     .section .rodata
+    .globl irq_stub_table
+irq_stub_table:
+    .quad irq0_stub
+    .quad irq_stub_1
+    .quad irq_stub_2
+    .quad irq_stub_3
+    .quad irq_stub_4
+    .quad irq_stub_5
+    .quad irq_stub_6
+    .quad irq_stub_7
+    .quad irq_stub_8
+    .quad irq_stub_9
+    .quad irq_stub_10
+    .quad irq_stub_11
+    .quad irq_stub_12
+    .quad irq_stub_13
+    .quad irq_stub_14
+    .quad irq_stub_15
     .globl exc_table
 exc_table:
     .macro EXC_REF i

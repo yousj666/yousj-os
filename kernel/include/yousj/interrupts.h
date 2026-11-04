@@ -23,6 +23,16 @@
 void interrupts_init(void);
 void timer_start(void);
 
+/* M79: device IRQs on the 8259 pair. irq_register() points
+ * the line's IDT gate at its stub, unmasks the line (and
+ * the cascade for lines 8-15) and records the handler.
+ * irq_dispatch() is called from the generic stubs with the
+ * line number; it runs the handler (which acknowledges
+ * its device) and then sends the EOI(s). Returns false
+ * for an unusable line (0 is the timer's, >=16 invalid). */
+bool irq_register(uint8_t irq, void (*handler)(void));
+void irq_dispatch(uint64_t irq);
+
 /* Called from the assembly stubs in isr.S. exception_handler()
  * receives the stack pointer at stub entry (vector number on top),
  * dumps the fault over serial and halts; it never returns. */

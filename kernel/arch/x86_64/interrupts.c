@@ -13,6 +13,7 @@
 extern const uint64_t exc_table[32];
 extern void irq0_stub(void);
 extern void pf_stub(void);
+extern const uint64_t irq_stub_table[16]; /* isr.S (M79) */
 
 /* --- IDT -------------------------------------------------------------- */
 
@@ -115,7 +116,11 @@ void interrupts_init(void)
 void timer_start(void)
 {
     pit_start(YOUSJ_HZ);
-    outb(PIC1_DATA, 0xFE); /* unmask IRQ0 (timer) only */
+    /* Unmask IRQ0 (timer). Read-modify-write since M79: a
+     * device may have unmasked its own line before the tick
+     * starts (the NIC registers during net_init), and the
+     * old flat 0xFE write would silently re-mask it. */
+    outb(PIC1_DATA, (uint8_t)(inb(PIC1_DATA) & 0xFE));
     __asm__ volatile("sti");
 }
 
@@ -123,7 +128,46 @@ void irq0_handler(void)
 {
     outb(PIC1_CMD, PIC_EOI);
     sched_tick();
-    net_poll(); /* M72: the NIC is polled, not interrupt-driven */
+    net_poll(); /* M72: tick-time drain; M79 added the NIC's
+                 * own IRQ, this stays as the safety net */
+}
+
+/* --- device IRQs (M79) ------------------------------------------------ */
+
+static void (*g_irq_handlers[16])(void);
+
+void irq_dispatch(uint64_t irq)
+{
+    void (*fn)(void);
+
+    if (irq >= 16)
+        return;
+    fn = g_irq_handlers[irq];
+    if (fn != NULL)
+        fn(); /* the handler acknowledges its own device */
+    /* EOI after the device ack: INTx is level-triggered, so
+     * an EOI sent first would just re-fire the line. */
+    if (irq >= 8)
+        outb(PIC2_CMD, PIC_EOI);
+    outb(PIC1_CMD, PIC_EOI);
+}
+
+bool irq_register(uint8_t irq, void (*handler)(void))
+{
+    if (irq == 0 || irq >= 16 || handler == NULL)
+        return false;
+    g_irq_handlers[irq] = handler;
+    idt_set_gate(0x20 + irq, irq_stub_table[irq]);
+    if (irq < 8) {
+        outb(PIC1_DATA,
+             (uint8_t)(inb(PIC1_DATA) & ~(1u << irq)));
+    } else {
+        outb(PIC2_DATA,
+             (uint8_t)(inb(PIC2_DATA) & ~(1u << (irq - 8))));
+        /* the slave hangs off the master's IRQ2 */
+        outb(PIC1_DATA, (uint8_t)(inb(PIC1_DATA) & ~(1u << 2)));
+    }
+    return true;
 }
 
 /* --- exception dump -------------------------------------------------------- */

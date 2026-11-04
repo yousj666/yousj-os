@@ -9,8 +9,10 @@
  *  - No feature bits accepted: no checksum offload, no GSO,
  *    no mergeable buffers. The MAC still comes from the
  *    device configuration area, as QEMU always provides it.
- *  - Polling from the timer tick; the device interrupt line
- *    stays masked.
+ *  - M72-M78 polled from the timer tick. M79 wires the
+ *    device's INTx line: the ISR acknowledges through the
+ *    legacy ISR register and drains the receive ring; the
+ *    tick poll remains as a safety net underneath.
  *  - Each queue's descriptor table is used through a small
  *    window: 16 receive buffers in flight, one transmit
  *    buffer, however large the queue itself is.
@@ -19,6 +21,7 @@
 #include <yousj/pci.h>
 #include <yousj/pmm.h>
 #include <yousj/vmm.h>
+#include <yousj/interrupts.h>
 #include <yousj/virtio_net.h>
 
 #define VIRTIO_VENDOR 0x1AF4
@@ -84,6 +87,12 @@ static bool g_present;
 static uint8_t g_mac[6];
 static struct vqueue g_rxq, g_txq;
 static uint64_t g_rx_count, g_tx_count;
+/* M79: the receive consumer, registered by poll_rx; the
+ * IRQ handler drains through it. Plus the interrupt tally
+ * the snapshot reports (proof the line really fires). */
+static void (*g_input)(const uint8_t *frame, uint32_t len);
+static uint64_t g_irq_count;
+static void virtio_net_isr(void);
 
 /* Receive buffers (FRAME_BUF each) and their physical twins */
 static uint8_t *g_rx_bufs[RX_WINDOW];
@@ -176,7 +185,9 @@ static bool vq_setup(struct vqueue *q, uint16_t sel)
     q->avail = (struct vq_avail *)(base + sizeof(struct vq_desc) *
                                    q->num);
     q->used = (struct vq_used *)(base + align_up(prefix, 4096));
-    q->avail->flags = 1; /* no interrupts, thank you */
+    q->avail->flags = 0; /* M79: interrupts welcome (the
+                          * VRING_AVAIL_F_NO_INTERRUPT bit
+                          * stays clear) */
     q->last_used = 0;
     q->io_sel = sel;
     outl((uint16_t)(g_io + R_QUEUE_PFN), (uint32_t)(phys >> 12));
@@ -217,10 +228,12 @@ bool virtio_net_init(void)
         return false; /* not an I/O BAR: a modern-only device */
     g_io = (uint16_t)(bar & ~3u);
 
-    /* Enable I/O space + bus mastering in the command reg. */
+    /* Enable I/O space + bus mastering in the command reg,
+     * and make sure INTx is not disabled (bit 10) -- M79
+     * actually uses the line. */
     {
         uint32_t cmd = pci_read32(0, slot, func, 0x04);
-        pci_write32(0, slot, func, 0x04, cmd | 0x5);
+        pci_write32(0, slot, func, 0x04, (cmd | 0x5) & ~0x400u);
     }
 
     outb((uint16_t)(g_io + R_STATUS), 0); /* reset */
@@ -259,6 +272,14 @@ bool virtio_net_init(void)
     for (i = 0; i < 6; i++)
         g_mac[i] = inb((uint16_t)(g_io + R_CONFIG + i));
     g_present = true;
+    /* M79: wire the INTx line the firmware assigned. An
+     * unassigned line (0 or 0xFF) simply leaves the tick
+     * poll in charge, as before. */
+    {
+        uint8_t irq = pci_read8(0, slot, func, 0x3C);
+        if (irq >= 1 && irq < 16)
+            (void)irq_register(irq, virtio_net_isr);
+    }
     vq_kick(0);
     return true;
 }
@@ -336,11 +357,11 @@ int virtio_net_send(const uint8_t *frame, uint32_t len)
     return -1;
 }
 
-void virtio_net_poll_rx(void (*input)(const uint8_t *frame,
-                                      uint32_t len))
+/* The one drain loop, shared by the tick poll and the
+ * IRQ handler: whoever gets here first consumes the used
+ * ring, the other finds it empty. */
+static void rx_drain(void)
 {
-    if (!g_present)
-        return;
     while (g_rxq.last_used != g_rxq.used->idx) {
         struct vq_used_elem *e =
             &g_rxq.used->ring[g_rxq.last_used % g_rxq.num];
@@ -349,12 +370,38 @@ void virtio_net_poll_rx(void (*input)(const uint8_t *frame,
         if (id < RX_WINDOW && total > VIRTIO_HDR_LEN &&
             total <= FRAME_BUF) {
             g_rx_count++;
-            input(g_rx_bufs[id] + VIRTIO_HDR_LEN,
-                  total - VIRTIO_HDR_LEN);
+            g_input(g_rx_bufs[id] + VIRTIO_HDR_LEN,
+                    total - VIRTIO_HDR_LEN);
         }
         rx_post((int)id);
     }
     /* A refill only matters when something was consumed; the
      * kick is harmless either way. */
     vq_kick(0);
+}
+
+static void virtio_net_isr(void)
+{
+    uint8_t isr = inb((uint16_t)(g_io + R_ISR)); /* ack */
+
+    g_irq_count++;
+    if ((isr & 1) != 0 && g_input != NULL)
+        rx_drain();
+    /* bit 1 would be a config change; TX completions also
+     * raise bit 0 and are consumed by send()'s own spin, so
+     * nothing else is owed here. */
+}
+
+void virtio_net_poll_rx(void (*input)(const uint8_t *frame,
+                                      uint32_t len))
+{
+    if (!g_present)
+        return;
+    g_input = input; /* the IRQ handler drains through this */
+    rx_drain();
+}
+
+uint64_t virtio_net_irq_count(void)
+{
+    return g_irq_count;
 }

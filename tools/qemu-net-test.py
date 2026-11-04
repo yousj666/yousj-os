@@ -146,6 +146,10 @@ check('nettest done', until('NETTEST DONE', 30, mark))
 seg = buf[mark:].decode(errors='replace')
 m = re.search(r'arp_replied=(\d+)', seg)
 check('netinfo counts the reply', m is not None and int(m.group(1)) >= 1)
+# M79: the frames above must have raised the NIC's own IRQ
+# at least once (the tick poll alone would leave this 0).
+m = re.search(r'net_irq=(\d+)', seg)
+check('NIC interrupt fired', m is not None and int(m.group(1)) >= 1)
 
 # 4. (M73) The peer pings the guest: expect a correct echo
 # reply, both checksums verifiable.

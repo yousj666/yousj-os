@@ -1594,6 +1594,8 @@ uint64_t net_snapshot(char *buf, uint64_t len)
     at = snap_put_u64(buf, len, at, virtio_net_rx_count());
     at = snap_puts(buf, len, at, " tx=");
     at = snap_put_u64(buf, len, at, virtio_net_tx_count());
+    at = snap_puts(buf, len, at, " net_irq=");
+    at = snap_put_u64(buf, len, at, virtio_net_irq_count());
     at = snap_puts(buf, len, at, " arp_seen=");
     at = snap_put_u64(buf, len, at, g_arp_req_seen);
     at = snap_puts(buf, len, at, " arp_replied=");

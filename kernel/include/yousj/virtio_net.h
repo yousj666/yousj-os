@@ -28,6 +28,8 @@ void virtio_net_poll_rx(void (*input)(const uint8_t *frame,
 
 uint64_t virtio_net_rx_count(void);
 uint64_t virtio_net_tx_count(void);
+/* M79: how many times the device's INTx line has fired. */
+uint64_t virtio_net_irq_count(void);
 
 /* M72 diagnostics: raw ring indices for the snapshot. */
 uint32_t virtio_net_diag(void);
