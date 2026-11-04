@@ -14,6 +14,7 @@
  */
 #include <yousj/types.h>
 #include <yousj/ps2kbd.h>
+#include <yousj/ps2mouse.h> /* M84: AUX bytes go to the mouse */
 
 #define KBD_STATUS 0x64
 #define KBD_DATA   0x60
@@ -119,8 +120,10 @@ static void drain(void)
     while (inb(KBD_STATUS) & ST_OBF) {
         uint8_t st = inb(KBD_STATUS);
         uint8_t b = inb(KBD_DATA);
-        if (st & ST_AUX)
-            continue; /* mouse byte: not ours yet */
+        if (st & ST_AUX) {
+            ps2mouse_feed(b); /* M84: the mouse shares this drain */
+            continue;
+        }
         decode(b);
     }
 }
@@ -141,4 +144,11 @@ int ps2kbd_ready(void)
 {
     drain();
     return g_tail != g_head;
+}
+
+/* M84: the timer tick drains through here too (input_poll), so
+ * mouse packets flow even when nobody is reading the console. */
+void ps2_poll(void)
+{
+    drain();
 }

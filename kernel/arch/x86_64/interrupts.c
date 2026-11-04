@@ -8,6 +8,7 @@
 #include <yousj/io.h>
 #include <yousj/sched.h>
 #include <yousj/net.h>
+#include <yousj/ps2mouse.h> /* M84: input_poll */
 #include <drivers/serial.h>
 
 extern const uint64_t exc_table[32];
@@ -130,6 +131,7 @@ void irq0_handler(void)
     sched_tick();
     net_poll(); /* M72: tick-time drain; M79 added the NIC's
                  * own IRQ, this stays as the safety net */
+    input_poll(); /* M84: drain the 8042, move the mouse arrow */
 }
 
 /* --- device IRQs (M79) ------------------------------------------------ */

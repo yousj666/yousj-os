@@ -287,6 +287,109 @@ static void con_activate(void)
     con_cursor(1);
 }
 
+/* ---------------------------------------------------------------- */
+/* Mouse arrow (M84). Classic arrow glyph, '#' = black edge,       */
+/* 'o' = white fill, '.' = untouched. Save-under keeps the          */
+/* console intact beneath it: the pixels under the arrow are        */
+/* copied aside on arrival and written back on departure.           */
+/* Clipping: the saved region is the on-screen intersection,        */
+/* and its origin/size are what restore uses.                       */
+/* ---------------------------------------------------------------- */
+
+#define CUR_W 12
+#define CUR_H 17
+
+static const char *const g_arrow[CUR_H] = {
+    "#...........",
+    "##..........",
+    "#o#.........",
+    "#oo#........",
+    "#ooo#.......",
+    "#oooo#......",
+    "#ooooo#.....",
+    "#oooooo#....",
+    "#ooooooo#...",
+    "#oooooooo#..",
+    "#oooooo#####",
+    "#oo#oo#.....",
+    "#o#.#oo#....",
+    "##..#oo#....",
+    "#....#oo#...",
+    "......#oo#..",
+    ".......##...",
+};
+
+static struct {
+    int shown;
+    uint32_t x, y;     /* where the arrow's tip is */
+    uint32_t sx, sy;   /* saved region origin (clipped) */
+    uint32_t sw, sh;   /* saved region size */
+    uint32_t saved[CUR_W * CUR_H];
+} g_cur;
+
+static void cur_restore(void)
+{
+    uint32_t r, c;
+    if (!g_cur.shown)
+        return;
+    for (r = 0; r < g_cur.sh; r++) {
+        uint32_t *row = (uint32_t *)((uint8_t *)g_fb.px +
+                                     (uint64_t)(g_cur.sy + r) *
+                                         g_fb.pitch);
+        for (c = 0; c < g_cur.sw; c++)
+            row[g_cur.sx + c] = g_cur.saved[r * CUR_W + c];
+    }
+    g_cur.shown = 0;
+}
+
+void fb_cursor_move(uint32_t x, uint32_t y)
+{
+    uint32_t r, c;
+    if (!g_fb.present)
+        return;
+    cur_restore();
+    if (x >= g_fb.width)
+        x = g_fb.width - 1;
+    if (y >= g_fb.height)
+        y = g_fb.height - 1;
+    g_cur.x = x;
+    g_cur.y = y;
+    g_cur.sx = x;
+    g_cur.sy = y;
+    g_cur.sw = CUR_W;
+    g_cur.sh = CUR_H;
+    if (g_cur.sx + g_cur.sw > g_fb.width)
+        g_cur.sw = g_fb.width - g_cur.sx;
+    if (g_cur.sy + g_cur.sh > g_fb.height)
+        g_cur.sh = g_fb.height - g_cur.sy;
+    for (r = 0; r < g_cur.sh; r++) {
+        uint32_t *row = (uint32_t *)((uint8_t *)g_fb.px +
+                                     (uint64_t)(g_cur.sy + r) *
+                                         g_fb.pitch);
+        for (c = 0; c < g_cur.sw; c++)
+            g_cur.saved[r * CUR_W + c] = row[g_cur.sx + c];
+    }
+    g_cur.shown = 1;
+    for (r = 0; r < g_cur.sh; r++) {
+        uint32_t *row = (uint32_t *)((uint8_t *)g_fb.px +
+                                     (uint64_t)(g_cur.sy + r) *
+                                         g_fb.pitch);
+        for (c = 0; c < g_cur.sw; c++) {
+            char p = g_arrow[r][c];
+            if (p == '#')
+                row[g_cur.sx + c] = pack(0x000000);
+            else if (p == 'o')
+                row[g_cur.sx + c] = pack(0xFFFFFF);
+        }
+    }
+}
+
+void fb_click_mark(uint32_t x, uint32_t y)
+{
+    /* offset so the mark does not fight the arrow's save-under */
+    fb_fill_rect(x + 14, y + 14, 6, 6, 0xFFD75E);
+}
+
 void fb_init(const struct yousj_framebuffer *f)
 {
     uint64_t base, end;

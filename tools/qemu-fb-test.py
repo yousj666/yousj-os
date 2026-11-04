@@ -237,6 +237,54 @@ def main():
         check("console advanced with keyboard input",
               lower_kbd > lower_after + 20)
         save_png(os.path.join(ROOT, "build", "fb_kbd.png"), w, h, body)
+
+        # --- M84: move the PS/2 mouse, watch the arrow follow ---
+        def mon_cmd(cmd, wait=0.3):
+            m = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            m.connect(MON)
+            m.settimeout(5)
+            m.recv(4096)
+            m.sendall((cmd + "\n").encode())
+            time.sleep(wait)
+            try:
+                m.recv(4096)
+            except socket.timeout:
+                pass
+            m.close()
+
+        def white_at(body2, cx, cy, rad=14):
+            n = 0
+            for yy in range(max(0, cy - rad), min(h, cy + rad)):
+                for xx in range(max(0, cx - rad), min(w, cx + rad)):
+                    r, g, b = px(body2, w, xx, yy)
+                    if r > 240 and g > 240 and b > 240:
+                        n += 1
+            return n
+
+        w2, h2, body = dump(os.path.join(ROOT, "build", "fb_m0.ppm"))
+        centre = white_at(body, w // 2, h // 2)
+        print("cursor white px at centre:", centre)
+        check("arrow sits at screen centre", centre > 10)
+        mon_cmd("mouse_move 200 100", 0.8)
+        w2, h2, body = dump(os.path.join(ROOT, "build", "fb_m1.ppm"))
+        moved = white_at(body, w // 2 + 200, h // 2 + 100)
+        gone = white_at(body, w // 2, h // 2)
+        print("cursor white px at +200,+100:", moved,
+              "centre now:", gone)
+        check("arrow followed the mouse", moved > 10)
+        check("arrow vacated the centre (save-under)", gone < 5)
+        mon_cmd("mouse_button 1", 0.5)
+        mon_cmd("mouse_button 0", 0.3)
+        w2, h2, body = dump(os.path.join(ROOT, "build", "fb_m2.ppm"))
+        mark = 0
+        for yy in range(h // 2 + 100, h // 2 + 140):
+            for xx in range(w // 2 + 200, w // 2 + 240):
+                r, g, b = px(body, w, xx, yy)
+                if r > 240 and 190 < g < 240 and b < 140:
+                    mark += 1
+        print("click marker px:", mark)
+        check("click dropped its marker", mark > 10)
+        save_png(os.path.join(ROOT, "build", "fb_mouse.png"), w, h, body)
     finally:
         qemu.terminate()
         try:

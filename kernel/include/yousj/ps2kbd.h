@@ -24,4 +24,8 @@ int ps2kbd_getc(void);
 /* 1 when a typed character is waiting. */
 int ps2kbd_ready(void);
 
+/* Drain the 8042 once (keys into the ring, AUX bytes to the
+ * mouse driver). Called per timer tick by input_poll (M84). */
+void ps2_poll(void);
+
 #endif /* YOUSJ_PS2KBD_H */

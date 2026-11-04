@@ -52,4 +52,13 @@ uint32_t fb_height(void);
  * region below the M81 banner. No-op while inactive. */
 void fb_console_putc(char c);
 
+/* Mouse arrow (M84): a 12x17 arrow with save-under, so it can
+ * wander over the console without erasing it. fb_cursor_move()
+ * restores the previous spot and paints at the new one. */
+void fb_cursor_move(uint32_t x, uint32_t y);
+
+/* Drop a small marker square near (x, y): visible proof that a
+ * click decoded (M84; real click routing comes with windows). */
+void fb_click_mark(uint32_t x, uint32_t y);
+
 #endif /* YOUSJ_FB_H */
