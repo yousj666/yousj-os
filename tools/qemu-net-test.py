@@ -147,6 +147,84 @@ seg = buf[mark:].decode(errors='replace')
 m = re.search(r'arp_replied=(\d+)', seg)
 check('netinfo counts the reply', m is not None and int(m.group(1)) >= 1)
 
+# 4. (M73) The peer pings the guest: expect a correct echo
+# reply, both checksums verifiable.
+def csum(data):
+    if len(data) % 2: data += b'\x00'
+    s = sum(struct.unpack('>%dH' % (len(data) // 2), data))
+    while s >> 16: s = (s & 0xFFFF) + (s >> 16)
+    return (~s) & 0xFFFF
+
+def ip_packet(src, dst, proto, payload, corrupt=False):
+    hdr = struct.pack('>BBHHHBBH', 0x45, 0, 20 + len(payload),
+                      0x2222, 0, 64, proto, 0) + src + dst
+    c = 0 if corrupt else csum(hdr)
+    hdr = hdr[:10] + struct.pack('>H', c) + hdr[12:]
+    return hdr + payload
+
+def icmp_echo(type_, id_, seq, data):
+    msg = struct.pack('>BBHHH', type_, 0, 0, id_, seq) + data
+    return msg[:2] + struct.pack('>H', csum(msg)) + msg[4:]
+
+frames.clear()
+ping_data = b'yousj-ping-4'
+send_frame(eth(GUEST_MAC, PEER_MAC, 0x0800,
+               ip_packet(PEER_IP, GUEST_IP, 1,
+                         icmp_echo(8, 0x1234, 7, ping_data))))
+rep = wait_frame(lambda f: len(f) >= 14 and f[12:14] == b'\x08\x00', 12)
+ok = rep is not None
+if ok:
+    ip = rep[14:]
+    ic = ip[20:]
+    ok = (rep[0:6] == PEER_MAC and rep[6:12] == GUEST_MAC and
+          ip[12:16] == GUEST_IP and ip[16:20] == PEER_IP and
+          csum(ip[:20]) == 0 and ic[0] == 0 and
+          ic[4:8] == struct.pack('>HH', 0x1234, 7) and
+          ic[8:] == ping_data and csum(ic) == 0)
+check('guest answers a ping correctly', ok)
+
+# 5. A packet with a corrupted IP checksum is dropped.
+frames.clear()
+mark = len(buf)
+send_frame(eth(GUEST_MAC, PEER_MAC, 0x0800,
+               ip_packet(PEER_IP, GUEST_IP, 1,
+                         icmp_echo(8, 0x1234, 8, ping_data),
+                         corrupt=True)))
+time.sleep(2.5)
+check('corrupt-checksum packet gets no reply', len(frames) == 0)
+send('nettest')
+check('nettest done (corrupt check)', until('NETTEST DONE', 30, mark))
+seg = buf[mark:].decode(errors='replace')
+m = re.search(r'dropped=(\d+)', seg)
+check('netinfo counts the drop', m is not None and int(m.group(1)) >= 1)
+
+# 6. The guest pings the gateway: watch for the echo request,
+# answer it, and expect netinfo to count the reply.
+frames.clear()
+mark = len(buf)
+send('nettest ping')
+req = wait_frame(lambda f: len(f) >= 14 and f[12:14] == b'\x08\x00', 15)
+ok = req is not None
+if ok:
+    ip = req[14:]
+    ic = ip[20:]
+    ok = (ip[12:16] == GUEST_IP and ip[16:20] == PEER_IP and
+          ic[0] == 8 and ic[4:6] == struct.pack('>H', 0x5973) and
+          csum(ip[:20]) == 0 and csum(ic) == 0)
+check('guest ping request on the wire', ok)
+if ok:
+    seq = ic[6:8]
+    send_frame(eth(GUEST_MAC, PEER_MAC, 0x0800,
+                   ip_packet(PEER_IP, GUEST_IP, 1,
+                             icmp_echo(0, 0x5973,
+                                       struct.unpack('>H', seq)[0],
+                                       ic[8:]))))
+check('nettest done (ping)', until('NETTEST DONE', 40, mark))
+seg = buf[mark:].decode(errors='replace')
+check('nettest ping sent', 'ping-sent' in seg)
+m = re.search(r'ping_replied=(\d+)', seg)
+check('netinfo counts the ping reply', m is not None and int(m.group(1)) >= 1)
+
 f1 = free_pages(len(buf))
 check('PMM steady state', f0 is not None and f0 == f1)
 

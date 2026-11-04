@@ -5836,6 +5836,11 @@ static long dispatch_inner(struct yousj_syscall_ctx *ctx)
                         ((b >> 8) & 0xFF00u) | ((b >> 24) & 0xFFu));
         return 0;
     }
+    case YOUSJ_SYS_NATIVE_NET_PING: {
+        uint32_t b = (uint32_t)a1;
+        return net_ping(((b & 0xFFu) << 24) | ((b & 0xFF00u) << 8) |
+                        ((b >> 8) & 0xFF00u) | ((b >> 24) & 0xFFu));
+    }
     default:
         return -YOUSJ_ENOSYS;
     }

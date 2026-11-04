@@ -26,6 +26,11 @@ uint32_t net_ip(void); /* host byte order */
 /* Send an ARP request asking who has `who` (host order). */
 void net_arp_request(uint32_t who);
 
+/* M73: resolve `who` if needed (ARP with retries, process
+ * context: it sleeps on ticks) and send one ICMP echo
+ * request. Returns 0 when the request went out. */
+long net_ping(uint32_t who);
+
 /* Text snapshot for the native netinfo syscall. Returns the
  * number of bytes written (excluding the NUL). */
 uint64_t net_snapshot(char *buf, uint64_t len);

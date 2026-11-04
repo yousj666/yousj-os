@@ -1283,14 +1283,36 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   默、客户机请求实上线。
   无网卡时 net 层安静缺
   席，既有套件不受影响。
-- ⏳ 下一步候选：IPv4
-  ＋ICMP（能被 ping 通、
-  能 ping 出去），然后
-  UDP，再 TCP；网卡中
-  断与 modern virtio 后
-  置；SCM_RIGHTS 与抽
-  象地址留在 socket 面
-  待办。
+- ✅ IPv4＋ICMP M73
+  （2026-11-04）：IP 层
+  落地——入向验版本/头
+  校验和/目的地址（分片
+  与选项暂丢），出向封
+  装（校验和、TTL 64、
+  id 递增），同网段直
+  达、跨网段走网关；ARP
+  邻居缓存（4 项，请求
+  与回复都学习）。ICMP
+  echo 应答（校验和双
+  验、原样回数据）与主
+  动 ping（原生调用 net_
+  ping：先 ARP 解析、睡
+  tick 等缓存命中，再发
+  echo 并计数回复）。组
+  帧缓冲按上下文分开
+  （中断应答与进程发起
+  各一份）。验收在 net
+  套件上逐包核对：对方
+  ping 我们、我们 ping
+  网关、坏校验和包被丢
+  且计数。
+- ⏳ 下一步候选：UDP
+  与 AF_INET 数据报
+  socket 面，然后 TCP；
+  网卡中断与 modern
+  virtio 后置；SCM_
+  RIGHTS 与抽象地址留
+  在 socket 面待办。
 
 ## 从零构建
 

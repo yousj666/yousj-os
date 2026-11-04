@@ -127,6 +127,8 @@
  * net_arp(ip_be32) -> send one ARP request for that address. */
 #define YOUSJ_SYS_NATIVE_NET_INFO    (YOUSJ_SYS_NATIVE_BASE + 2)
 #define YOUSJ_SYS_NATIVE_NET_ARP     (YOUSJ_SYS_NATIVE_BASE + 3)
+/* M73: net_ping(ip_be32) -> 0 when the echo request is out */
+#define YOUSJ_SYS_NATIVE_NET_PING    (YOUSJ_SYS_NATIVE_BASE + 4)
 
 #define YOUSJ_SYS_inotify_init     253 /* M48 */
 #define YOUSJ_SYS_inotify_add_watch 254 /* M48 */

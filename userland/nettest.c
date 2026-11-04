@@ -16,6 +16,7 @@ typedef long int64_t;
 #define SYS_nanosleep 35
 #define SYS_NET_INFO 0x1002
 #define SYS_NET_ARP  0x1003
+#define SYS_NET_PING 0x1004
 
 static long sys_call3(long nr, long a1, long a2, long a3)
 {
@@ -46,12 +47,12 @@ static int str_eq(const char *a, const char *b)
 
 static void print_info(const char *tag)
 {
-    char buf[256];
+    char buf[384];
     long n, i;
 
-    for (i = 0; i < 256; i++)
+    for (i = 0; i < 384; i++)
         buf[i] = 0;
-    n = sys_call3(SYS_NET_INFO, (long)buf, 255, 0);
+    n = sys_call3(SYS_NET_INFO, (long)buf, 383, 0);
     out(tag);
     if (n < 0) {
         out(" <netinfo failed>\n");
@@ -62,6 +63,25 @@ static void print_info(const char *tag)
 
 int main(int argc, char **argv)
 {
+    if (argc > 1 && str_eq(argv[1], "ping")) {
+        /* ping the gateway 10.0.2.2, give the reply a second
+         * to come back, then show the counters */
+        uint32_t be = (uint32_t)10 | (0u << 8) | (2u << 16) |
+                      (2u << 24);
+        struct {
+            int64_t sec;
+            int64_t nsec;
+        } ts;
+        long rc = sys_call3(SYS_NET_PING, (long)be, 0, 0);
+        out(rc == 0 ? "NETTEST ping-sent\n"
+                    : "NETTEST ping-failed\n");
+        ts.sec = 1;
+        ts.nsec = 0;
+        sys_call3(SYS_nanosleep, (long)&ts, 0, 0);
+        print_info("NETTEST after-ping ");
+        out("NETTEST DONE\n");
+        return 0;
+    }
     if (argc > 1 && str_eq(argv[1], "arp")) {
         /* 10.0.2.2 in network byte order */
         uint32_t be = (uint32_t)10 | (0u << 8) | (2u << 16) |
