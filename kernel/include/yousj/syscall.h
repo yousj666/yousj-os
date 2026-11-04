@@ -123,6 +123,10 @@
  * simple; it goes away when /proc arrives. */
 #define YOUSJ_SYS_NATIVE_PS_SNAPSHOT (YOUSJ_SYS_NATIVE_BASE + 0)
 #define YOUSJ_SYS_NATIVE_PMM_FREE    (YOUSJ_SYS_NATIVE_BASE + 1)
+/* M72: netinfo(buf, len) -> text snapshot of the net layer;
+ * net_arp(ip_be32) -> send one ARP request for that address. */
+#define YOUSJ_SYS_NATIVE_NET_INFO    (YOUSJ_SYS_NATIVE_BASE + 2)
+#define YOUSJ_SYS_NATIVE_NET_ARP     (YOUSJ_SYS_NATIVE_BASE + 3)
 
 #define YOUSJ_SYS_inotify_init     253 /* M48 */
 #define YOUSJ_SYS_inotify_add_watch 254 /* M48 */

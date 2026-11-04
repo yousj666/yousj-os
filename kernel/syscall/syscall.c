@@ -23,6 +23,7 @@
 #include <yousj/fpu.h>
 #include <yousj/fs.h>
 #include <yousj/sched.h>
+#include <yousj/net.h>
 #include <yousj/user.h>
 #include <yousj/gdt.h>
 #include <yousj/vmm.h>
@@ -5472,6 +5473,19 @@ static long sys_ps_snapshot(uint64_t buf, uint64_t len)
     return (long)sched_snapshot_tasks((char *)(uintptr_t)buf, len);
 }
 
+/* M72: the net layer's native pair. netinfo's argument is a
+ * user buffer the snapshot is written into directly (the ps
+ * contract); net_arp takes the target IPv4 in network order
+ * in a1, exactly as it appears in a packet. */
+static long sys_net_info(uint64_t buf, uint64_t len)
+{
+    if (len == 0)
+        return 0;
+    if (!user_range_ok(buf, len))
+        return -YOUSJ_EFAULT;
+    return (long)net_snapshot((char *)(uintptr_t)buf, len);
+}
+
 /* --- dispatcher --------------------------------------------------------- */
 
 /* The switch itself. Arguments arrive via the entry shim's
@@ -5813,6 +5827,15 @@ static long dispatch_inner(struct yousj_syscall_ctx *ctx)
         return sys_ps_snapshot(a1, a2);
     case YOUSJ_SYS_NATIVE_PMM_FREE:
         return (long)pmm_free_page_count();
+    case YOUSJ_SYS_NATIVE_NET_INFO:
+        return sys_net_info(a1, a2);
+    case YOUSJ_SYS_NATIVE_NET_ARP: {
+        /* a1 arrives in network byte order */
+        uint32_t b = (uint32_t)a1;
+        net_arp_request(((b & 0xFFu) << 24) | ((b & 0xFF00u) << 8) |
+                        ((b >> 8) & 0xFF00u) | ((b >> 24) & 0xFFu));
+        return 0;
+    }
     default:
         return -YOUSJ_ENOSYS;
     }

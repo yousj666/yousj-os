@@ -1259,13 +1259,38 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   知标志位先行回 EINVAL。
   socktest 新增 sockopt
   场景（共 11）。
-- ⏳ 下一步：转入网络
-  栈战线——virtio-net 驱
-  动与链路层（帧收发＋
-  ARP），为 IPv4/UDP/
-  TCP 与 AF_INET 铺路；
-  SCM_RIGHTS 与抽象地
-  址留在 socket 面待办。
+- ✅ 网络栈起步 M72
+  （2026-11-04）：PCI
+  配置空间访问层（0xCF8/
+  0xCFC 枚举）＋virtio-
+  net legacy 驱动（I/O
+  BAR、双 virtqueue、零
+  可选特性协商、定时器
+  tick 轮询收包，不占中
+  断）＋以太网/ARP 层：
+  固定配置 10.0.2.15/24
+  （QEMU 用户网默认），
+  应答问我方地址的 ARP
+  请求、可主动发 ARP 查
+  询。两个原生调用：
+  netinfo（文本快照，含
+  环索引诊断）与 net_arp
+  （触发一次查询）。验
+  收用 QEMU socket 网卡
+  后端直连测试脚本扮演
+  对端：问答字段逐项核
+  对、问陌生地址保持沉
+  默、客户机请求实上线。
+  无网卡时 net 层安静缺
+  席，既有套件不受影响。
+- ⏳ 下一步候选：IPv4
+  ＋ICMP（能被 ping 通、
+  能 ping 出去），然后
+  UDP，再 TCP；网卡中
+  断与 modern virtio 后
+  置；SCM_RIGHTS 与抽
+  象地址留在 socket 面
+  待办。
 
 ## 从零构建
 

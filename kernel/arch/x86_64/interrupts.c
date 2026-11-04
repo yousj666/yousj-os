@@ -7,6 +7,7 @@
 #include <yousj/interrupts.h>
 #include <yousj/io.h>
 #include <yousj/sched.h>
+#include <yousj/net.h>
 #include <drivers/serial.h>
 
 extern const uint64_t exc_table[32];
@@ -122,6 +123,7 @@ void irq0_handler(void)
 {
     outb(PIC1_CMD, PIC_EOI);
     sched_tick();
+    net_poll(); /* M72: the NIC is polled, not interrupt-driven */
 }
 
 /* --- exception dump -------------------------------------------------------- */

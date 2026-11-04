@@ -17,6 +17,7 @@
 #include <yousj/fs.h>
 #include <yousj/user.h>
 #include <yousj/elf.h>
+#include <yousj/net.h>
 #include <drivers/serial.h> /* kernel/drivers/serial.h; -I kernel in Makefile */
 
 /* M1 demo threads (SCHED_DESIGN.md milestone M1): two cooperative
@@ -518,6 +519,7 @@ void kmain(struct yousj_boot_info *boot_info)
         /* M9: the ramfs exists before any task does; the
          * embedded program images become its first files. */
         fs_init();
+        net_init(); /* M72: probe the NIC (absent is fine) */
         if (fs_load_initramfs() < 0) {
             serial_puts("Yousj OS: initramfs FAILED (corrupt archive)\n");
             halt_forever();
