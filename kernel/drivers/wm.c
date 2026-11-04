@@ -1,26 +1,33 @@
 /* Yousj OS - window layer (M85; desktop M86; user windows
- * M88).
+ * M88; real desktop M91).
  *
  * Written from scratch. One demonstration window, drawn
  * with fb primitives, proves the mechanics; M86 adds the
  * taskbar/start menu furniture; M88 generalises the layer
  * into a small service: user tasks open windows that are
  * character-cell text surfaces, stream bytes into them,
- * and receive the keyboard while focused. Erasing always
- * goes through the console's character backing store, so
- * whatever was underneath comes back exactly as it was,
- * and any window still standing over the erased area is
- * redrawn on top.
+ * and receive the keyboard while focused.
+ *
+ * M91 turns the screen into a real desktop: the wallpaper
+ * is the base surface (the M82 screen console no longer
+ * paints over it), icons live in a column at the top left,
+ * a double-click launches, and erasing a window repaints
+ * wallpaper, then icons, then the windows still standing
+ * over the area. The old demonstration window becomes the
+ * About box.
  */
 #include <yousj/types.h>
 #include <yousj/wm.h>
 #include <yousj/fb.h>
 #include <yousj/ps2kbd.h> /* M89: the menu's Terminal entry */
+#include <yousj/sched.h>  /* M91: uptime ticks time the
+                             double-click */
 
 #define WIN_W 560u
 #define WIN_H 340u
 #define WIN_TITLE 28u
-#define WIN_MIN_Y 200u
+#define WIN_MIN_Y 8u /* M91: no banner anymore; the whole
+                        desktop is usable window space */
 
 #define COL_BORDER 0x9FB8D8u
 #define COL_TITLE  0x2E5E8Cu
@@ -44,7 +51,140 @@
 #define MENU_H     84u /* M89: two entries since the menu
                           grew a Terminal launcher */
 
-/* --- the demonstration window (M85) ---------------------- */
+/* --- desktop icons (M91) --------------------------------- */
+/* A left column of launchers. Each cell is 96x116: a 72x72
+ * glyph tile with a label under it. One click selects (the
+ * label highlights), a second click inside 45 ticks
+ * (about half a second) launches. */
+#define ICON_X    24u
+#define ICON_Y    24u
+#define ICON_STEP 124u
+#define ICON_CELL_W 96u
+#define ICON_CELL_H 116u
+#define ICON_TILE   72u
+#define ICON_DBL_TICKS 60u
+
+#define ICON_TERMINAL 0
+#define ICON_ABOUT    1
+#define ICON_COUNT    2
+
+static const char *const g_icon_labels[ICON_COUNT] = {
+    "Terminal",
+    "About",
+};
+
+static int g_icon_sel = -1;
+static uint64_t g_icon_last_tick;
+
+static uint32_t icon_x(int i)
+{
+    (void)i;
+    return ICON_X;
+}
+
+static uint32_t icon_y(int i)
+{
+    return ICON_Y + (uint32_t)i * ICON_STEP;
+}
+
+static void icon_draw(int i)
+{
+    uint32_t x = icon_x(i), y = icon_y(i);
+    uint32_t tx = x + (ICON_CELL_W - ICON_TILE) / 2;
+    const char *label = g_icon_labels[i];
+    uint32_t len = 0, lx;
+    while (label[len] != '\0')
+        len++;
+    lx = x + (ICON_CELL_W - len * 8) / 2;
+
+    /* repaint the cell's wallpaper first, so deselecting
+     * leaves no trace */
+    fb_desktop_paint_rect(x, y, ICON_CELL_W, ICON_CELL_H);
+    if (i == ICON_TERMINAL) {
+        fb_fill_rect(tx, y, ICON_TILE, ICON_TILE, 0x0A141F);
+        fb_draw_text(tx + 13, y + 24, ">_", 0x4ADE80,
+                     0x0A141F, 3);
+    } else {
+        fb_fill_rect(tx, y, ICON_TILE, ICON_TILE, COL_TITLE);
+        fb_draw_text(tx + 22, y + 20, "Y", COL_TEXT,
+                     COL_TITLE, 4);
+    }
+    fb_fill_rect(tx, y, ICON_TILE, 1, COL_BORDER);
+    fb_fill_rect(tx, y + ICON_TILE - 1, ICON_TILE, 1,
+                 COL_BORDER);
+    fb_fill_rect(tx, y, 1, ICON_TILE, COL_BORDER);
+    fb_fill_rect(tx + ICON_TILE - 1, y, 1, ICON_TILE,
+                 COL_BORDER);
+    if (g_icon_sel == i)
+        fb_draw_text(lx, y + 84, label, COL_TEXT, COL_TITLE,
+                     1);
+    else
+        fb_draw_text(lx, y + 84, label, COL_TEXT,
+                     FB_TEXT_TRANSPARENT, 1);
+}
+
+static void icons_draw(void)
+{
+    int i;
+    for (i = 0; i < ICON_COUNT; i++)
+        icon_draw(i);
+}
+
+/* Redraw any icon the rectangle touches (window erases). */
+static void icons_repair(uint32_t x, uint32_t y, uint32_t w,
+                         uint32_t h)
+{
+    int i;
+    for (i = 0; i < ICON_COUNT; i++) {
+        uint32_t ix = icon_x(i), iy = icon_y(i);
+        if (x < ix + ICON_CELL_W && x + w > ix &&
+            y < iy + ICON_CELL_H && y + h > iy)
+            icon_draw(i);
+    }
+}
+
+static int icon_hit(uint32_t mx, uint32_t my)
+{
+    int i;
+    for (i = 0; i < ICON_COUNT; i++) {
+        uint32_t ix = icon_x(i), iy = icon_y(i);
+        if (mx >= ix && mx < ix + ICON_CELL_W && my >= iy &&
+            my < iy + ICON_CELL_H)
+            return i;
+    }
+    return -1;
+}
+
+static void window_open(void); /* below */
+
+static void icon_launch(int i)
+{
+    if (i == ICON_TERMINAL) {
+        /* the M89 mechanism: the console shell runs the
+         * terminal; the desktop just types the command */
+        ps2kbd_inject("gterm\n");
+    } else if (i == ICON_ABOUT) {
+        window_open(); /* a no-op while it stands */
+    }
+}
+
+/* One press on icon i: select it, or launch it when it is
+ * the second press on the same icon inside the window. */
+static void icon_press(int i)
+{
+    uint64_t now = sched_uptime_ticks();
+    if (g_icon_sel == i && g_icon_last_tick != 0 &&
+        now - g_icon_last_tick <= ICON_DBL_TICKS) {
+        g_icon_last_tick = 0;
+        icon_launch(i);
+        return;
+    }
+    g_icon_sel = i;
+    g_icon_last_tick = now;
+    icons_draw();
+}
+
+/* --- the About window (M85's demonstration window) ------- */
 static struct {
     int open;
     int dragging;
@@ -113,7 +253,7 @@ static void taskbar_draw(void)
     if (chip != NULL || g_win.open) {
         fb_fill_rect(CHIP_X, by + 6, CHIP_W, 28, COL_BODY);
         fb_draw_text(CHIP_X + 10, by + 12,
-                     chip != NULL ? chip : "YOUSJ WINDOW",
+                     chip != NULL ? chip : "ABOUT",
                      COL_TEXT, COL_BODY, 1);
     }
     /* right-hand label */
@@ -129,7 +269,7 @@ static void menu_draw(void)
     fb_fill_rect(8, my + MENU_H - 1, MENU_W, 1, COL_BORDER);
     fb_fill_rect(8, my, 1, MENU_H, COL_BORDER);
     fb_fill_rect(8 + MENU_W - 1, my, 1, MENU_H, COL_BORDER);
-    fb_draw_text(24, my + 14, "Open the window", COL_TEXT,
+    fb_draw_text(24, my + 14, "About Yousj OS", COL_TEXT,
                  COL_BODY, 1);
     fb_draw_text(24, my + 48, "Terminal", COL_TEXT,
                  COL_BODY, 1);
@@ -137,12 +277,36 @@ static void menu_draw(void)
 
 static void menu_erase(void)
 {
-    fb_fill_rect(8, bar_y() - MENU_H, MENU_W, MENU_H, COL_FIELD);
+    /* M91: what is under the menu is wallpaper, not the
+     * old flat field color */
+    if (fb_desktop())
+        fb_desktop_paint_rect(8, bar_y() - MENU_H, MENU_W,
+                              MENU_H);
+    else
+        fb_fill_rect(8, bar_y() - MENU_H, MENU_W, MENU_H,
+                     COL_FIELD);
+}
+
+/* Append v's decimal digits to buf at *n (no libc here). */
+static void fmt_u32(char *buf, uint32_t *n, uint32_t v)
+{
+    char digits[10];
+    uint32_t d = 0;
+    do {
+        digits[d++] = (char)('0' + (v % 10));
+        v /= 10;
+    } while (v);
+    while (d)
+        buf[(*n)++] = digits[--d];
+    buf[*n] = '\0';
 }
 
 static void win_draw(void)
 {
     uint32_t x = g_win.x, y = g_win.y;
+    char disp[40];
+    uint32_t n = 0;
+    const char *s;
     /* body first, then title bar, border, close box, texts */
     fb_fill_rect(x, y + WIN_TITLE, WIN_W, WIN_H - WIN_TITLE,
                  COL_BODY);
@@ -151,17 +315,37 @@ static void win_draw(void)
     fb_fill_rect(x, y + WIN_H - 1, WIN_W, 1, COL_BORDER);
     fb_fill_rect(x, y, 1, WIN_H, COL_BORDER);
     fb_fill_rect(x + WIN_W - 1, y, 1, WIN_H, COL_BORDER);
-    fb_draw_text(x + 10, y + 6, "YOUSJ WINDOW", COL_TEXT,
+    fb_draw_text(x + 10, y + 6, "ABOUT YOUSJ OS", COL_TEXT,
                  COL_TITLE, 1);
     fb_fill_rect(x + WIN_W - 24, y + 4, 20, 20, COL_CLOSE);
     fb_draw_text(x + WIN_W - 19, y + 6, "x", COL_TEXT, COL_CLOSE,
                  1);
     fb_draw_text(x + 16, y + WIN_TITLE + 18,
-                 "Drag me by the title bar.", COL_BTEXT, COL_BODY,
-                 1);
-    fb_draw_text(x + 16, y + WIN_TITLE + 38,
-                 "Close me with the red box.", COL_BTEXT,
+                 "Yousj OS 0.1, written from scratch:",
+                 COL_BTEXT, COL_BODY, 1);
+    fb_draw_text(x + 16, y + WIN_TITLE + 40,
+                 "no Linux kernel code, a Linux-compatible",
+                 COL_BTEXT, COL_BODY, 1);
+    fb_draw_text(x + 16, y + WIN_TITLE + 62,
+                 "syscall interface, a UEFI bootloader,",
+                 COL_BTEXT, COL_BODY, 1);
+    fb_draw_text(x + 16, y + WIN_TITLE + 84,
+                 "windows and a graphical terminal.",
+                 COL_BTEXT, COL_BODY, 1);
+    for (s = "Display: "; *s; s++)
+        disp[n++] = *s;
+    fmt_u32(disp, &n, fb_width());
+    disp[n++] = 'x';
+    disp[n] = '\0';
+    fmt_u32(disp, &n, fb_height());
+    fb_draw_text(x + 16, y + WIN_TITLE + 126, disp, COL_BTEXT,
                  COL_BODY, 1);
+    fb_draw_text(x + 16, y + WIN_TITLE + 168,
+                 "Double-click the Terminal icon on the",
+                 COL_BTEXT, COL_BODY, 1);
+    fb_draw_text(x + 16, y + WIN_TITLE + 190,
+                 "desktop for a shell.", COL_BTEXT, COL_BODY,
+                 1);
 }
 
 /* --- user window rendering -------------------------------- */
@@ -213,13 +397,19 @@ static void uwin_draw(struct uwin *u)
     uw_draw_cursor(u, 1);
 }
 
-/* Restore what a rectangle of screen used to show: console
- * text first, then every open window that overlaps it. */
+/* Restore what a rectangle of screen used to show: the
+ * wallpaper first (M91; the console's backing store before
+ * it), then the icons, then every open window that
+ * overlaps it. */
 static void rect_repair(uint32_t x, uint32_t y, uint32_t w,
                         uint32_t h)
 {
     int i;
-    fb_console_repaint_rect(x, y, w, h);
+    if (fb_desktop())
+        fb_desktop_paint_rect(x, y, w, h);
+    else
+        fb_console_repaint_rect(x, y, w, h);
+    icons_repair(x, y, w, h);
     if (g_win.open && x < g_win.x + WIN_W && x + w > g_win.x &&
         y < g_win.y + WIN_H && y + h > g_win.y)
         win_draw();
@@ -233,12 +423,12 @@ static void rect_repair(uint32_t x, uint32_t y, uint32_t w,
 
 static void window_open(void)
 {
-    g_win.x = 1050;
-    g_win.y = 1080;
-    if (g_win.x + WIN_W > fb_width())
-        g_win.x = fb_width() > WIN_W ? fb_width() - WIN_W : 0;
-    if (g_win.y + WIN_H > fb_height())
-        g_win.y = fb_height() > WIN_H ? fb_height() - WIN_H : 0;
+    if (g_win.open)
+        return; /* the About box is a singleton */
+    /* M91: centered on the desktop */
+    g_win.x = fb_width() > WIN_W ? (fb_width() - WIN_W) / 2 : 0;
+    g_win.y = fb_height() > WIN_H ? (fb_height() - WIN_H) / 2
+                                  : 0;
     g_win.open = 1;
     win_draw();
     taskbar_draw(); /* the chip appears */
@@ -248,8 +438,10 @@ void wm_init(void)
 {
     if (!fb_present())
         return;
+    /* M91: a clean desktop -- icons and the taskbar, no
+     * window standing open. */
     taskbar_draw();
-    window_open();
+    icons_draw();
 }
 
 int wm_window_rect(int idx, uint32_t *x, uint32_t *y,
@@ -668,6 +860,19 @@ void wm_mouse(uint32_t mx, uint32_t my, int buttons)
         }
         /* body clicks: focus only, nothing to show yet */
     }
+    if (pressed && !was && !hit_window) {
+        /* M91: a press on a desktop icon selects it, or
+         * launches it on a double-click. Icons sit under
+         * windows: reaching here means no window took the
+         * press (the user-window block above returns on a
+         * hit, and the demo window vetoes via hit_window). */
+        int ic = icon_hit(mx, my);
+        if (ic >= 0) {
+            icon_press(ic);
+            g_win.prev_buttons = buttons;
+            return;
+        }
+    }
     if (pressed && g_win.dragging && g_win.open) {
         int32_t nx = (int32_t)mx - (int32_t)g_win.grab_dx;
         int32_t ny = (int32_t)my - (int32_t)g_win.grab_dy;
@@ -693,8 +898,15 @@ void wm_mouse(uint32_t mx, uint32_t my, int buttons)
     if (!pressed)
         g_win.dragging = 0;
     if (pressed && !was && !hit_window) {
+        /* bare desktop: keyboard back to the console, and
+         * any icon selection clears (M91; the M84 click
+         * mark is gone -- the desktop stays clean) */
         g_focus = -1;
-        fb_click_mark(mx, my); /* desktop click: the M84 mark */
+        if (g_icon_sel >= 0) {
+            g_icon_sel = -1;
+            g_icon_last_tick = 0;
+            icons_draw();
+        }
     }
     g_win.prev_buttons = buttons;
 }

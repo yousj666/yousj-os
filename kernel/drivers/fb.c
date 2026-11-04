@@ -24,12 +24,18 @@
 
 static struct {
     int      present;
+    int      desktop;  /* M91: a GOP boot runs the desktop */
     uint32_t *px;      /* HHDM pointer to the first pixel */
     uint32_t width;
     uint32_t height;
     uint32_t pitch;    /* bytes per scanline */
     int      bgr;      /* 1: lowest byte is blue (UEFI format 1) */
 } g_fb;
+
+int fb_desktop(void)
+{
+    return g_fb.desktop;
+}
 
 /* 0xRRGGBB -> the 32-bit store value for this panel's order. */
 static uint32_t pack(uint32_t rgb)
@@ -108,7 +114,11 @@ void fb_draw_text(uint32_t x, uint32_t y, const char *text,
         for (row = 0; row < 16; row++) {
             uint8_t bits = glyph[row];
             for (col = 0; col < 8; col++) {
-                uint32_t v = (bits & (0x80u >> col)) ? fg_v : bg_v;
+                int on = (bits & (0x80u >> col)) != 0;
+                uint32_t v;
+                if (!on && bg == FB_TEXT_TRANSPARENT)
+                    continue; /* wallpaper shows through */
+                v = on ? fg_v : bg_v;
                 for (sy = 0; sy < scale; sy++) {
                     uint32_t py = y + row * scale + sy;
                     uint32_t *prow;
@@ -130,51 +140,44 @@ void fb_draw_text(uint32_t x, uint32_t y, const char *text,
     }
 }
 
-/* The M81 first screen. Deliberately simple shapes (fills and one
- * font) so a screendump check can verify them mechanically: the
- * background color, the title-bar color, and four swatches whose
- * positions and colors are fixed fractions of the mode. */
-static void fb_banner(void)
+/* The desktop wallpaper (M91). The M81 first screen -- banner
+ * text, boot-mode line, channel-order swatches, and under it the
+ * M82 screen console -- is retired: a GOP boot now shows a real
+ * desktop. A vertical gradient, deep blue easing darker towards
+ * the bottom; the window layer paints icons, windows and the
+ * taskbar over it, and fb_desktop_paint_rect() restores any
+ * rectangle of it exactly. */
+static uint32_t wall_color(uint32_t y)
 {
-    char mode_line[64];
-    uint32_t i = 0;
-    const char *pre = "framebuffer online - ";
-    uint32_t sw_y, sw_w;
+    uint32_t h = g_fb.height ? g_fb.height : 1;
+    uint32_t t = (uint32_t)((uint64_t)y * 255u / h); /* 0..255 */
+    uint32_t r = 0x17u - (0x0Du * t) / 255u;
+    uint32_t g = 0x35u - (0x1Bu * t) / 255u;
+    uint32_t b = 0x50u - (0x24u * t) / 255u;
+    return (r << 16) | (g << 8) | b;
+}
 
-    fb_clear(0x10243E);                       /* deep blue field */
-    fb_fill_rect(0, 0, g_fb.width, 64, 0x1B3A5C); /* title bar */
-    fb_draw_text(24, 12, "YOUSJ OS", 0xFFFFFF, 0x1B3A5C, 3);
-    fb_draw_text(24, 96, "M81: first screen (GOP framebuffer)",
-                 0xD7E3F4, 0x10243E, 2);
+static void fb_wallpaper(void)
+{
+    uint32_t y;
+    for (y = 0; y < g_fb.height; y++)
+        fb_fill_rect(0, y, g_fb.width, 1, wall_color(y));
+}
 
-    /* "<W>x<H>" built by hand: no printf in this driver. */
-    {
-        char digits[16];
-        uint32_t n = 0, v;
-        const char *s;
-        for (s = pre; *s; s++)
-            mode_line[i++] = *s;
-        v = g_fb.width;
-        do { digits[n++] = (char)('0' + (v % 10)); v /= 10; } while (v);
-        while (n)
-            mode_line[i++] = digits[--n];
-        mode_line[i++] = 'x';
-        n = 0;
-        v = g_fb.height;
-        do { digits[n++] = (char)('0' + (v % 10)); v /= 10; } while (v);
-        while (n)
-            mode_line[i++] = digits[--n];
-        mode_line[i] = '\0';
-    }
-    fb_draw_text(24, 140, mode_line, 0x9FB8D8, 0x10243E, 2);
-
-    /* Channel-order swatches: pure red, green, blue, white. */
-    sw_y = g_fb.height - 120;
-    sw_w = g_fb.width / 8;
-    fb_fill_rect(sw_w * 1, sw_y, sw_w, 60, 0xFF0000);
-    fb_fill_rect(sw_w * 3, sw_y, sw_w, 60, 0x00FF00);
-    fb_fill_rect(sw_w * 5, sw_y, sw_w, 60, 0x0000FF);
-    fb_fill_rect(sw_w * 7 - 24, sw_y, 24, 60, 0xFFFFFF);
+void fb_desktop_paint_rect(uint32_t x, uint32_t y, uint32_t w,
+                           uint32_t h)
+{
+    uint32_t yy;
+    if (!g_fb.present)
+        return;
+    if (x >= g_fb.width || y >= g_fb.height)
+        return;
+    if (x + w > g_fb.width)
+        w = g_fb.width - x;
+    if (y + h > g_fb.height)
+        h = g_fb.height - y;
+    for (yy = y; yy < y + h; yy++)
+        fb_fill_rect(x, yy, w, 1, wall_color(yy));
 }
 
 /* ---------------------------------------------------------------- */
@@ -277,8 +280,9 @@ static void con_newline(void)
 
 void fb_console_putc(char c)
 {
-    if (!g_con.active)
-        return;
+    if (!g_con.active || g_fb.desktop)
+        return; /* M91: the desktop owns the screen; the
+                 * console lives on serial and in gterm */
     con_cursor(0);
     if (c == '\n') {
         con_newline();
@@ -344,8 +348,9 @@ void fb_console_repaint_rect(uint32_t rx, uint32_t ry,
                              uint32_t rw, uint32_t rh)
 {
     uint32_t cx0, cy0, cx1, cy1, cx, cy;
-    if (!g_con.active)
-        return;
+    if (!g_con.active || g_fb.desktop)
+        return; /* M91: the window layer repaints the
+                 * wallpaper instead on a desktop boot */
     fb_fill_rect(rx, ry, rw, rh, FB_CON_BG);
     if (rx >= g_fb.width || ry + rh <= g_con.top)
         return;
@@ -506,8 +511,9 @@ void fb_init(const struct yousj_framebuffer *f)
     g_fb.pitch = f->pitch;
     g_fb.bgr = (f->reserved[0] == 1);
     g_fb.present = 1;
+    g_fb.desktop = 1; /* M91: a GOP boot is a desktop boot */
 
-    fb_banner();
+    fb_wallpaper();
 
     serial_puts("Yousj OS: fb ");
     serial_put_u64(g_fb.width);
@@ -519,6 +525,11 @@ void fb_init(const struct yousj_framebuffer *f)
 
     /* M82: from the next byte on, the serial console mirrors to
      * the screen (see fb_console_putc). Activated last so the
-     * report line above stays serial-only history. */
-    con_activate();
+     * report line above stays serial-only history.
+     * M91: not on a desktop boot -- activation fills its region
+     * with the flat console color, which would paint a slab
+     * over the wallpaper, and every putc is suppressed anyway;
+     * the console's homes are serial and the gterm window. */
+    if (!g_fb.desktop)
+        con_activate();
 }

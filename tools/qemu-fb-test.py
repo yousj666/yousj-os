@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""M81 acceptance: boot the UEFI ESP image, let the kernel light
-the GOP framebuffer, take a QEMU screendump, and verify the
-pixels mechanically (background, title bar, channel swatches),
-plus the serial "Yousj OS: fb ..." line. Also saves a PNG next to
-the PPM so a human can look at the first Yousj screen.
+"""Framebuffer/desktop acceptance: boot the UEFI ESP image and
+verify the screen mechanically, milestone by milestone --
+M81 the GOP framebuffer, M82/M83 the (now serial-side) console
+and PS/2 keyboard, M84 the mouse arrow, M85/M86 windows and
+the taskbar/start menu, M88 the graphical terminal, M89 the
+menu's Terminal entry, and M91 the real desktop: wallpaper,
+icons, select/double-click launch, the About box.
 
 The monitor socket approach keeps the guest display headless
 (-display none) while still owning a VGA device to dump.
@@ -64,12 +66,11 @@ class Serial:
 def read_ppm(path):
     with open(path, "rb") as fh:
         data = fh.read()
-    # header: P6 <ws> W <ws> H <ws> MAX <one ws>
     parts = data.split(b"\n", 3)
     magic = parts[0].strip()
     assert magic == b"P6", magic
     dims = parts[1].split()
-    if len(dims) < 2:  # comment line possible; not expected from QEMU
+    if len(dims) < 2:
         raise ValueError("unexpected PPM header")
     w, h = int(dims[0]), int(dims[1])
     maxv = int(parts[2])
@@ -133,62 +134,13 @@ def main():
         check("guest boots to the shell (UEFI + GOP build)",
               ser.until("sh> ", 90))
         time.sleep(1.0)
-        mon = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        mon.connect(MON)
-        mon.settimeout(5)
-        mon.recv(4096)
-        mon.sendall(("screendump " + PPM + "\n").encode())
-        time.sleep(1.5)
-        try:
-            mon.recv(4096)
-        except socket.timeout:
-            pass
-        mon.close()
-        log = ser.text()
-        check("kernel reports the framebuffer on serial",
-              "Yousj OS: fb " in log)
-        check("no exceptions", "EXCEPTION" not in log)
-        w, h, body = read_ppm(PPM)
-        print("screendump: %dx%d" % (w, h))
-        check("resolution at least 800x600", w >= 800 and h >= 600)
-        check("background is the banner field color",
-              close(px(body, w, w // 4, h // 2), (0x10, 0x24, 0x3E)))
-        check("title bar color",
-              close(px(body, w, w // 2, 20), (0x1B, 0x3A, 0x5C)))
-        swy = h - 90
-        check("red swatch is red",
-              close(px(body, w, int(w * 1.5 / 8), swy), (255, 0, 0)))
-        check("green swatch is green",
-              close(px(body, w, int(w * 3.5 / 8), swy), (0, 255, 0)))
-        check("blue swatch is blue",
-              close(px(body, w, int(w * 5.5 / 8), swy), (0, 0, 255)))
-        # the title text must have painted bright pixels in the bar
-        bright = 0
-        for yy in range(8, 56, 2):
-            for xx in range(16, 220, 2):
-                r, g, b = px(body, w, xx, yy)
-                if r > 200 and g > 200 and b > 200:
-                    bright += 1
-        check("title text pixels present", bright > 30)
-        save_png(PNG, w, h, body)
-        print("screenshot saved:", PNG)
-
-        # --- M82: the framebuffer console mirrors serial output ---
-        def band_bright(y0, y1):
-            n = 0
-            for yy in range(y0, min(y1, h), 2):
-                for xx in range(8, min(1400, w), 2):
-                    r, g, b = px(body, w, xx, yy)
-                    if r > 150 and g > 170 and b > 200:
-                        n += 1
-            return n
 
         def dump(name):
             # The monitor can answer before the PPM is fully
-            # written; on a loaded host the old fixed sleep read
-            # STALE frames (an arrow still mid-journey), which
-            # poisoned every position decision downstream. Wait
-            # for the file's mtime to actually advance.
+            # written; on a loaded host a fixed sleep read STALE
+            # frames (an arrow still mid-journey), which poisoned
+            # every position decision downstream. Wait for the
+            # file's mtime to actually advance.
             try:
                 before = os.stat(name).st_mtime_ns
             except OSError:
@@ -213,24 +165,19 @@ def main():
                 time.sleep(0.1)
             return read_ppm(name)
 
-        w2, h2, body = dump(os.path.join(ROOT, "build", "fb_con1.ppm"))
-        upper = band_bright(200, 560)
-        lower_before = band_bright(560, 1000)
-        print("console bright samples: upper", upper,
-              "lower", lower_before)
-        check("console shows mirrored boot text", upper > 400)
-        ser.send("echo FBCON82\n")
-        check("shell echoes the marker on serial",
-              ser.until("FBCON82", 30))
-        time.sleep(0.6)
-        w2, h2, body = dump(os.path.join(ROOT, "build", "fb_con2.ppm"))
-        lower_after = band_bright(560, 1000)
-        print("console bright samples after echo: lower", lower_after)
-        check("console advanced with new shell output",
-              lower_after > lower_before + 20)
-        save_png(os.path.join(ROOT, "build", "fb_con.png"), w, h, body)
+        def mon_cmd(cmd, wait=0.3):
+            m = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            m.connect(MON)
+            m.settimeout(5)
+            m.recv(4096)
+            m.sendall((cmd + "\n").encode())
+            time.sleep(wait)
+            try:
+                m.recv(4096)
+            except socket.timeout:
+                pass
+            m.close()
 
-        # --- M83: type on the PS/2 keyboard via monitor sendkey ---
         def sendkey(key):
             m = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             m.connect(MON)
@@ -240,21 +187,81 @@ def main():
             time.sleep(0.22)
             m.close()
 
-        for key in ("e", "c", "h", "o", "spc", "shift-k", "shift-b",
-                    "shift-d", "8", "3"):
+        def click():
+            mon_cmd("mouse_button 1", 0.5)
+            mon_cmd("mouse_button 0", 0.4)
+
+        def dblclick():
+            # press-to-press well inside the kernel's 60-tick
+            # double-click window
+            mon_cmd("mouse_button 1", 0.12)
+            mon_cmd("mouse_button 0", 0.12)
+            mon_cmd("mouse_button 1", 0.12)
+            mon_cmd("mouse_button 0", 0.3)
+
+        w, h, body = dump(PPM)
+        log = ser.text()
+        check("kernel reports the framebuffer on serial",
+              "Yousj OS: fb " in log)
+        check("no exceptions", "EXCEPTION" not in log)
+        print("screendump: %dx%d" % (w, h))
+        check("resolution at least 800x600", w >= 800 and h >= 600)
+
+        def wall(y):
+            # the kernel's gradient, recomputed
+            t = (y * 255) // h
+            return (0x17 - (0x0D * t) // 255,
+                    0x35 - (0x1B * t) // 255,
+                    0x50 - (0x24 * t) // 255)
+
+        # --- M91: the desktop is the screen -------------------
+        check("wallpaper gradient mid-screen",
+              close(px(body, w, 1024, 700), wall(700), 6))
+        check("wallpaper gradient lower",
+              close(px(body, w, 1024, 1500), wall(1500), 6))
+        check("old swatch spot is wallpaper now",
+              close(px(body, w, int(w * 1.5 / 8), h - 90),
+                    wall(h - 90), 6))
+        # no console text wall: right of the icon column the
+        # desktop is pure wallpaper
+        bright = 0
+        for yy in range(150, 1900, 3):
+            for xx in range(220, 2040, 3):
+                r, g, b = px(body, w, xx, yy)
+                if r > 150 and g > 170 and b > 200:
+                    bright += 1
+        print("stray bright samples on the desktop:", bright)
+        check("no console text wall on the desktop", bright < 5)
+        check("Terminal icon tile",
+              close(px(body, w, 100, 34), (0x0A, 0x14, 0x1F)))
+        check("About icon tile",
+              close(px(body, w, 60, 158), (0x2E, 0x5E, 0x8C)))
+        lbl = 0
+        for yy in range(104, 128):
+            for xx in range(24, 122):
+                r, g, b = px(body, w, xx, yy)
+                if r > 200 and g > 200 and b > 200:
+                    lbl += 1
+        print("Terminal label bright px:", lbl)
+        check("icon labels painted", lbl > 20)
+        check("taskbar present",
+              close(px(body, w, 600, 2028), (0x1B, 0x3A, 0x5C)))
+        check("start button present",
+              close(px(body, w, 30, 2028), (0x2E, 0x5E, 0x8C)))
+        check("desktop starts clean: no window chip",
+              close(px(body, w, 150, 2028), (0x1B, 0x3A, 0x5C)))
+        save_png(PNG, w, h, body)
+        print("screenshot saved:", PNG)
+
+        # --- M83: the keyboard still drives the serial shell --
+        for key in ("e", "c", "h", "o", "spc", "shift-k",
+                    "shift-b", "shift-d", "8", "3"):
             sendkey(key)
         sendkey("ret")
         check("keyboard-typed command ran (KBD83 on serial)",
               ser.until("KBD83", 30))
-        time.sleep(0.6)
-        w2, h2, body = dump(os.path.join(ROOT, "build", "fb_kbd.ppm"))
-        lower_kbd = band_bright(560, 1000)
-        print("console bright samples after keyboard:", lower_kbd)
-        check("console advanced with keyboard input",
-              lower_kbd > lower_after + 20)
-        save_png(os.path.join(ROOT, "build", "fb_kbd.png"), w, h, body)
 
-        # --- M84: move the PS/2 mouse, watch the arrow follow ---
+        # --- M84: the arrow follows, clicks leave no mark -----
         ARROW = [
             "#...........", "##..........", "#o#.........",
             "#oo#........", "#ooo#.......", "#oooo#......",
@@ -265,9 +272,6 @@ def main():
         ]
 
         def find_arrow(body2):
-            # numpy template match: a pure-Python scan of a
-            # 2048x2048 dump takes seconds and starves the VM
-            # it is measuring; this takes milliseconds.
             import numpy as np
             arr = np.frombuffer(body2, dtype=np.uint8).reshape(
                 h, w, 3).astype(np.int16)
@@ -292,55 +296,25 @@ def main():
             return (int(xs[0]), int(ys[0]))
 
         def goto(ex, ey, frm):
-            # Open-loop move + a long blind wait + one look.
-            # QEMU delivers a large PS/2 move packet by packet
-            # (+-127 each) over seconds, and screendump polling
-            # itself stalls that delivery -- every closed-loop
-            # scheme tried here (settle watching, stable-park
-            # nudges) ended up double-delivering and overshoot-
-            # ing into a corner. A single move, patience scaled
-            # to the distance, and at most one correction from
-            # the verified resting position is what works.
+            # One open-loop trip, then verify. QEMU accumulates
+            # a large PS/2 move internally and each following
+            # mouse event flushes only a bounded chunk (~635px),
+            # so the trip ends with zero-move flushes; a second
+            # corrective trip would stack on the undelivered
+            # remainder and overshoot into a corner.
             def trip(tx, ty, fx, fy):
                 mon_cmd("mouse_move %d %d" % (tx - fx, ty - fy),
                         0.3)
                 dist = max(abs(tx - fx), abs(ty - fy))
-                # QEMU accumulates a big move internally and
-                # each FOLLOWING mouse event flushes only a
-                # bounded chunk of it (~5 packets, 635px --
-                # measured: a -1690 move showed 5 packets
-                # delivered at verify time, 10 by the next
-                # press, the rest only after another event).
-                # Flush with harmless zero moves, then rest.
                 for _ in range(2 + dist // 400):
                     mon_cmd("mouse_move 0 0", 0.35)
                 time.sleep(1.5)
 
-            # NO correction trip: every scheme that moved the
-            # mouse a second time based on an observed position
-            # overshot, because the observed frame lags the
-            # still-travelling arrow and the "correction" then
-            # stacks on top of the undelivered remainder. One
-            # trip, then verify (the caller's pixel checks and
-            # the kernel's own press log judge the result).
             trip(ex, ey, frm[0], frm[1])
             _, _, b2 = dump("/tmp/settle.ppm")
             pos = find_arrow(b2)
             print("goto (%d,%d) -> arrow %s" % (ex, ey, pos))
             return pos == (ex, ey)
-
-        def mon_cmd(cmd, wait=0.3):
-            m = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            m.connect(MON)
-            m.settimeout(5)
-            m.recv(4096)
-            m.sendall((cmd + "\n").encode())
-            time.sleep(wait)
-            try:
-                m.recv(4096)
-            except socket.timeout:
-                pass
-            m.close()
 
         def white_at(body2, cx, cy, rad=14):
             n = 0
@@ -351,107 +325,61 @@ def main():
                         n += 1
             return n
 
-        w2, h2, body = dump(os.path.join(ROOT, "build", "fb_m0.ppm"))
+        w, h, body = dump(os.path.join(ROOT, "build",
+                                       "fb_m0.ppm"))
         centre = white_at(body, w // 2, h // 2)
         print("cursor white px at centre:", centre)
         check("arrow sits at screen centre", centre > 10)
         goto(1224, 1124, (1024, 1024))
-        w2, h2, body = dump(os.path.join(ROOT, "build", "fb_m1.ppm"))
+        w, h, body = dump(os.path.join(ROOT, "build",
+                                       "fb_m1.ppm"))
         moved = white_at(body, w // 2 + 200, h // 2 + 100)
         gone = white_at(body, w // 2, h // 2)
         print("cursor white px at +200,+100:", moved,
               "centre now:", gone)
         check("arrow followed the mouse", moved > 10)
-        check("arrow vacated the centre (save-under)", gone < 5)
-        # click on the desktop (below the M85 window) for a marker.
-        # NOTE: HMP mouse_move sends its arguments as RELATIVE
-        # deltas for the PS/2 mouse (verified against dumps:
-        # the applied motion equals the arguments, not a delta
-        # from any tracked absolute position).
+        check("arrow vacated the centre (save-under)",
+              gone < 5)
         goto(1500, 1500, (1224, 1124))
-        mon_cmd("mouse_button 1", 0.5)
-        mon_cmd("mouse_button 0", 0.3)
-        w2, h2, body = dump(os.path.join(ROOT, "build", "fb_m2.ppm"))
-        mark = 0
-        for yy in range(1500, 1545):
-            for xx in range(1500, 1545):
-                r, g, b = px(body, w, xx, yy)
-                if r > 240 and 190 < g < 240 and b < 140:
-                    mark += 1
-        print("click marker px:", mark)
-        check("click dropped its marker", mark > 10)
-        save_png(os.path.join(ROOT, "build", "fb_mouse.png"), w, h, body)
+        click()
+        w, h, body = dump(os.path.join(ROOT, "build",
+                                       "fb_m2.ppm"))
+        check("bare desktop click leaves no mark (M91)",
+              close(px(body, w, 1514, 1514), wall(1514), 6))
+        save_png(os.path.join(ROOT, "build", "fb_mouse.png"),
+                 w, h, body)
 
-        # --- M85: the window exists, drags, and closes ---
-        check("window body present",
-              close(px(body, w, 1330, 1264), (0x24, 0x46, 0x6B)))
-        check("window title bar present",
-              close(px(body, w, 1330, 1094), (0x2E, 0x5E, 0x8C)))
-        check("window close box present",
-              close(px(body, w, 1589, 1087), (0xC0, 0x39, 0x2B)))
-        # grab the title at (1200,1094): from (1500,1500)
-        goto(1200, 1094, (1500, 1500))
-        mon_cmd("mouse_button 1", 0.5)
-        goto(1350, 1214, (1200, 1094))
-        mon_cmd("mouse_button 0", 0.4)
-        w2, h2, body = dump(os.path.join(ROOT, "build", "fb_w1.ppm"))
-        check("window followed the drag",
-              close(px(body, w, 1480, 1384), (0x24, 0x46, 0x6B)))
-        check("window title moved too",
-              close(px(body, w, 1480, 1214), (0x2E, 0x5E, 0x8C)))
-        check("old window spot repainted to console",
-              close(px(body, w, 1100, 1130), (0x10, 0x24, 0x3E)))
-        save_png(os.path.join(ROOT, "build", "fb_win.png"), w, h, body)
-        # close it: box centre now at (1746,1214): from (1350,1214)
-        goto(1746, 1214, (1350, 1214))
-        mon_cmd("mouse_button 1", 0.5)
-        mon_cmd("mouse_button 0", 0.4)
-        w2, h2, body = dump(os.path.join(ROOT, "build", "fb_w2.ppm"))
-        check("window closed, console restored",
-              close(px(body, w, 1480, 1384), (0x10, 0x24, 0x3E)))
-        save_png(os.path.join(ROOT, "build", "fb_closed.png"), w, h,
-                 body)
+        # --- M91: icon select, deselect, double-click launch --
+        def sel_band():
+            n = 0
+            for yy in range(106, 126):
+                for xx in range(24, 120):
+                    r, g, b = px(body, w, xx, yy)
+                    if b > 112 and r < 0x40:
+                        n += 1
+            return n
 
-        # --- M86: taskbar, start menu, reopen the window ---
-        # pointer is at (1746,1214); the window is closed now.
-        check("taskbar present",
-              close(px(body, w, 600, 2028), (0x1B, 0x3A, 0x5C)))
-        check("start button present",
-              close(px(body, w, 30, 2028), (0x2E, 0x5E, 0x8C)))
-        check("no window chip while closed",
-              close(px(body, w, 150, 2028), (0x1B, 0x3A, 0x5C)))
-        goto(56, 2028, (1746, 1214))
-        mon_cmd("mouse_button 1", 0.5)
-        mon_cmd("mouse_button 0", 0.4)
-        w2, h2, body = dump(os.path.join(ROOT, "build", "fb_d1.ppm"))
-        check("start menu opened",
-              close(px(body, w, 200, 2000), (0x24, 0x46, 0x6B)))
-        goto(100, 1946, (56, 2028))
-        mon_cmd("mouse_button 1", 0.5)
-        mon_cmd("mouse_button 0", 0.4)
-        w2, h2, body = dump(os.path.join(ROOT, "build", "fb_d2.ppm"))
-        check("menu reopened the window",
-              close(px(body, w, 1330, 1094), (0x2E, 0x5E, 0x8C)))
-        check("menu closed itself",
-              close(px(body, w, 200, 2000), (0x10, 0x24, 0x3E)))
-        check("window chip back on the taskbar",
-              close(px(body, w, 150, 2028), (0x24, 0x46, 0x6B)))
-
-        save_png(os.path.join(ROOT, "build", "fb_desk.png"), w, h,
-                 body)
-
-        # --- M88: a real shell inside a window ----------------
-        # Type `gterm` at the console prompt; a terminal window
-        # opens at (300,300), 880x560, and takes the keyboard.
-        # Commands typed then run INSIDE the window; closing
-        # it with the mouse hands the keyboard back.
-        for key in ("g", "t", "e", "r", "m"):
-            sendkey(key)
-        sendkey("ret")
+        goto(72, 60, (1500, 1500))
+        click()
+        w, h, body = dump(os.path.join(ROOT, "build",
+                                       "fb_i1.ppm"))
+        sel = sel_band()
+        print("selection band px after one click:", sel)
+        check("single click selects the Terminal icon",
+              sel > 800)
+        goto(1500, 1500, (72, 60))
+        click()
+        w, h, body = dump(os.path.join(ROOT, "build",
+                                       "fb_i2.ppm"))
+        desel = sel_band()
+        print("selection band px after desktop click:", desel)
+        check("desktop click clears the selection", desel < 50)
+        goto(72, 60, (1500, 1500))
+        dblclick()
         time.sleep(2.5)
-        w2, h2, body = dump(os.path.join(ROOT, "build",
-                                         "fb_t1.ppm"))
-        check("terminal window title bar",
+        w, h, body = dump(os.path.join(ROOT, "build",
+                                       "fb_t1.ppm"))
+        check("double-click opened the terminal window",
               close(px(body, w, 500, 310), (0x2E, 0x5E, 0x8C)))
         check("terminal window body",
               close(px(body, w, 700, 700), (0x24, 0x46, 0x6B)))
@@ -468,77 +396,107 @@ def main():
         before = win_text_pixels()
         check("shell banner rendered in the window",
               before > 60)
-        for key in ("e", "c", "h", "o", "spc", "shift-g", "u",
-                    "i", "8", "8"):
+        for key in ("e", "c", "h", "o", "spc", "shift-g",
+                    "shift-u", "shift-i", "9", "1"):
             sendkey(key)
         sendkey("ret")
         time.sleep(2.0)
-        w2, h2, body = dump(os.path.join(ROOT, "build",
-                                         "fb_t2.ppm"))
+        w, h, body = dump(os.path.join(ROOT, "build",
+                                       "fb_t2.ppm"))
         after = win_text_pixels()
         print("window text pixels before/after echo:",
               before, after)
-        check("typed command ran inside the window",
+        check("typed command ran inside the window (GUI91)",
               after > before + 15)
         save_png(os.path.join(ROOT, "build", "fb_term.png"),
                  w, h, body)
-
-        goto(1166, 310, (100, 1946))
-        mon_cmd("mouse_button 1", 0.5)
-        mon_cmd("mouse_button 0", 0.4)
+        goto(1166, 310, (72, 60))
+        click()
         time.sleep(1.5)
-        w2, h2, body = dump(os.path.join(ROOT, "build",
-                                         "fb_t3.ppm"))
-        check("terminal window closed by its red box",
+        w, h, body = dump(os.path.join(ROOT, "build",
+                                       "fb_t3.ppm"))
+        check("terminal closed, wallpaper restored",
+              close(px(body, w, 500, 310), wall(310), 6))
+        check("terminal body gone",
               not close(px(body, w, 1100, 800),
                         (0x24, 0x46, 0x6B)))
         for key in ("e", "c", "h", "o", "spc", "shift-b",
-                    "shift-a", "shift-c", "shift-k", "8", "8"):
+                    "shift-a", "shift-c", "shift-k", "9", "1"):
             sendkey(key)
         sendkey("ret")
-        back_ok = ser.until("BACK88", 30)
-        check("console shell took the keyboard back (BACK88)",
+        back_ok = ser.until("BACK91", 30)
+        check("console shell live behind the desktop (BACK91)",
               back_ok)
         if not back_ok:
             print("serial tail:", repr(ser.text()[-600:]))
 
-        # --- M89: the start menu launches a terminal --------
-        # Open the menu, click "Terminal": the kernel types
-        # `gterm` into the console ring and the shell runs it.
-        goto(56, 2028, (1166, 310))
+        # --- M91: the About icon, its window, a drag ----------
+        goto(72, 184, (1166, 310))
+        dblclick()
+        time.sleep(1.2)
+        w, h, body = dump(os.path.join(ROOT, "build",
+                                       "fb_a1.ppm"))
+        check("About window opened centered (title)",
+              close(px(body, w, 754, 860), (0x2E, 0x5E, 0x8C)))
+        check("About window body",
+              close(px(body, w, 1000, 1000),
+                    (0x24, 0x46, 0x6B)))
+        check("taskbar chip names the About window",
+              close(px(body, w, 150, 2028), (0x24, 0x46, 0x6B)))
+        save_png(os.path.join(ROOT, "build", "fb_about.png"),
+                 w, h, body)
+        goto(1000, 868, (72, 184))
         mon_cmd("mouse_button 1", 0.5)
+        goto(1150, 988, (1000, 868))
         mon_cmd("mouse_button 0", 0.4)
-        w2, h2, body = dump(os.path.join(ROOT, "build",
-                                         "fb_m1.ppm"))
+        w, h, body = dump(os.path.join(ROOT, "build",
+                                       "fb_a2.ppm"))
+        check("About window followed the drag",
+              close(px(body, w, 1280, 1154),
+                    (0x24, 0x46, 0x6B)))
+        check("drag start repainted to wallpaper",
+              close(px(body, w, 760, 880), wall(880), 6))
+        goto(1440, 984, (1150, 988))
+        click()
+        w, h, body = dump(os.path.join(ROOT, "build",
+                                       "fb_a3.ppm"))
+        check("About closed, wallpaper restored",
+              close(px(body, w, 904, 980), wall(980), 6))
+
+        # --- M86/M89: the start menu still launches -----------
+        goto(56, 2028, (1440, 984))
+        click()
+        w, h, body = dump(os.path.join(ROOT, "build",
+                                       "fb_m91a.ppm"))
         check("start menu opened (two entries)",
               close(px(body, w, 200, 2000), (0x24, 0x46, 0x6B)))
         goto(100, 1988, (56, 2028))
-        mon_cmd("mouse_button 1", 0.5)
-        mon_cmd("mouse_button 0", 0.4)
+        click()
         time.sleep(2.5)
-        w2, h2, body = dump(os.path.join(ROOT, "build",
-                                         "fb_m2.ppm"))
+        w, h, body = dump(os.path.join(ROOT, "build",
+                                       "fb_m91b.ppm"))
         check("menu Terminal entry opened a terminal window",
               close(px(body, w, 500, 310), (0x2E, 0x5E, 0x8C)))
+        check("menu area repainted to wallpaper",
+              close(px(body, w, 200, 2000), wall(2000), 6))
         check("taskbar chip names the menu-launched terminal",
               close(px(body, w, 150, 2028), (0x24, 0x46, 0x6B)))
         save_png(os.path.join(ROOT, "build", "fb_menu.png"),
                  w, h, body)
         goto(1166, 310, (100, 1988))
-        mon_cmd("mouse_button 1", 0.5)
-        mon_cmd("mouse_button 0", 0.4)
+        click()
         time.sleep(1.5)
-        w2, h2, body = dump(os.path.join(ROOT, "build",
-                                         "fb_m3.ppm"))
+        w, h, body = dump(os.path.join(ROOT, "build",
+                                       "fb_m91c.ppm"))
         check("menu-launched terminal closed by its red box",
               not close(px(body, w, 1100, 800),
                         (0x24, 0x46, 0x6B)))
         for key in ("e", "c", "h", "o", "spc", "shift-m",
-                    "shift-e", "shift-n", "shift-u", "8", "9"):
+                    "shift-e", "shift-n", "shift-u", "9", "1"):
             sendkey(key)
         sendkey("ret")
-        menu_ok = ser.until("MENU89", 30)
-        check("console shell live after menu launch (MENU89)",
+        menu_ok = ser.until("MENU91", 30)
+        check("console shell live after menu launch (MENU91)",
               menu_ok)
         if not menu_ok:
             print("serial tail:", repr(ser.text()[-400:]))

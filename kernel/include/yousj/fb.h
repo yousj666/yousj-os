@@ -38,9 +38,23 @@ void fb_fill_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h,
 
 /* Draw text with the built-in 8x16 font at pixel position (x, y),
  * scaled by an integer factor (>= 1). bg is painted behind glyphs
- * so lines overwrite cleanly. */
+ * so lines overwrite cleanly -- unless bg is FB_TEXT_TRANSPARENT,
+ * in which case only the glyph pixels are painted (M91: text over
+ * the desktop wallpaper). */
+#define FB_TEXT_TRANSPARENT 0xFFFFFFFFu
 void fb_draw_text(uint32_t x, uint32_t y, const char *text,
                   uint32_t fg, uint32_t bg, uint32_t scale);
+
+/* Desktop wallpaper (M91): a vertical gradient that IS the
+ * desktop background. fb_desktop_paint_rect() repaints any
+ * rectangle of it -- what the window layer restores when a
+ * window moves or closes over the desktop. */
+void fb_desktop_paint_rect(uint32_t x, uint32_t y, uint32_t w,
+                           uint32_t h);
+
+/* 1 when the screen runs the desktop (a GOP boot). The serial
+ * console is unaffected either way. */
+int fb_desktop(void);
 
 uint32_t fb_width(void);
 uint32_t fb_height(void);
