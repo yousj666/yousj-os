@@ -38,6 +38,9 @@ struct yousj_framebuffer {
     uint32_t height;
     uint32_t pitch;     /* bytes per scanline */
     uint8_t  bpp;
+    /* reserved[0] (M81): pixel channel order for 32bpp --
+     * 0 = lowest byte is red (UEFI pixel format 0, RGBx),
+     * 1 = lowest byte is blue (format 1, BGRx). */
     uint8_t  reserved[3];
 };
 

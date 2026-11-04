@@ -741,6 +741,78 @@ static void jump_to_kernel(const struct yousj_boot_info *info,
 }
 
 /* ---------------------------------------------------------------- */
+/* Graphics (M81): find GOP, pick its largest direct-color mode,    */
+/* set it, and remember the framebuffer for boot_info. This runs    */
+/* BEFORE the memory-map fetch loop on purpose: SetMode is allowed  */
+/* to allocate, and anything that allocates must not happen         */
+/* between GetMemoryMap and ExitBootServices. fetch_map_and_build   */
+/* zeroes the boot_info struct on every attempt, so the cached      */
+/* numbers are copied into info->fb after each successful build,    */
+/* just before the exit call.                                       */
+/*                                                                  */
+/* Fail-soft by design: no GOP, an odd pixel format, or a refused   */
+/* SetMode leaves g_fb all zero -- the kernel then simply has no    */
+/* screen and the serial console stays the only console, exactly    */
+/* as before M81. fb.reserved[0] carries the pixel order: 0 = the   */
+/* lowest byte is red (UEFI format 0, RGBx), 1 = blue (format 1,    */
+/* BGRx); boot.h's struct leaves reserved[] to us.                  */
+/* ---------------------------------------------------------------- */
+
+static struct yousj_framebuffer g_fb; /* zeroed: no screen (yet) */
+
+static void setup_framebuffer(void)
+{
+    static const struct efi_guid gop_guid =
+        EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID;
+    struct efi_graphics_output_protocol *gop = NULL;
+    efi_status_t status;
+    uint32_t best = 0, have_best = 0;
+    uint64_t best_area = 0;
+    uint32_t m;
+
+    status = g_bs->locate_protocol(&gop_guid, NULL, (void **)&gop);
+    if (EFI_ERROR(status) || gop == NULL || gop->mode == NULL)
+        return;
+    for (m = 0; m < gop->mode->max_mode; m++) {
+        struct efi_graphics_output_mode_info *mi = NULL;
+        uint64_t size = 0, area;
+        status = gop->query_mode(gop, m, &size, &mi);
+        if (EFI_ERROR(status) || mi == NULL)
+            continue;
+        if (mi->pixel_format <= 1) {
+            area = (uint64_t)mi->horizontal_resolution *
+                   mi->vertical_resolution;
+            if (!have_best || area > best_area) {
+                best = m;
+                best_area = area;
+                have_best = 1;
+            }
+        }
+        g_bs->free_pool(mi);
+    }
+    if (!have_best)
+        return;
+    if (best != gop->mode->mode) {
+        status = gop->set_mode(gop, best);
+        if (EFI_ERROR(status))
+            return; /* keep whatever the firmware had: no fb claim */
+    }
+    if (gop->mode->info == NULL || gop->mode->frame_buffer_base == 0)
+        return;
+    g_fb.addr = gop->mode->frame_buffer_base;
+    g_fb.width = gop->mode->info->horizontal_resolution;
+    g_fb.height = gop->mode->info->vertical_resolution;
+    g_fb.pitch = gop->mode->info->pixels_per_scan_line * 4;
+    g_fb.bpp = 32;
+    g_fb.reserved[0] = (uint8_t)gop->mode->info->pixel_format;
+    con_print("Yousj OS: GOP framebuffer ");
+    con_print_hex64(g_fb.width);
+    con_print("x");
+    con_print_hex64(g_fb.height);
+    con_print("\n");
+}
+
+/* ---------------------------------------------------------------- */
 /* Entry point (UEFI calling convention).                           */
 /* ---------------------------------------------------------------- */
 
@@ -803,6 +875,11 @@ efi_status_t EFIAPI efi_main(efi_handle_t image_handle,
 
     rsdp = find_rsdp();
 
+    /* M81: graphics mode BEFORE the map fetch loop (see the
+     * comment on setup_framebuffer). g_fb survives the loop;
+     * each attempt copies it into the freshly built info. */
+    setup_framebuffer();
+
     /* LoadOptions (CHAR16, usually the loader's own name/args) ->
      * ASCII for boot.h's cmdline. Non-ASCII becomes '?'. */
     {
@@ -827,6 +904,7 @@ efi_status_t EFIAPI efi_main(efi_handle_t image_handle,
             info, &kimg, (uint64_t)(uintptr_t)info,
             info_pages * EFI_PAGE_SIZE, stack_base,
             stack_pages * EFI_PAGE_SIZE, rsdp, cmdline_ascii);
+        info->fb = g_fb; /* M81: build zeroed it; refill per attempt */
         status = g_bs->exit_boot_services(image_handle, map_key);
         if (!EFI_ERROR(status))
             break;

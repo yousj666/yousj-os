@@ -18,6 +18,7 @@
 #include <yousj/user.h>
 #include <yousj/elf.h>
 #include <yousj/net.h>
+#include <yousj/fb.h>
 #include <drivers/serial.h> /* kernel/drivers/serial.h; -I kernel in Makefile */
 
 /* M1 demo threads (SCHED_DESIGN.md milestone M1): two cooperative
@@ -382,6 +383,12 @@ void kmain(struct yousj_boot_info *boot_info)
 
     serial_puts("Yousj OS: boot_info OK, memory map received\n");
 
+    /* M81: snapshot the framebuffer handoff NOW, while boot_info
+     * is still reachable through the hand-off identity map; the
+     * master space that replaces it has no identity map, and the
+     * fb_init() call below happens long after the switch. */
+    struct yousj_framebuffer boot_fb = boot_info->fb;
+
     /* M23: seed the wall clock from the CMOS RTC before
      * anything can ask for a timestamp. */
     time_init();
@@ -520,6 +527,7 @@ void kmain(struct yousj_boot_info *boot_info)
          * embedded program images become its first files. */
         fs_init();
         net_init(); /* M72: probe the NIC (absent is fine) */
+        fb_init(&boot_fb); /* M81: light the screen if GOP gave one */
         if (fs_load_initramfs() < 0) {
             serial_puts("Yousj OS: initramfs FAILED (corrupt archive)\n");
             halt_forever();

@@ -51,6 +51,8 @@ struct efi_guid {
     { 0x8868E871, 0xE4F1, 0x11D3, { 0xBC, 0x22, 0x00, 0x80, 0xC7, 0x3C, 0x88, 0x81 } }
 #define EFI_ACPI_10_TABLE_GUID \
     { 0xEB9D2D30, 0x2D88, 0x11D3, { 0x9A, 0x16, 0x00, 0x90, 0x27, 0x3F, 0xC1, 0x4D } }
+#define EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID \
+    { 0x9042A9DE, 0x23DC, 0x4A38, { 0x96, 0xFB, 0x7A, 0xDE, 0xD0, 0x80, 0x51, 0x6A } }
 
 /* ---- memory ---------------------------------------------------- */
 
@@ -207,6 +209,56 @@ struct efi_boot_services {
     void *_unload_image;
     efi_status_t (EFIAPI *exit_boot_services)(efi_handle_t image_handle,
                                               uint64_t map_key);
+    /* M81: modelled on to locate_protocol (spec offsets 0xF0..0x140)
+     * because GOP is how the framebuffer handoff gets filled. */
+    void *_get_next_monotonic_count;
+    void *_stall;
+    void *_set_watchdog_timer;
+    void *_connect_controller;
+    void *_disconnect_controller;
+    void *_open_protocol;
+    void *_close_protocol;
+    void *_open_protocol_information;
+    void *_protocols_per_handle;
+    void *_locate_handle_buffer;
+    efi_status_t (EFIAPI *locate_protocol)(const struct efi_guid *protocol,
+                                           void *registration,
+                                           void **interface);
+};
+
+/* ---- graphics output (M81) -------------------------------------- */
+
+/* EFI_GRAPHICS_OUTPUT_MODE_INFORMATION. pixel_format uses the
+ * EFI_GRAPHICS_PIXEL_FORMAT enum: 0 = RGBx, 1 = BGRx (the two
+ * direct-color formats with a framebuffer worth having). */
+struct efi_graphics_output_mode_info {
+    uint32_t version;
+    uint32_t horizontal_resolution;
+    uint32_t vertical_resolution;
+    uint32_t pixel_format;
+    uint32_t red_mask, green_mask, blue_mask, reserved_mask;
+    uint32_t pixels_per_scan_line;
+};
+
+/* EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE: what gop->mode points at. */
+struct efi_graphics_output_mode {
+    uint32_t max_mode;
+    uint32_t mode;
+    struct efi_graphics_output_mode_info *info;
+    uint64_t size_of_info;
+    uint64_t frame_buffer_base;
+    uint64_t frame_buffer_size;
+};
+
+struct efi_graphics_output_protocol {
+    efi_status_t (EFIAPI *query_mode)(
+        struct efi_graphics_output_protocol *self, uint32_t mode_number,
+        uint64_t *size_of_info,
+        struct efi_graphics_output_mode_info **info);
+    efi_status_t (EFIAPI *set_mode)(
+        struct efi_graphics_output_protocol *self, uint32_t mode_number);
+    void *_blt;
+    struct efi_graphics_output_mode *mode;
 };
 
 /* ---- system table ---------------------------------------------- */
