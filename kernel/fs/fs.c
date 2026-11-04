@@ -825,6 +825,65 @@ long fs_sockpair_create(struct yousj_file **a_out,
     return 0;
 }
 
+/* --- M87: PTY pairs -----------------------------------------
+ * A PTY is an M67 sockpair with a different birth: opening
+ * /dev/ptmx creates the pair and returns end 0 (the master);
+ * end 1 (the slave) is materialised later, exactly once, by
+ * fs_pty_make_slave. Until then ends[1] is 0, so the stream
+ * semantics fall out of the shared code for free: a master
+ * write with no slave yet has nowhere to go (the channel
+ * buffers it, like an unread pipe), and if the master dies
+ * first the pair dies with it, untaken slave and all. Data
+ * movement is raw -- no line discipline; the terminal
+ * emulator on the master side owns echo and editing, which
+ * is also how the console works today. */
+
+long fs_pty_open_master(struct yousj_file **out)
+{
+    struct yousj_sockpair *sp;
+    struct yousj_file *m;
+
+    sp = sockpair_alloc();
+    if (sp == NULL)
+        return -YOUSJ_ENFILE;
+    sp->pty = true;
+    sp->ends[1] = 0; /* no slave until pty_slave takes it */
+    m = file_alloc();
+    if (m == NULL) {
+        sp->in_use = false;
+        return -YOUSJ_ENFILE;
+    }
+    m->spair = sp;
+    m->spair_end = 0;
+    m->flags = YOUSJ_O_RDWR;
+    *out = m;
+    return 0;
+}
+
+long fs_pty_make_slave(struct yousj_file *master,
+                       struct yousj_file **out)
+{
+    struct yousj_sockpair *sp;
+    struct yousj_file *s;
+
+    if (master == NULL || master->spair == NULL ||
+        master->spair_end != 0 || !master->spair->pty)
+        return -YOUSJ_EINVAL;
+    sp = master->spair;
+    if (sp->slave_taken)
+        return -YOUSJ_EINVAL;
+    s = file_alloc();
+    if (s == NULL)
+        return -YOUSJ_ENFILE;
+    sp->slave_taken = true;
+    sp->ends[1] = 1;
+    s->spair = sp;
+    s->spair_end = 1;
+    s->flags = YOUSJ_O_RDWR;
+    *out = s;
+    return 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* M68: named AF_UNIX stream sockets. The endpoint object lives
  * here; the syscall layer copies sockaddr_un in and installs
@@ -2739,6 +2798,13 @@ long fs_open_path(const char *path, long flags,
     if (rc != 0)
         return rc;
     path = resolved;
+    /* M87: /dev/ptmx is not a file -- opening it creates a
+     * PTY pair and returns the master end. */
+    if (path[0] == '/' && path[1] == 'd' && path[2] == 'e' &&
+        path[3] == 'v' && path[4] == '/' && path[5] == 'p' &&
+        path[6] == 't' && path[7] == 'm' && path[8] == 'x' &&
+        path[9] == '\0')
+        return fs_pty_open_master(out);
     if (is_data_path(path))
         return yfs_open_path_fs(data_rel(path), flags,
                                 mode_bits, out);
@@ -4577,16 +4643,17 @@ void fs_init(void)
     ramfs_mkdir_path("/dev");
     {
         struct yousj_ramfs_node *devdir = fs_lookup("/dev");
-        static const char *const names[7] = {
+        static const char *const names[8] = {
             "null", "zero", "full", "random", "urandom",
             "console", /* M49 */
-            "tty" /* M63: the console under its other name */
+            "tty", /* M63: the console under its other name */
+            "ptmx" /* M87: opening it creates a PTY pair */
         };
-        static const uint32_t ids[7] = { 1, 2, 3, 4, 4, 5,
-                                         5 };
+        static const uint32_t ids[8] = { 1, 2, 3, 4, 4, 5,
+                                         5, 6 };
         int i;
         if (devdir != NULL) {
-            for (i = 0; i < 7; i++) {
+            for (i = 0; i < 8; i++) {
                 struct yousj_ramfs_node *n = node_create(
                     devdir, names[i], str_len(names[i]),
                     false);

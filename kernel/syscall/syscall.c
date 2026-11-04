@@ -6096,6 +6096,26 @@ static long sys_net_info(uint64_t buf, uint64_t len)
     return (long)net_snapshot((char *)(uintptr_t)buf, len);
 }
 
+/* M87: pty_slave(master_fd) -> new fd for the slave end of
+ * a /dev/ptmx pair. */
+static long sys_pty_slave(long master_fd)
+{
+    struct task *me = sched_current();
+    struct yousj_file *mf = fd_file_of(me, master_fd);
+    struct yousj_file *sf;
+    long rc;
+
+    if (mf == NULL)
+        return -YOUSJ_EBADF;
+    rc = fs_pty_make_slave(mf, &sf);
+    if (rc != 0)
+        return rc;
+    rc = fd_alloc(me, sf);
+    if (rc < 0)
+        file_put(sf);
+    return rc;
+}
+
 /* --- dispatcher --------------------------------------------------------- */
 
 /* The switch itself. Arguments arrive via the entry shim's
@@ -6439,6 +6459,8 @@ static long dispatch_inner(struct yousj_syscall_ctx *ctx)
         return (long)pmm_free_page_count();
     case YOUSJ_SYS_NATIVE_NET_INFO:
         return sys_net_info(a1, a2);
+    case YOUSJ_SYS_NATIVE_PTY_SLAVE:
+        return sys_pty_slave((long)a1);
     case YOUSJ_SYS_NATIVE_NET_ARP: {
         /* a1 arrives in network byte order */
         uint32_t b = (uint32_t)a1;

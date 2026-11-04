@@ -1635,16 +1635,35 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   像素，测试须以零位
   移动多次「冲刷」后
   再定位点击。）
-- ⏳ 下一步候选：图
-  形终端窗口（把 shell
-  装进窗口）、多窗口、
-  modern virtio、服务
-  器版日常化（服务管
-  理＋持久根 fs），待
-  定向；SCM_RIGHTS/
-  抽象地址/sendfile
-  对 socket 输入仍在
-  socket 面待办。
+- ✅ PTY 对 M87
+  （2026-11-04）：开
+  /dev/ptmx 造一对伪
+  终端（复用 M67
+  sockpair 双通道与
+  阻塞/轮询语义，标
+  记 pty），原生调用
+  pty_slave(0x1005)
+  取从端 fd；原始字
+  节流、无行规程，回
+  显/编辑归主端终端
+  模拟器。验收：pty
+  套件 12 场景×2 轮
+  全过（双向流通、
+  poll、跨 fork 阻塞
+  读、关主端 EOF、双
+  对独立、无泄漏）。
+- ⏳ 下一步：M88 图
+  形终端——GUI 原生
+  调用（开窗/绘字/
+  事件）＋ gterm 把
+  真 shell 经 PTY 装
+  进窗口。再后：多窗
+  口、modern virtio、
+  服务器版日常化；SCM
+  _RIGHTS/抽象地址/
+  sendfile 对 socket
+  输入仍在 socket 面
+  待办。
 
 ## 从零构建
 

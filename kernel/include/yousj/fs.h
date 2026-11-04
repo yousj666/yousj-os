@@ -65,6 +65,13 @@ struct yousj_sockpair {
     int ends[2];
     uint8_t shut[2];
     bool in_use;
+    /* M87: this pair is a PTY (created via /dev/ptmx, not
+     * socketpair()). The channels and lifetime rules are the
+     * same raw byte streams; slave_taken records that the
+     * slave end (end 1) has been materialised by pty_slave --
+     * until then ends[1] is 0 and the pair is master-only. */
+    bool pty;
+    bool slave_taken;
 };
 
 /* M68: a named AF_UNIX stream socket endpoint that is not
@@ -203,6 +210,14 @@ long fs_pipe_create(struct yousj_file **rd_out,
  * refcount 1, both O_RDWR). 0 or a negative errno. */
 long fs_sockpair_create(struct yousj_file **a_out,
                         struct yousj_file **b_out);
+
+/* M87: PTYs. fs_pty_open_master creates a pair and hands out
+ * the master end (refcount 1, O_RDWR); the slave end does not
+ * exist until fs_pty_make_slave materialises it (once only).
+ * 0 or a negative errno. */
+long fs_pty_open_master(struct yousj_file **out);
+long fs_pty_make_slave(struct yousj_file *master,
+                       struct yousj_file **out);
 
 /* M68: named AF_UNIX stream sockets. All take an absolute,
  * link-resolved path. 0 or a negative errno. */

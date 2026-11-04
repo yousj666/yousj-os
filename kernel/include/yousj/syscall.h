@@ -129,6 +129,12 @@
 #define YOUSJ_SYS_NATIVE_NET_ARP     (YOUSJ_SYS_NATIVE_BASE + 3)
 /* M73: net_ping(ip_be32) -> 0 when the echo request is out */
 #define YOUSJ_SYS_NATIVE_NET_PING    (YOUSJ_SYS_NATIVE_BASE + 4)
+/* M87: pty_slave(master_fd) -> a new fd for the slave end of
+ * the PTY pair created by opening /dev/ptmx. Linux grows the
+ * slave as /dev/pts/N after TIOCGPTN + unlockpt ioctls; this
+ * native call is the Yousj shortcut until that ioctl surface
+ * is worth building (the pair itself is the real thing). */
+#define YOUSJ_SYS_NATIVE_PTY_SLAVE   (YOUSJ_SYS_NATIVE_BASE + 5)
 
 #define YOUSJ_SYS_inotify_init     253 /* M48 */
 #define YOUSJ_SYS_inotify_add_watch 254 /* M48 */
