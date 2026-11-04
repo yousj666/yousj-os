@@ -347,6 +347,33 @@ image: kernel
 	cd dist && sha256sum yousj-os-$(VERSION).img > SHA256SUMS
 	@echo "image ready: dist/yousj-os-$(VERSION).img"
 
+# M80: the same system as a bootable ISO (ISO 9660 + El
+# Torito UEFI). A small 8 MiB FAT image carries the loader
+# and kernel for the El Torito entry (its size must fit
+# the catalog's 16-bit 512-sector count); the ISO itself
+# also lists the files in plain sight. Written by our own
+# tools/mkiso.py -- no xorriso on this path.
+.PHONY: iso
+iso: image
+	rm -rf build/isoesp && mkdir -p build/isoesp
+	dd if=/dev/zero of=build/isoesp/efiboot.img bs=1M count=8 status=none
+	mformat -i build/isoesp/efiboot.img ::
+	@# NOTE: no -F here. Forcing FAT32 at 8 MiB produces a
+	@# degenerate volume OVMF's FAT driver refuses outright
+	@# (mtools reads it happily, which makes the failure
+	@# easy to miss); mformat's own choice at this size is
+	@# FAT12/16, which firmware boots fine (M80 debugging).
+	mmd -i build/isoesp/efiboot.img ::/EFI ::/EFI/YOUSJ ::/EFI/BOOT
+	mcopy -i build/isoesp/efiboot.img build/image/BOOTX64.EFI ::/EFI/YOUSJ/BOOTX64.EFI
+	mcopy -i build/isoesp/efiboot.img build/image/BOOTX64.EFI ::/EFI/BOOT/BOOTX64.EFI
+	mcopy -i build/isoesp/efiboot.img build/yousj-kernel.elf ::/EFI/YOUSJ/YOUSJ.KRN
+	python3 tools/mkiso.py --efi build/image/BOOTX64.EFI \
+	    --kernel build/yousj-kernel.elf \
+	    --bootimg build/isoesp/efiboot.img \
+	    --out dist/yousj-os-$(VERSION).iso
+	cd dist && sha256sum yousj-os-$(VERSION).img yousj-os-$(VERSION).iso > SHA256SUMS
+	@echo "iso ready: dist/yousj-os-$(VERSION).iso"
+
 $(KERNEL): $(KERNEL_LINK_OBJS) kernel/arch/x86_64/link.ld
 	ld -T kernel/arch/x86_64/link.ld -o $@ $(KERNEL_LINK_OBJS)
 	@nm $@ | python3 -c "import sys; d={p[2]:int(p[0],16) for p in (l.split() for l in sys.stdin) if len(p)==3}; s=d['__kernel_end']-d['__kernel_start']; print(f'kernel image span: {s} bytes'); sys.exit('span exceeds the 8 MiB early-map window (stub + UEFI handoff, M58)' if s>8388608 else None)"

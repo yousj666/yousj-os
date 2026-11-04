@@ -1456,16 +1456,60 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   像自此可拷走、在任
   何 UEFI 机器/虚拟机
   上直接启动。
-- ⏳ 下一步候选：网卡
-  中断与 modern
-  virtio，然后服务器
-  版日常化（服务管理
-  ＋持久根文件系统安
-  装到镜像第二分区）；
-  SCM_RIGHTS 与抽象地
-  址留在 socket 面待
-  办，sendfile 对
-  socket 输入亦然。
+- ✅ 网卡中断 M79
+  （2026-11-04）：virtio
+  -net 的 INTx 线接通
+  ——通用 IRQ 桩（1–15
+  号，与 irq0 共用同
+  一条精细的返回路径：
+  帧规范化＋信号门）、
+  irq_register 注册＋
+  PIC 放行、驱动读配
+  置空间 IRQ 号、ISR
+  读寄存器应答并排空
+  接收环；netinfo 新增
+  net_irq 计数，net 套
+  件断言其 ≥1（真中断
+  而非轮询冒充）。tick
+  轮询保留作安全网；
+  timer_start 改读改写
+  掩码，免得把设备刚
+  放行的线又盖回去。
+- ✅ ISO 镜像 M80
+  （2026-11-04，用户
+  点名）：`make iso`
+  产出 dist/yousj-os-
+  0.1.0.iso——自研
+  tools/mkiso.py 写
+  ISO 9660＋El Torito
+  (UEFI)，无 xorriso
+  依赖；验收 qemu-iso-
+  test.py 以光盘冷启
+  7 项全过。坑记一笔：
+  El Torito 引导镜像
+  的小 FAT 卷不能强
+  制 FAT32（`mformat
+  -F` 在 8MiB 上做出
+  的卷 mtools 能读、
+  OVMF 拒认），用
+  mformat 默认的
+  FAT12/16 即可。
+- ⏳ 下一步：GUI 线开
+  工（用户 2026-11-04
+  亲订）——M81 帧缓冲
+  点亮：引导侧打开
+  GOP 填 bootinfo.fb，
+  内核画像素/文字，
+  截图验收；其后键鼠
+  输入、窗口合成、桌
+  面环境。modern
+  virtio 与服务器版日
+  常化（服务管理＋持
+  久根 fs）随后；
+  SCM_RIGHTS/抽象地
+  址/sendfile 对
+  socket 输入仍在
+  socket 面待办。
 
 ## 从零构建
 
