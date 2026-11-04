@@ -24,13 +24,70 @@
 #define COL_TEXT   0xFFFFFFu
 #define COL_BTEXT  0xD7E3F4u
 
+/* Desktop furniture (M86): a 40px taskbar along the bottom,
+ * a start button, a start menu with one entry, and a taskbar
+ * chip naming the open window. All of it lives below the
+ * console region, so it never fights the console's repaint. */
+#define COL_BAR    0x1B3A5Cu
+#define COL_FIELD  0x10243Eu
+#define BAR_H      40u
+#define BTN_X      8u
+#define BTN_W      96u
+#define CHIP_X     116u
+#define CHIP_W     170u
+#define MENU_W     220u
+#define MENU_H     48u
+
 static struct {
     int open;
     int dragging;
     int prev_buttons;
     uint32_t x, y;
     uint32_t grab_dx, grab_dy;
+    int menu_open;
 } g_win;
+
+static uint32_t bar_y(void)
+{
+    return fb_height() - BAR_H;
+}
+
+static void taskbar_draw(void)
+{
+    uint32_t w = fb_width(), by = bar_y();
+    fb_fill_rect(0, by, w, BAR_H, COL_BAR);
+    fb_fill_rect(0, by, w, 1, COL_BORDER);
+    /* start button */
+    fb_fill_rect(BTN_X, by + 6, BTN_W, 28, COL_TITLE);
+    fb_draw_text(BTN_X + 16, by + 12, "YOUSJ", COL_TEXT,
+                 COL_TITLE, 1);
+    /* the open window's chip, or plain bar when it is closed */
+    if (g_win.open) {
+        fb_fill_rect(CHIP_X, by + 6, CHIP_W, 28, COL_BODY);
+        fb_draw_text(CHIP_X + 10, by + 12, "YOUSJ WINDOW",
+                     COL_TEXT, COL_BODY, 1);
+    }
+    /* right-hand label */
+    fb_draw_text(w - 110, by + 12, "Yousj OS 0.1", COL_BTEXT,
+                 COL_BAR, 1);
+}
+
+static void menu_draw(void)
+{
+    uint32_t my = bar_y() - MENU_H;
+    fb_fill_rect(8, my, MENU_W, MENU_H, COL_BODY);
+    fb_fill_rect(8, my, MENU_W, 1, COL_BORDER);
+    fb_fill_rect(8, my + MENU_H - 1, MENU_W, 1, COL_BORDER);
+    fb_fill_rect(8, my, 1, MENU_H, COL_BORDER);
+    fb_fill_rect(8 + MENU_W - 1, my, 1, MENU_H, COL_BORDER);
+    fb_draw_text(24, my + 16, "Open the window", COL_TEXT,
+                 COL_BODY, 1);
+}
+
+static void menu_erase(void)
+{
+    fb_fill_rect(8, bar_y() - MENU_H, MENU_W, MENU_H, COL_FIELD);
+}
 
 static void win_draw(void)
 {
@@ -61,10 +118,8 @@ static void win_erase(uint32_t x, uint32_t y)
     fb_console_repaint_rect(x, y, WIN_W, WIN_H);
 }
 
-void wm_init(void)
+static void window_open(void)
 {
-    if (!fb_present())
-        return;
     g_win.x = 1050;
     g_win.y = 1080;
     if (g_win.x + WIN_W > fb_width())
@@ -73,6 +128,15 @@ void wm_init(void)
         g_win.y = fb_height() > WIN_H ? fb_height() - WIN_H : 0;
     g_win.open = 1;
     win_draw();
+    taskbar_draw(); /* the chip appears */
+}
+
+void wm_init(void)
+{
+    if (!fb_present())
+        return;
+    taskbar_draw();
+    window_open();
 }
 
 int wm_window_rect(uint32_t *x, uint32_t *y, uint32_t *w,
@@ -105,6 +169,46 @@ void wm_mouse(uint32_t mx, uint32_t my, int buttons)
                      mx < g_win.x + WIN_W && my >= g_win.y &&
                      my < g_win.y + WIN_H;
 
+    /* Desktop furniture first (M86): the start menu and the
+     * start button consume their clicks outright. A press
+     * elsewhere closes an open menu and then falls through to
+     * the window/desktop handling below. */
+    if (pressed && !was) {
+        uint32_t by = bar_y();
+        int on_button = mx >= BTN_X && mx < BTN_X + BTN_W &&
+                        my >= by + 6 && my < by + 34;
+        int consumed = 0;
+        if (g_win.menu_open) {
+            uint32_t myy = by - MENU_H;
+            if (mx >= 8 && mx < 8 + MENU_W && my >= myy &&
+                my < myy + MENU_H) {
+                g_win.menu_open = 0;
+                menu_erase();
+                if (!g_win.open)
+                    window_open();
+                consumed = 1;
+            } else if (!on_button) {
+                g_win.menu_open = 0;
+                menu_erase();
+            }
+        }
+        if (!consumed && on_button) {
+            g_win.menu_open = !g_win.menu_open;
+            if (g_win.menu_open)
+                menu_draw();
+            else
+                menu_erase();
+            consumed = 1;
+        }
+        if (consumed) {
+            g_win.prev_buttons = buttons;
+            return;
+        }
+        /* hit_window may have changed if the menu just ran;
+         * it cannot have (menu clicks are consumed), but the
+         * fall-through close-menu path leaves it valid. */
+    }
+
     if (pressed && !was && hit_window) {
         uint32_t x = g_win.x, y = g_win.y;
         if (mx >= x + WIN_W - 24 && mx < x + WIN_W - 4 &&
@@ -113,6 +217,7 @@ void wm_mouse(uint32_t mx, uint32_t my, int buttons)
             g_win.open = 0;
             g_win.dragging = 0;
             win_erase(x, y);
+            taskbar_draw(); /* the chip disappears */
         } else if (mx >= x && mx < x + WIN_W && my >= y &&
                    my < y + WIN_TITLE) {
             g_win.dragging = 1;

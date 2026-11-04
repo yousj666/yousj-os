@@ -184,17 +184,33 @@ def main():
             return n
 
         def dump(name):
+            # The monitor can answer before the PPM is fully
+            # written; on a loaded host the old fixed sleep read
+            # STALE frames (an arrow still mid-journey), which
+            # poisoned every position decision downstream. Wait
+            # for the file's mtime to actually advance.
+            try:
+                before = os.stat(name).st_mtime_ns
+            except OSError:
+                before = 0
             mon2 = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             mon2.connect(MON)
             mon2.settimeout(5)
             mon2.recv(4096)
             mon2.sendall(("screendump " + name + "\n").encode())
-            time.sleep(1.2)
+            time.sleep(0.4)
             try:
                 mon2.recv(4096)
             except socket.timeout:
                 pass
             mon2.close()
+            for _ in range(40):
+                try:
+                    if os.stat(name).st_mtime_ns > before:
+                        break
+                except OSError:
+                    pass
+                time.sleep(0.1)
             return read_ppm(name)
 
         w2, h2, body = dump(os.path.join(ROOT, "build", "fb_con1.ppm"))
@@ -239,6 +255,80 @@ def main():
         save_png(os.path.join(ROOT, "build", "fb_kbd.png"), w, h, body)
 
         # --- M84: move the PS/2 mouse, watch the arrow follow ---
+        ARROW = [
+            "#...........", "##..........", "#o#.........",
+            "#oo#........", "#ooo#.......", "#oooo#......",
+            "#ooooo#.....", "#oooooo#....", "#ooooooo#...",
+            "#oooooooo#..", "#oooooo#####", "#oo#oo#.....",
+            "#o#.#oo#....", "##..#oo#....", "#....#oo#...",
+            "......#oo#..", ".......##...",
+        ]
+
+        def find_arrow(body2):
+            # numpy template match: a pure-Python scan of a
+            # 2048x2048 dump takes seconds and starves the VM
+            # it is measuring; this takes milliseconds.
+            import numpy as np
+            arr = np.frombuffer(body2, dtype=np.uint8).reshape(
+                h, w, 3).astype(np.int16)
+            black = (arr[:, :, 0] < 30) & (arr[:, :, 1] < 30) & \
+                (arr[:, :, 2] < 30)
+            white = (arr[:, :, 0] > 240) & (arr[:, :, 1] > 240) & \
+                (arr[:, :, 2] > 240)
+            rows, cols = h - 16, w - 11
+            score = np.zeros((rows, cols), dtype=np.int32)
+            need = 0
+            for r, row in enumerate(ARROW):
+                for c, ch in enumerate(row):
+                    if ch == '#':
+                        score += black[r:r + rows, c:c + cols]
+                        need += 1
+                    elif ch == 'o':
+                        score += white[r:r + rows, c:c + cols]
+                        need += 1
+            ys, xs = np.nonzero(score == need)
+            if len(xs) == 0:
+                return None
+            return (int(xs[0]), int(ys[0]))
+
+        def goto(ex, ey, frm):
+            # Open-loop move + a long blind wait + one look.
+            # QEMU delivers a large PS/2 move packet by packet
+            # (+-127 each) over seconds, and screendump polling
+            # itself stalls that delivery -- every closed-loop
+            # scheme tried here (settle watching, stable-park
+            # nudges) ended up double-delivering and overshoot-
+            # ing into a corner. A single move, patience scaled
+            # to the distance, and at most one correction from
+            # the verified resting position is what works.
+            def trip(tx, ty, fx, fy):
+                mon_cmd("mouse_move %d %d" % (tx - fx, ty - fy),
+                        0.3)
+                dist = max(abs(tx - fx), abs(ty - fy))
+                # QEMU accumulates a big move internally and
+                # each FOLLOWING mouse event flushes only a
+                # bounded chunk of it (~5 packets, 635px --
+                # measured: a -1690 move showed 5 packets
+                # delivered at verify time, 10 by the next
+                # press, the rest only after another event).
+                # Flush with harmless zero moves, then rest.
+                for _ in range(2 + dist // 400):
+                    mon_cmd("mouse_move 0 0", 0.35)
+                time.sleep(1.5)
+
+            # NO correction trip: every scheme that moved the
+            # mouse a second time based on an observed position
+            # overshot, because the observed frame lags the
+            # still-travelling arrow and the "correction" then
+            # stacks on top of the undelivered remainder. One
+            # trip, then verify (the caller's pixel checks and
+            # the kernel's own press log judge the result).
+            trip(ex, ey, frm[0], frm[1])
+            _, _, b2 = dump("/tmp/settle.ppm")
+            pos = find_arrow(b2)
+            print("goto (%d,%d) -> arrow %s" % (ex, ey, pos))
+            return pos == (ex, ey)
+
         def mon_cmd(cmd, wait=0.3):
             m = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             m.connect(MON)
@@ -265,7 +355,7 @@ def main():
         centre = white_at(body, w // 2, h // 2)
         print("cursor white px at centre:", centre)
         check("arrow sits at screen centre", centre > 10)
-        mon_cmd("mouse_move 200 100", 0.8)
+        goto(1224, 1124, (1024, 1024))
         w2, h2, body = dump(os.path.join(ROOT, "build", "fb_m1.ppm"))
         moved = white_at(body, w // 2 + 200, h // 2 + 100)
         gone = white_at(body, w // 2, h // 2)
@@ -278,7 +368,7 @@ def main():
         # deltas for the PS/2 mouse (verified against dumps:
         # the applied motion equals the arguments, not a delta
         # from any tracked absolute position).
-        mon_cmd("mouse_move 276 376", 0.8)  # guest now at 1500,1500
+        goto(1500, 1500, (1224, 1124))
         mon_cmd("mouse_button 1", 0.5)
         mon_cmd("mouse_button 0", 0.3)
         w2, h2, body = dump(os.path.join(ROOT, "build", "fb_m2.ppm"))
@@ -300,9 +390,9 @@ def main():
         check("window close box present",
               close(px(body, w, 1589, 1087), (0xC0, 0x39, 0x2B)))
         # grab the title at (1200,1094): from (1500,1500)
-        mon_cmd("mouse_move -300 -406", 0.8)
+        goto(1200, 1094, (1500, 1500))
         mon_cmd("mouse_button 1", 0.5)
-        mon_cmd("mouse_move 150 120", 0.8)  # drag by (+150,+120)
+        goto(1350, 1214, (1200, 1094))
         mon_cmd("mouse_button 0", 0.4)
         w2, h2, body = dump(os.path.join(ROOT, "build", "fb_w1.ppm"))
         check("window followed the drag",
@@ -313,13 +403,41 @@ def main():
               close(px(body, w, 1100, 1130), (0x10, 0x24, 0x3E)))
         save_png(os.path.join(ROOT, "build", "fb_win.png"), w, h, body)
         # close it: box centre now at (1746,1214): from (1350,1214)
-        mon_cmd("mouse_move 396 0", 0.8)
+        goto(1746, 1214, (1350, 1214))
         mon_cmd("mouse_button 1", 0.5)
         mon_cmd("mouse_button 0", 0.4)
         w2, h2, body = dump(os.path.join(ROOT, "build", "fb_w2.ppm"))
         check("window closed, console restored",
               close(px(body, w, 1480, 1384), (0x10, 0x24, 0x3E)))
         save_png(os.path.join(ROOT, "build", "fb_closed.png"), w, h,
+                 body)
+
+        # --- M86: taskbar, start menu, reopen the window ---
+        # pointer is at (1746,1214); the window is closed now.
+        check("taskbar present",
+              close(px(body, w, 600, 2028), (0x1B, 0x3A, 0x5C)))
+        check("start button present",
+              close(px(body, w, 30, 2028), (0x2E, 0x5E, 0x8C)))
+        check("no window chip while closed",
+              close(px(body, w, 150, 2028), (0x1B, 0x3A, 0x5C)))
+        goto(56, 2028, (1746, 1214))
+        mon_cmd("mouse_button 1", 0.5)
+        mon_cmd("mouse_button 0", 0.4)
+        w2, h2, body = dump(os.path.join(ROOT, "build", "fb_d1.ppm"))
+        check("start menu opened",
+              close(px(body, w, 200, 2000), (0x24, 0x46, 0x6B)))
+        goto(100, 1984, (56, 2028))
+        mon_cmd("mouse_button 1", 0.5)
+        mon_cmd("mouse_button 0", 0.4)
+        w2, h2, body = dump(os.path.join(ROOT, "build", "fb_d2.ppm"))
+        check("menu reopened the window",
+              close(px(body, w, 1330, 1094), (0x2E, 0x5E, 0x8C)))
+        check("menu closed itself",
+              close(px(body, w, 200, 2000), (0x10, 0x24, 0x3E)))
+        check("window chip back on the taskbar",
+              close(px(body, w, 150, 2028), (0x24, 0x46, 0x6B)))
+
+        save_png(os.path.join(ROOT, "build", "fb_desk.png"), w, h,
                  body)
     finally:
         qemu.terminate()
