@@ -14,6 +14,7 @@
  *   +5  LSR (bit 5 = transmitter holding register empty)
  */
 #include "serial.h"
+#include <yousj/fb.h> /* M82: fb_console_putc mirror */
 
 #define SERIAL_PORT YOUSJ_SERIAL_COM1_PORT
 
@@ -46,6 +47,11 @@ void serial_putc(char c)
         /* wait for transmitter holding register empty */
     }
     outb(SERIAL_PORT, (uint8_t)c);
+    /* M82: mirror to the framebuffer console once it is active
+     * (fb_console_putc is a no-op before fb_init). Every kernel
+     * and userland console byte funnels through this one
+     * function, so the screen sees exactly what serial sees. */
+    fb_console_putc(c);
 }
 
 void serial_puts(const char *s)

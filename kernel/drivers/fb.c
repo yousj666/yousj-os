@@ -176,6 +176,117 @@ static void fb_banner(void)
     fb_fill_rect(sw_w * 7 - 24, sw_y, 24, 60, 0xFFFFFF);
 }
 
+/* ---------------------------------------------------------------- */
+/* Text console (M82). A character grid living under the banner:    */
+/* x margin 8, top at y=192, bottom keeps the swatch strip clear.   */
+/* serial_putc() mirrors every byte here once fb_init() flips       */
+/* g_con.active, so kernel log, shell output and echo all appear    */
+/* on screen as they happen. Scrolling moves the region up 16       */
+/* pixel rows at a time; the cursor is a 2-row underline in the     */
+/* current cell (erased by repainting those rows with bg -- the     */
+/* cursor only ever rests on a fresh cell in left-to-right flow).   */
+/* ---------------------------------------------------------------- */
+
+#define FB_CON_FG 0xD7E3F4u
+#define FB_CON_BG 0x10243Eu
+#define FB_CON_TOP 192u
+#define FB_CON_BOTTOM_MARGIN 140u
+
+static struct {
+    int      active;
+    uint32_t cx, cy;
+    uint32_t cols, rows;
+    uint32_t top;      /* pixel y of row 0 */
+} g_con;
+
+static uint32_t con_cell_x(uint32_t cx)
+{
+    return 8 + cx * 8;
+}
+
+static uint32_t con_cell_y(uint32_t cy)
+{
+    return g_con.top + cy * 16;
+}
+
+static void con_cursor(int on)
+{
+    fb_fill_rect(con_cell_x(g_con.cx), con_cell_y(g_con.cy) + 13,
+                 8, 2, on ? FB_CON_FG : FB_CON_BG);
+}
+
+static void con_scroll(void)
+{
+    uint32_t bottom = g_con.top + g_con.rows * 16;
+    uint32_t y;
+    for (y = g_con.top; y < bottom - 16; y++) {
+        uint8_t *dst = (uint8_t *)g_fb.px + (uint64_t)y * g_fb.pitch;
+        const uint8_t *src = dst + (uint64_t)16 * g_fb.pitch;
+        uint32_t i, n = g_fb.width * 4;
+        for (i = 0; i < n; i++)
+            dst[i] = src[i];
+    }
+    fb_fill_rect(0, bottom - 16, g_fb.width, 16, FB_CON_BG);
+}
+
+static void con_newline(void)
+{
+    g_con.cx = 0;
+    if (g_con.cy + 1 >= g_con.rows)
+        con_scroll();
+    else
+        g_con.cy++;
+}
+
+void fb_console_putc(char c)
+{
+    if (!g_con.active)
+        return;
+    con_cursor(0);
+    if (c == '\n') {
+        con_newline();
+    } else if (c == '\r') {
+        g_con.cx = 0;
+    } else if (c == '\t') {
+        g_con.cx = (g_con.cx + 8) & ~7u;
+        if (g_con.cx >= g_con.cols)
+            con_newline();
+    } else if (c >= 32 && c < 127) {
+        char buf[2];
+        buf[0] = c;
+        buf[1] = '\0';
+        fb_draw_text(con_cell_x(g_con.cx), con_cell_y(g_con.cy),
+                     buf, FB_CON_FG, FB_CON_BG, 1);
+        g_con.cx++;
+        if (g_con.cx >= g_con.cols)
+            con_newline();
+    }
+    /* other control bytes: ignored on screen (serial keeps them) */
+    con_cursor(1);
+}
+
+static void con_activate(void)
+{
+    uint32_t bottom;
+    g_con.top = FB_CON_TOP;
+    bottom = g_fb.height > FB_CON_BOTTOM_MARGIN
+                 ? g_fb.height - FB_CON_BOTTOM_MARGIN
+                 : g_fb.height;
+    if (bottom <= g_con.top + 64) { /* tiny mode: shrink the banner */
+        g_con.top = 80;
+        bottom = g_fb.height;
+    }
+    g_con.cols = (g_fb.width - 16) / 8;
+    g_con.rows = (bottom - g_con.top) / 16;
+    if (g_con.cols == 0 || g_con.rows == 0)
+        return;
+    fb_fill_rect(0, g_con.top, g_fb.width, g_con.rows * 16, FB_CON_BG);
+    g_con.cx = 0;
+    g_con.cy = 0;
+    g_con.active = 1;
+    con_cursor(1);
+}
+
 void fb_init(const struct yousj_framebuffer *f)
 {
     uint64_t base, end;
@@ -213,4 +324,9 @@ void fb_init(const struct yousj_framebuffer *f)
     serial_puts(g_fb.bgr ? " BGRx @ " : " RGBx @ ");
     serial_put_hex64(f->addr);
     serial_puts("\n");
+
+    /* M82: from the next byte on, the serial console mirrors to
+     * the screen (see fb_console_putc). Activated last so the
+     * report line above stays serial-only history. */
+    con_activate();
 }

@@ -45,4 +45,11 @@ void fb_draw_text(uint32_t x, uint32_t y, const char *text,
 uint32_t fb_width(void);
 uint32_t fb_height(void);
 
+/* Text console on the framebuffer (M82). serial_putc() feeds
+ * every byte here after fb_init() activates the console, so the
+ * screen mirrors the serial console -- kernel log, shell output,
+ * echo -- with wrapping, scrolling and a block cursor, in a
+ * region below the M81 banner. No-op while inactive. */
+void fb_console_putc(char c);
+
 #endif /* YOUSJ_FB_H */

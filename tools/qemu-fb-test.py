@@ -57,6 +57,9 @@ class Serial:
     def text(self):
         return self.buf.decode(errors="replace")
 
+    def send(self, s):
+        self.s.sendall(s.encode())
+
 
 def read_ppm(path):
     with open(path, "rb") as fh:
@@ -169,6 +172,47 @@ def main():
         check("title text pixels present", bright > 30)
         save_png(PNG, w, h, body)
         print("screenshot saved:", PNG)
+
+        # --- M82: the framebuffer console mirrors serial output ---
+        def band_bright(y0, y1):
+            n = 0
+            for yy in range(y0, min(y1, h), 2):
+                for xx in range(8, min(1400, w), 2):
+                    r, g, b = px(body, w, xx, yy)
+                    if r > 150 and g > 170 and b > 200:
+                        n += 1
+            return n
+
+        def dump(name):
+            mon2 = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            mon2.connect(MON)
+            mon2.settimeout(5)
+            mon2.recv(4096)
+            mon2.sendall(("screendump " + name + "\n").encode())
+            time.sleep(1.2)
+            try:
+                mon2.recv(4096)
+            except socket.timeout:
+                pass
+            mon2.close()
+            return read_ppm(name)
+
+        w2, h2, body = dump(os.path.join(ROOT, "build", "fb_con1.ppm"))
+        upper = band_bright(200, 560)
+        lower_before = band_bright(560, 1000)
+        print("console bright samples: upper", upper,
+              "lower", lower_before)
+        check("console shows mirrored boot text", upper > 400)
+        ser.send("echo FBCON82\n")
+        check("shell echoes the marker on serial",
+              ser.until("FBCON82", 30))
+        time.sleep(0.6)
+        w2, h2, body = dump(os.path.join(ROOT, "build", "fb_con2.ppm"))
+        lower_after = band_bright(560, 1000)
+        print("console bright samples after echo: lower", lower_after)
+        check("console advanced with new shell output",
+              lower_after > lower_before + 20)
+        save_png(os.path.join(ROOT, "build", "fb_con.png"), w, h, body)
     finally:
         qemu.terminate()
         try:
