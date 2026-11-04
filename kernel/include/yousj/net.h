@@ -57,6 +57,39 @@ long net_udp_recv_try(struct yousj_udp_ep *ep, uint8_t *dst,
                       uint16_t *src_port_out);
 uint64_t net_udp_dropped(void);
 
+/* M75: TCP connections for the AF_INET stream socket face.
+ * The connection object lives in the net layer and outlives
+ * its file when a close is still draining (the object
+ * detaches; the stack finishes the farewell on its own).
+ * Errors are negative Linux errnos; state polling makes the
+ * blocking connect/accept loops in the syscall layer
+ * possible without the net layer knowing about tasks. */
+struct yousj_tcp;
+long net_tcp_create(struct yousj_tcp **out);
+long net_tcp_bind(struct yousj_tcp *t, uint32_t ip,
+                  uint16_t port);
+long net_tcp_listen(struct yousj_tcp *t, long backlog);
+long net_tcp_connect_start(struct yousj_tcp *t, uint32_t ip,
+                           uint16_t port);
+bool net_tcp_established(struct yousj_tcp *t);
+bool net_tcp_connecting(struct yousj_tcp *t);
+bool net_tcp_listening(struct yousj_tcp *t);
+long net_tcp_poll_err(struct yousj_tcp *t);
+long net_tcp_accept_try(struct yousj_tcp *t,
+                        struct yousj_tcp **out);
+bool net_tcp_pending(struct yousj_tcp *t);
+void net_tcp_local(struct yousj_tcp *t, uint32_t *ip,
+                   uint16_t *port);
+bool net_tcp_peer(struct yousj_tcp *t, uint32_t *ip,
+                  uint16_t *port);
+long net_tcp_send(struct yousj_tcp *t, const uint8_t *data,
+                  uint32_t len);
+long net_tcp_recv_try(struct yousj_tcp *t, uint8_t *dst,
+                      uint64_t cap, bool peek);
+void net_tcp_shutdown_write(struct yousj_tcp *t);
+void net_tcp_release(struct yousj_tcp *t);
+uint64_t net_tcp_estab(void);
+
 /* Text snapshot for the native netinfo syscall. Returns the
  * number of bytes written (excluding the NUL). */
 uint64_t net_snapshot(char *buf, uint64_t len);

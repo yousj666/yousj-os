@@ -1332,12 +1332,45 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   约更新（INET 流式回
   EPROTONOSUPPORT，等
   M75 的 TCP）。
-- ⏳ 下一步候选：TCP
-  （M75 起：握手/字节
-  流/关闭），然后 AF_
-  INET 流式 socket 面；
-  网卡中断与 modern
-  virtio 后置；SCM_
+- ✅ TCP M75（2026-
+  11-04）：完整连接状
+  态机（三步握手、FIN
+  关闭双向、RST、无主
+  段按规回 RST），序号
+  环形缓冲（4KB 收发各
+  一），按序交付（乱序
+  段丢弃＋重复 ACK 诱
+  发对端重传，不做乱序
+  缓存），每连接一个重
+  传定时器（轮询 tick
+  驱动、指数退避、超次
+  数置 ECONNRESET），
+  TIME_WAIT 定时回收；
+  回环连接在栈内直投
+  同一状态机。socket
+  面：socket(2, STREAM)
+  bind/listen/accept/
+  connect（阻塞等待建
+  立、非阻塞回 EINPROG
+  RESS）、read/write/
+  send/recv 家族/send
+  msg/recvmsg/shutdown
+  （写向即 FIN）、poll
+  就绪、getname 全部接
+  通；close 时连接脱离
+  file、由协议栈自己走
+  完告别。验收：回环对
+  话＋拒绝连接（RST→
+  ECONNREFUSED），线级
+  由脚本服务器全程应答
+  （握手/双向数据/FIN）。
+- ⏳ 下一步候选：真实
+  互通验证（QEMU 用户
+  网 slirp 后与宿主机
+  真实 TCP 栈互打，
+  busybox nc 双向），
+  然后网卡中断与
+  modern virtio；SCM_
   RIGHTS 与抽象地址留
   在 socket 面待办。
 

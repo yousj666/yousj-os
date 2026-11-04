@@ -204,6 +204,9 @@ static bool ip_send(uint8_t *f, uint32_t dst_ip, uint8_t proto,
 #define PROTO_UDP 17
 static void udp_input(const uint8_t *frame, const uint8_t *ip,
                       uint32_t ip_tot); /* M74, below */
+static void tcp_input_seg(uint32_t src_ip, uint32_t dst_ip,
+                          const uint8_t *seg, uint32_t seglen,
+                          const uint8_t *src_mac); /* M75 */
 static uint8_t g_icmp_out[1600];
 
 static void icmp_input(const uint8_t *frame, const uint8_t *ip,
@@ -257,6 +260,9 @@ static void ip_input(const uint8_t *frame, uint32_t len)
         icmp_input(frame, ip, tot);
     else if (ip[9] == 17 /* UDP */)
         udp_input(frame, ip, tot);
+    else if (ip[9] == 6 /* TCP: M75 */)
+        tcp_input_seg(rd32(ip + 12), rd32(ip + 16), ip + 20,
+                      tot - 20, frame + 6);
     else
         g_dropped++; /* TCP: a later milestone */
 }
@@ -329,10 +335,13 @@ bool net_present(void)
     return g_up;
 }
 
+static void tcp_timer(void); /* M75, below */
 void net_poll(void)
 {
-    if (g_up)
+    if (g_up) {
         virtio_net_poll_rx(net_input);
+        tcp_timer();
+    }
 }
 
 const uint8_t *net_mac(void)
@@ -712,6 +721,822 @@ long net_udp_recv_try(struct yousj_udp_ep *ep, uint8_t *dst,
     return (long)n;
 }
 
+/* ------------------------------------------------------------------ */
+/* M75: TCP. A deliberately straightforward implementation:
+ * the full connection state machine, in-order delivery only
+ * (an out-of-order segment is dropped and answered with a
+ * duplicate ACK, so a well-behaved peer's retransmit timer
+ * heals the stream), one retransmit timer per connection
+ * driven from the poll tick, and loopback delivered by
+ * feeding the segment straight back into the input path.
+ *
+ * Send buffer bookkeeping uses absolute sequence numbers:
+ * byte with sequence s lives at s % TCP_RING in sbuf. Bytes
+ * in [snd_una, snd_nxt) are sent-unacknowledged, bytes in
+ * [snd_nxt, snd_nxt + s_queued) wait for window. The receive
+ * side is a plain byte queue fed strictly in order. */
+
+#define PROTO_TCP 6
+#define TCP_CONN_MAX 8
+#define TCP_RING 4096
+#define TCP_MSS 1360
+
+enum {
+    TS_CLOSED = 0,
+    TS_LISTEN,
+    TS_SYN_SENT,
+    TS_SYN_RCVD,
+    TS_ESTABLISHED,
+    TS_FIN_WAIT_1,
+    TS_FIN_WAIT_2,
+    TS_CLOSE_WAIT,
+    TS_LAST_ACK,
+    TS_TIME_WAIT
+};
+
+#define TF_FIN 0x01
+#define TF_SYN 0x02
+#define TF_RST 0x04
+#define TF_PSH 0x08
+#define TF_ACK 0x10
+
+struct yousj_tcp {
+    bool in_use;
+    bool detached; /* file gone; stack finishes alone */
+    uint8_t state;
+    uint32_t local_ip;
+    uint16_t local_port;
+    uint32_t peer_ip;
+    uint16_t peer_port;
+    uint32_t iss, snd_una, snd_nxt, rcv_nxt;
+    uint32_t peer_wnd;
+    uint8_t sbuf[TCP_RING];
+    uint32_t s_queued;  /* in ring, not yet sent */
+    uint8_t rbuf[TCP_RING];
+    uint32_t r_head, r_count;
+    bool fin_queued;    /* our side asked to close-write */
+    bool fin_sent;
+    bool fin_seen;      /* peer's FIN consumed in order */
+    bool rst_err;       /* connection reset by peer */
+    bool refused;       /* connect() refused */
+    struct yousj_tcp *pend[4]; /* listener: finished children */
+    int pend_count;
+    int backlog;
+    struct yousj_tcp *listener; /* a SYN_RCVD child's parent */
+    uint64_t last_tx_tick;
+    uint64_t rto;       /* ticks */
+    int rtx_count;
+    uint64_t tw_deadline;
+    uint64_t estab_seq_at; /* snapshot counter stamp */
+};
+
+static struct yousj_tcp g_tcps[TCP_CONN_MAX];
+static uint32_t g_iss = 0x2A150000;
+static uint64_t g_tcp_segs_in, g_tcp_segs_out, g_tcp_estab_total;
+static uint8_t g_tcp_seg[20 + TCP_MSS];
+
+static bool seq_before(uint32_t a, uint32_t b)
+{
+    return (int32_t)(a - b) < 0;
+}
+
+static uint16_t tcp_rcv_wnd(struct yousj_tcp *t)
+{
+    return (uint16_t)(TCP_RING - t->r_count);
+}
+
+static uint32_t csum_partial(uint32_t sum, const uint8_t *p,
+                             uint32_t len)
+{
+    while (len >= 2) {
+        sum += ((uint32_t)p[0] << 8) | p[1];
+        p += 2;
+        len -= 2;
+    }
+    if (len)
+        sum += (uint32_t)p[0] << 8;
+    return sum;
+}
+
+static uint16_t csum_fold(uint32_t sum)
+{
+    while (sum >> 16)
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    return (uint16_t)~sum;
+}
+
+/* Transmit one segment. `fbuf` is the caller's ethernet
+ * scratch (interrupt context and process context each use
+ * their own). Loopback destinations never touch the wire. */
+static void tcp_input_seg(uint32_t src_ip, uint32_t dst_ip,
+                          const uint8_t *seg, uint32_t seglen,
+                          const uint8_t *src_mac);
+static void tcp_xmit(uint8_t *fbuf, const uint8_t *dst_mac,
+                     uint32_t src_ip, uint32_t dst_ip,
+                     uint16_t sport, uint16_t dport, uint32_t seq,
+                     uint32_t ack, uint8_t flags, uint16_t wnd,
+                     const uint8_t *data, uint32_t dlen)
+{
+    uint8_t *seg = g_tcp_seg;
+    uint32_t slen = 20 + dlen;
+
+    wr16(seg, sport);
+    wr16(seg + 2, dport);
+    wr32(seg + 4, seq);
+    wr32(seg + 8, ack);
+    seg[12] = 0x50; /* data offset 5 words */
+    seg[13] = flags;
+    wr16(seg + 14, wnd);
+    wr16(seg + 16, 0);
+    wr16(seg + 18, 0);
+    if (dlen > 0)
+        mem_copy(seg + 20, data, dlen);
+    /* checksum over pseudo-header + segment */
+    {
+        uint8_t ph[12];
+        uint32_t sum = 0;
+        uint32_t i;
+        wr32(ph, src_ip);
+        wr32(ph + 4, dst_ip);
+        ph[8] = 0;
+        ph[9] = PROTO_TCP;
+        wr16(ph + 10, (uint16_t)slen);
+        for (i = 0; i < 12; i += 2)
+            sum += ((uint32_t)ph[i] << 8) | ph[i + 1];
+        for (i = 0; i + 1 < slen; i += 2)
+            sum += ((uint32_t)seg[i] << 8) | seg[i + 1];
+        if (slen & 1)
+            sum += (uint32_t)seg[slen - 1] << 8;
+        while (sum >> 16)
+            sum = (sum & 0xFFFF) + (sum >> 16);
+        wr16(seg + 16, (uint16_t)~sum);
+    }
+    g_tcp_segs_out++;
+    if (dst_ip == OUR_IP || dst_ip == 0x7F000001u) {
+        tcp_input_seg(src_ip, dst_ip, seg, slen, NULL);
+        return;
+    }
+    if (dst_mac != NULL)
+        ip_send_to_mac(fbuf, dst_mac, dst_ip, PROTO_TCP, seg,
+                       slen);
+    else
+        ip_send(fbuf, dst_ip, PROTO_TCP, seg, slen);
+}
+
+/* Send everything the peer's window allows (process
+ * context). Also issues the queued FIN when the data is
+ * gone. */
+static void tcp_output(struct yousj_tcp *t)
+{
+    if (t->state != TS_ESTABLISHED && t->state != TS_CLOSE_WAIT)
+        return;
+    for (;;) {
+        uint32_t inflight = t->snd_nxt - t->snd_una;
+        uint32_t can, take, i;
+
+        if (t->s_queued == 0)
+            break;
+        if (inflight >= t->peer_wnd)
+            break;
+        can = t->peer_wnd - inflight;
+        take = t->s_queued < can ? t->s_queued : can;
+        if (take > TCP_MSS)
+            take = TCP_MSS;
+        {
+            uint8_t data[TCP_MSS];
+            for (i = 0; i < take; i++)
+                data[i] = t->sbuf[(t->snd_nxt + i) % TCP_RING];
+            tcp_xmit(g_frame_out2, NULL, t->local_ip != 0 &&
+                                       t->local_ip != 0x7F000001u
+                                       ? t->local_ip
+                                       : (t->peer_ip == 0x7F000001u
+                                              ? 0x7F000001u
+                                              : OUR_IP),
+                     t->peer_ip, t->local_port, t->peer_port,
+                     t->snd_nxt, t->rcv_nxt, TF_PSH | TF_ACK,
+                     tcp_rcv_wnd(t), data, take);
+        }
+        t->snd_nxt += take;
+        t->s_queued -= take;
+        t->last_tx_tick = sched_uptime_ticks();
+        if (t->rto == 0)
+            t->rto = 100;
+    }
+    if (t->fin_queued && !t->fin_sent && t->s_queued == 0) {
+        tcp_xmit(g_frame_out2, NULL,
+                 t->local_ip != 0 && t->local_ip != 0x7F000001u
+                     ? t->local_ip
+                     : (t->peer_ip == 0x7F000001u ? 0x7F000001u
+                                                 : OUR_IP),
+                 t->peer_ip, t->local_port, t->peer_port, t->snd_nxt,
+                 t->rcv_nxt, TF_FIN | TF_ACK, tcp_rcv_wnd(t), NULL,
+                 0);
+        t->snd_nxt++;
+        t->fin_sent = true;
+        t->last_tx_tick = sched_uptime_ticks();
+        if (t->state == TS_ESTABLISHED)
+            t->state = TS_FIN_WAIT_1;
+        else if (t->state == TS_CLOSE_WAIT)
+            t->state = TS_LAST_ACK;
+    }
+}
+
+static struct yousj_tcp *tcp_alloc(void)
+{
+    int i;
+
+    for (i = 0; i < TCP_CONN_MAX; i++)
+        if (!g_tcps[i].in_use) {
+            mem_set((uint8_t *)&g_tcps[i], 0, sizeof(g_tcps[i]));
+            g_tcps[i].in_use = true;
+            g_tcps[i].state = TS_CLOSED;
+            g_tcps[i].peer_wnd = 65535;
+            return &g_tcps[i];
+        }
+    return NULL;
+}
+
+static struct yousj_tcp *tcp_find(uint32_t sip, uint16_t sport,
+                                  uint32_t dip, uint16_t dport,
+                                  bool listeners)
+{
+    int i;
+
+    for (i = 0; i < TCP_CONN_MAX; i++) {
+        struct yousj_tcp *t = &g_tcps[i];
+        if (!t->in_use || (t->state == TS_LISTEN) != listeners)
+            continue;
+        if (listeners) {
+            if (t->local_port == dport &&
+                (t->local_ip == 0 || t->local_ip == dip))
+                return t;
+        } else {
+            if (t->local_port == dport && t->peer_port == sport &&
+                t->peer_ip == sip &&
+                (t->local_ip == 0 || t->local_ip == dip ||
+                 dip == 0x7F000001u))
+                return t;
+        }
+    }
+    return NULL;
+}
+
+/* A reply segment from a connection (ACK/RST/SYN-ACK of the
+ * moment): interrupt-context flavour, MAC known. */
+static void tcp_reply(struct yousj_tcp *t, const uint8_t *mac,
+                      uint8_t flags, uint32_t seq)
+{
+    tcp_xmit(g_frame_out, mac,
+             t->local_ip != 0 && t->local_ip != 0x7F000001u
+                 ? t->local_ip
+                 : (t->peer_ip == 0x7F000001u ? 0x7F000001u
+                                             : OUR_IP),
+             t->peer_ip, t->local_port, t->peer_port, seq,
+             t->rcv_nxt, flags, tcp_rcv_wnd(t), NULL, 0);
+}
+
+static void tcp_ack(struct yousj_tcp *t, const uint8_t *mac)
+{
+    tcp_reply(t, mac, TF_ACK, t->snd_nxt);
+}
+
+static void tcp_input_seg(uint32_t src_ip, uint32_t dst_ip,
+                          const uint8_t *seg, uint32_t seglen,
+                          const uint8_t *src_mac)
+{
+    uint16_t sport, dport;
+    uint32_t seq, ack;
+    uint8_t flags;
+    uint32_t hlen, plen;
+    const uint8_t *data;
+    struct yousj_tcp *t;
+
+    if (seglen < 20) {
+        g_dropped++;
+        return;
+    }
+    /* checksum: pseudo-header + segment */
+    {
+        uint8_t ph[12];
+        uint32_t sum;
+        wr32(ph, src_ip);
+        wr32(ph + 4, dst_ip);
+        ph[8] = 0;
+        ph[9] = PROTO_TCP;
+        wr16(ph + 10, (uint16_t)seglen);
+        sum = csum_partial(0, ph, 12);
+        sum = csum_partial(sum, seg, seglen);
+        if (csum_fold(sum) != 0) {
+            g_dropped++;
+            return;
+        }
+    }
+    sport = rd16(seg);
+    dport = rd16(seg + 2);
+    seq = rd32(seg + 4);
+    ack = rd32(seg + 8);
+    hlen = (uint32_t)(seg[12] >> 4) * 4;
+    flags = seg[13];
+    if (hlen < 20 || hlen > seglen) {
+        g_dropped++;
+        return;
+    }
+    data = seg + hlen;
+    plen = seglen - hlen;
+    g_tcp_segs_in++;
+
+    t = tcp_find(src_ip, sport, dst_ip, dport, false);
+    if (t == NULL) {
+        struct yousj_tcp *lis =
+            tcp_find(src_ip, sport, dst_ip, dport, true);
+        if (lis != NULL && (flags & TF_SYN) && !(flags & TF_RST)) {
+            /* A child is born: SYN_RCVD, parked until the
+             * handshake completes. */
+            struct yousj_tcp *c = tcp_alloc();
+            if (c == NULL)
+                return;
+            c->local_ip = lis->local_ip;
+            c->local_port = dport;
+            c->peer_ip = src_ip;
+            c->peer_port = sport;
+            c->listener = lis;
+            g_iss += 0x1111;
+            c->iss = g_iss;
+            c->snd_una = c->iss;
+            c->snd_nxt = c->iss + 1;
+            c->rcv_nxt = seq + 1;
+            c->peer_wnd = rd16(seg + 14);
+            c->state = TS_SYN_RCVD;
+            /* SYN+ACK */
+            tcp_xmit(g_frame_out, src_mac,
+                     c->local_ip != 0 ? c->local_ip : dst_ip,
+                     src_ip, dport, sport, c->iss, c->rcv_nxt,
+                     TF_SYN | TF_ACK, tcp_rcv_wnd(c), NULL, 0);
+            c->last_tx_tick = sched_uptime_ticks();
+            c->rto = 100;
+            return;
+        }
+        /* Nobody home: RST, formatted per the book. */
+        if (!(flags & TF_RST)) {
+            uint32_t rseq = 0, rack = 0;
+            uint8_t rfl = TF_RST;
+            if (flags & TF_ACK)
+                rseq = ack;
+            else {
+                rack = seq + plen + ((flags & TF_SYN) ? 1 : 0) +
+                       ((flags & TF_FIN) ? 1 : 0);
+                rfl |= TF_ACK;
+            }
+            tcp_xmit(g_frame_out, src_mac, dst_ip, src_ip, dport,
+                     sport, rseq, rack, rfl, 0, NULL, 0);
+        }
+        return;
+    }
+
+    if (flags & TF_RST) {
+        if (t->state == TS_SYN_SENT)
+            t->refused = true;
+        else if (t->state != TS_LISTEN)
+            t->rst_err = true;
+        if (t->state != TS_LISTEN) {
+            t->state = TS_CLOSED;
+            if (t->detached)
+                t->in_use = false;
+        }
+        return;
+    }
+
+    if (t->state == TS_SYN_SENT) {
+        if ((flags & (TF_SYN | TF_ACK)) == (TF_SYN | TF_ACK) &&
+            ack == t->snd_nxt) {
+            t->rcv_nxt = seq + 1;
+            t->snd_una = ack;
+            t->peer_wnd = rd16(seg + 14);
+            t->state = TS_ESTABLISHED;
+            g_tcp_estab_total++;
+            tcp_ack(t, src_mac);
+        }
+        return;
+    }
+
+    if (t->state == TS_SYN_RCVD) {
+        if ((flags & TF_SYN) && seq == t->rcv_nxt - 1) {
+            /* Their SYN again: our SYN+ACK went missing. */
+            tcp_xmit(g_frame_out, src_mac,
+                     t->local_ip != 0 ? t->local_ip : dst_ip,
+                     t->peer_ip, t->local_port, t->peer_port,
+                     t->iss, t->rcv_nxt, TF_SYN | TF_ACK,
+                     tcp_rcv_wnd(t), NULL, 0);
+            return;
+        }
+        if ((flags & TF_ACK) && ack == t->snd_nxt &&
+            seq == t->rcv_nxt) {
+            t->snd_una = ack;
+            t->state = TS_ESTABLISHED;
+            g_tcp_estab_total++;
+            if (t->listener != NULL &&
+                t->listener->pend_count < 4 &&
+                t->listener->pend_count < t->listener->backlog) {
+                struct yousj_tcp *lis = t->listener;
+                lis->pend[lis->pend_count++] = t;
+                t->listener = NULL;
+            }
+            /* Fall through: this segment may already data. */
+        } else
+            return;
+    }
+
+    /* ACK bookkeeping for the connected states */
+    if (flags & TF_ACK) {
+        if (seq_before(t->snd_una, ack) &&
+            !seq_before(t->snd_nxt, ack)) {
+            bool fin_acked = t->fin_sent && ack == t->snd_nxt;
+            t->snd_una = ack;
+            t->rtx_count = 0;
+            t->rto = 100;
+            t->peer_wnd = rd16(seg + 14);
+            if (fin_acked && t->state == TS_FIN_WAIT_1)
+                t->state = TS_FIN_WAIT_2;
+            else if (fin_acked && t->state == TS_LAST_ACK) {
+                t->state = TS_CLOSED;
+                if (t->detached)
+                    t->in_use = false;
+                return;
+            }
+        }
+    }
+
+    /* Payload, strictly in order */
+    if (plen > 0 && (t->state == TS_ESTABLISHED ||
+                     t->state == TS_FIN_WAIT_1 ||
+                     t->state == TS_FIN_WAIT_2)) {
+        if (seq == t->rcv_nxt) {
+            uint32_t free = TCP_RING - t->r_count;
+            uint32_t take = plen < free ? plen : free;
+            uint32_t i;
+            for (i = 0; i < take; i++) {
+                t->rbuf[(t->r_head + t->r_count) % TCP_RING] =
+                    data[i];
+                t->r_count++;
+            }
+            t->rcv_nxt += take;
+            tcp_ack(t, src_mac);
+        } else
+            tcp_ack(t, src_mac); /* duplicate ACK */
+    }
+
+    /* FIN, only once everything before it is consumed */
+    if ((flags & TF_FIN) && seq + plen == t->rcv_nxt) {
+        t->rcv_nxt++;
+        t->fin_seen = true;
+        if (t->state == TS_ESTABLISHED)
+            t->state = TS_CLOSE_WAIT;
+        else if (t->state == TS_FIN_WAIT_1 ||
+                 t->state == TS_FIN_WAIT_2) {
+            t->state = TS_TIME_WAIT;
+            t->tw_deadline = sched_uptime_ticks() + 200;
+        }
+        tcp_ack(t, src_mac);
+    }
+}
+
+/* Retransmission + TIME_WAIT reaping, from the poll tick. */
+static void tcp_timer(void)
+{
+    uint64_t now = sched_uptime_ticks();
+    int i;
+
+    for (i = 0; i < TCP_CONN_MAX; i++) {
+        struct yousj_tcp *t = &g_tcps[i];
+        if (!t->in_use)
+            continue;
+        if (t->state == TS_TIME_WAIT) {
+            if (now >= t->tw_deadline) {
+                t->state = TS_CLOSED;
+                if (t->detached)
+                    t->in_use = false;
+            }
+            continue;
+        }
+        if ((t->state == TS_ESTABLISHED ||
+             t->state == TS_FIN_WAIT_1 || t->state == TS_LAST_ACK ||
+             t->state == TS_SYN_RCVD) &&
+            t->snd_una != t->snd_nxt && t->rto > 0 &&
+            now - t->last_tx_tick >= t->rto) {
+            if (t->rtx_count++ > 6) {
+                t->rst_err = true;
+                t->state = TS_CLOSED;
+                if (t->detached)
+                    t->in_use = false;
+                continue;
+            }
+            if (t->state == TS_SYN_RCVD) {
+                tcp_xmit(g_frame_out, NULL,
+                         t->local_ip != 0 ? t->local_ip : OUR_IP,
+                         t->peer_ip, t->local_port, t->peer_port,
+                         t->iss, t->rcv_nxt, TF_SYN | TF_ACK,
+                         tcp_rcv_wnd(t), NULL, 0);
+            } else {
+                uint32_t avail = t->snd_nxt - t->snd_una;
+                bool finbit = false;
+                uint32_t dlen = avail;
+                if (t->fin_sent)
+                    dlen = avail - 1; /* last unit is FIN */
+                if (dlen > TCP_MSS)
+                    dlen = TCP_MSS;
+                {
+                    uint8_t data[TCP_MSS];
+                    uint32_t k;
+                    for (k = 0; k < dlen; k++)
+                        data[k] =
+                            t->sbuf[(t->snd_una + k) % TCP_RING];
+                    finbit = t->fin_sent &&
+                             t->snd_una + dlen == t->snd_nxt - 1;
+                    tcp_xmit(g_frame_out, NULL,
+                             t->local_ip != 0 &&
+                                     t->local_ip != 0x7F000001u
+                                 ? t->local_ip
+                                 : (t->peer_ip == 0x7F000001u
+                                        ? 0x7F000001u
+                                        : OUR_IP),
+                             t->peer_ip, t->local_port,
+                             t->peer_port, t->snd_una, t->rcv_nxt,
+                             (uint8_t)(TF_ACK |
+                                       (dlen ? TF_PSH : 0) |
+                                       (finbit ? TF_FIN : 0)),
+                             tcp_rcv_wnd(t), data, dlen);
+                }
+            }
+            t->rto = t->rto * 2 > 800 ? 800 : t->rto * 2;
+            t->last_tx_tick = now;
+        }
+    }
+}
+
+/* -- API for the syscall layer (negative Linux errnos) ------- */
+
+#define N_EADDRINUSE_T 98
+#define N_EADDRNOTAVAIL_T 99
+#define N_ECONNREFUSED 111
+#define N_ECONNRESET 104
+#define N_EAGAIN_T 11
+#define N_ENFILE_T 23
+
+long net_tcp_create(struct yousj_tcp **out)
+{
+    struct yousj_tcp *t = tcp_alloc();
+
+    if (t == NULL)
+        return -N_ENFILE_T;
+    *out = t;
+    return 0;
+}
+
+long net_tcp_bind(struct yousj_tcp *t, uint32_t ip, uint16_t port)
+{
+    int i;
+
+    if (ip != 0 && ip != OUR_IP && ip != 0x7F000001u)
+        return -N_EADDRNOTAVAIL_T;
+    if (port != 0)
+        for (i = 0; i < TCP_CONN_MAX; i++)
+            if (g_tcps[i].in_use && &g_tcps[i] != t &&
+                g_tcps[i].local_port == port)
+                return -N_EADDRINUSE_T;
+    t->local_ip = ip;
+    t->local_port = port;
+    return 0;
+}
+
+long net_tcp_listen(struct yousj_tcp *t, long backlog)
+{
+    if (t->local_port == 0)
+        /* listen without bind: take from the shared ephemeral
+         * counter (the same source UDP uses) */
+        t->local_port = g_eph_port++;
+    t->backlog = backlog < 1 ? 1 : (backlog > 4 ? 4 : (int)backlog);
+    t->state = TS_LISTEN;
+    return 0;
+}
+
+long net_tcp_connect_start(struct yousj_tcp *t, uint32_t ip,
+                           uint16_t port)
+{
+    uint32_t local_ip;
+
+    if (t->local_port == 0) {
+        uint16_t p = g_eph_port;
+        int i;
+        for (;;) {
+            bool taken = false;
+            for (i = 0; i < TCP_CONN_MAX; i++)
+                if (g_tcps[i].in_use && g_tcps[i].local_port == p)
+                    taken = true;
+            if (!taken)
+                break;
+            p++;
+        }
+        t->local_port = p;
+        g_eph_port = (uint16_t)(p + 1);
+    }
+    local_ip = t->local_ip != 0 ? t->local_ip
+                                : (ip == 0x7F000001u ? 0x7F000001u
+                                                     : OUR_IP);
+    t->local_ip = t->local_ip != 0 ? t->local_ip : local_ip;
+    t->peer_ip = ip;
+    t->peer_port = port;
+    g_iss += 0x1111;
+    t->iss = g_iss;
+    t->snd_una = t->iss;
+    t->snd_nxt = t->iss + 1;
+    t->rcv_nxt = 0;
+    t->state = TS_SYN_SENT;
+    if (ip != OUR_IP && ip != 0x7F000001u) {
+        uint32_t onward = (ip & 0xFFFFFF00u) ==
+                                  (OUR_IP & 0xFFFFFF00u)
+                              ? ip
+                              : OUR_GATEWAY;
+        if (!resolve_wait(onward)) {
+            t->state = TS_CLOSED;
+            return -N_EHOSTUNREACH;
+        }
+    }
+    tcp_xmit(g_frame_out2, NULL, local_ip, ip, t->local_port,
+             port, t->iss, 0, TF_SYN, tcp_rcv_wnd(t), NULL, 0);
+    t->last_tx_tick = sched_uptime_ticks();
+    t->rto = 100;
+    return 0;
+}
+
+bool net_tcp_established(struct yousj_tcp *t)
+{
+    return t->state == TS_ESTABLISHED ||
+           t->state == TS_FIN_WAIT_1 || t->state == TS_FIN_WAIT_2 ||
+           t->state == TS_CLOSE_WAIT || t->state == TS_LAST_ACK ||
+           t->state == TS_TIME_WAIT;
+}
+
+bool net_tcp_listening(struct yousj_tcp *t)
+{
+    return t->state == TS_LISTEN;
+}
+
+bool net_tcp_connecting(struct yousj_tcp *t)
+{
+    return t->state == TS_SYN_SENT;
+}
+
+long net_tcp_poll_err(struct yousj_tcp *t)
+{
+    if (t->refused)
+        return -N_ECONNREFUSED;
+    if (t->rst_err)
+        return -N_ECONNRESET;
+    if (t->state == TS_CLOSED && !t->in_use)
+        return -N_ECONNRESET;
+    return 0;
+}
+
+bool net_tcp_pending(struct yousj_tcp *t)
+{
+    return t->pend_count > 0;
+}
+
+long net_tcp_accept_try(struct yousj_tcp *t,
+                        struct yousj_tcp **out)
+{
+    if (t->pend_count == 0)
+        return -N_EAGAIN_T;
+    *out = t->pend[0];
+    t->pend_count--;
+    {
+        int i;
+        for (i = 0; i < t->pend_count; i++)
+            t->pend[i] = t->pend[i + 1];
+    }
+    return 0;
+}
+
+void net_tcp_local(struct yousj_tcp *t, uint32_t *ip,
+                   uint16_t *port)
+{
+    *ip = t->local_ip != 0 ? t->local_ip : OUR_IP;
+    *port = t->local_port;
+}
+
+bool net_tcp_peer(struct yousj_tcp *t, uint32_t *ip,
+                  uint16_t *port)
+{
+    if (t->state == TS_LISTEN || t->state == TS_CLOSED ||
+        t->peer_port == 0)
+        return false;
+    *ip = t->peer_ip;
+    *port = t->peer_port;
+    return true;
+}
+
+long net_tcp_send(struct yousj_tcp *t, const uint8_t *data,
+                  uint32_t len)
+{
+    uint32_t used = (t->snd_nxt - t->snd_una) + t->s_queued;
+    uint32_t free = TCP_RING - used;
+    uint32_t take = len < free ? len : free;
+    uint32_t i, wpos;
+
+    if (t->rst_err)
+        return -N_ECONNRESET;
+    if (t->state != TS_ESTABLISHED && t->state != TS_CLOSE_WAIT)
+        return -109; /* EPIPE-ish for not-yet/closed: syscall
+                        layer distinguishes the common cases */
+    if (take == 0)
+        return -N_EAGAIN_T;
+    wpos = t->snd_nxt + t->s_queued;
+    for (i = 0; i < take; i++)
+        t->sbuf[(wpos + i) % TCP_RING] = data[i];
+    t->s_queued += take;
+    tcp_output(t);
+    return (long)take;
+}
+
+long net_tcp_recv_try(struct yousj_tcp *t, uint8_t *dst,
+                      uint64_t cap, bool peek)
+{
+    uint64_t n, i;
+
+    if (t->r_count > 0) {
+        n = cap < t->r_count ? cap : t->r_count;
+        if (peek) {
+            for (i = 0; i < n; i++)
+                dst[i] = t->rbuf[(t->r_head + i) % TCP_RING];
+        } else {
+            for (i = 0; i < n; i++) {
+                dst[i] = t->rbuf[t->r_head];
+                t->r_head = (t->r_head + 1) % TCP_RING;
+                t->r_count--;
+            }
+        }
+        return (long)n;
+    }
+    if (t->rst_err)
+        return -N_ECONNRESET;
+    if (t->fin_seen || t->state == TS_TIME_WAIT)
+        return 0;
+    if (t->state == TS_CLOSED)
+        return 0;
+    return -N_EAGAIN_T;
+}
+
+void net_tcp_shutdown_write(struct yousj_tcp *t)
+{
+    if ((t->state == TS_ESTABLISHED || t->state == TS_CLOSE_WAIT) &&
+        !t->fin_queued) {
+        t->fin_queued = true;
+        tcp_output(t);
+    }
+}
+
+void net_tcp_release(struct yousj_tcp *t)
+{
+    int i;
+
+    if (t->state == TS_LISTEN) {
+        /* Children of a dying listener go with it. */
+        for (i = 0; i < TCP_CONN_MAX; i++)
+            if (g_tcps[i].in_use && g_tcps[i].listener == t)
+                g_tcps[i].in_use = false;
+        for (i = 0; i < t->pend_count; i++)
+            t->pend[i]->in_use = false;
+        t->in_use = false;
+        return;
+    }
+    if (t->state == TS_ESTABLISHED || t->state == TS_CLOSE_WAIT) {
+        /* Graceful farewell: detach and let the stack finish
+         * (the retransmit timer keeps the FIN honest). */
+        t->detached = true;
+        if (!t->fin_queued) {
+            t->fin_queued = true;
+            tcp_output(t);
+        }
+        return;
+    }
+    if (t->state == TS_SYN_SENT || t->state == TS_SYN_RCVD) {
+        /* A half-open connection with no owner: RST it. */
+        t->detached = true;
+        tcp_xmit(g_frame_out2, NULL,
+                 t->local_ip != 0 ? t->local_ip : OUR_IP,
+                 t->peer_ip, t->local_port, t->peer_port,
+                 t->snd_nxt, 0, TF_RST, 0, NULL, 0);
+        t->in_use = false;
+        return;
+    }
+    t->in_use = false;
+}
+
+uint64_t net_tcp_estab(void)
+{
+    return g_tcp_estab_total;
+}
+
 /* -- the snapshot: deliberately textual, like ps ------------ */
 
 static uint64_t snap_puts(char *buf, uint64_t len, uint64_t at,
@@ -795,6 +1620,12 @@ uint64_t net_snapshot(char *buf, uint64_t len)
     at = snap_put_u64(buf, len, at, g_udp_tx);
     at = snap_puts(buf, len, at, " udp_dropped=");
     at = snap_put_u64(buf, len, at, g_udp_dropped);
+    at = snap_puts(buf, len, at, " tcp_in=");
+    at = snap_put_u64(buf, len, at, g_tcp_segs_in);
+    at = snap_puts(buf, len, at, " tcp_out=");
+    at = snap_put_u64(buf, len, at, g_tcp_segs_out);
+    at = snap_puts(buf, len, at, " tcp_estab=");
+    at = snap_put_u64(buf, len, at, g_tcp_estab_total);
     at = snap_puts(buf, len, at, "\n");
     if (at < len)
         buf[at] = '\0';

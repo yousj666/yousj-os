@@ -606,6 +606,12 @@ void file_put(struct yousj_file *f)
             net_udp_release(f->udp_ep);
             f->udp_ep = NULL;
         }
+        if (f->tcp != NULL) {
+            /* M75: release may detach; the stack finishes a
+             * graceful close on its own. */
+            net_tcp_release(f->tcp);
+            f->tcp = NULL;
+        }
         if (f->node != NULL) {
             node_ref_dec(f->node);
             f->node = NULL;
@@ -903,6 +909,19 @@ long fs_udp_file_create(struct yousj_udp_ep *ep,
     if (f == NULL)
         return -YOUSJ_ENFILE;
     f->udp_ep = ep;
+    f->flags = YOUSJ_O_RDWR;
+    *out = f;
+    return 0;
+}
+
+long fs_tcp_file_create(struct yousj_tcp *t,
+                        struct yousj_file **out)
+{
+    struct yousj_file *f = file_alloc();
+
+    if (f == NULL)
+        return -YOUSJ_ENFILE;
+    f->tcp = t;
     f->flags = YOUSJ_O_RDWR;
     *out = f;
     return 0;
@@ -3529,7 +3548,7 @@ bool fs_file_stat(struct yousj_file *f,
         return true;
     }
     if (f->spair != NULL || f->usock != NULL ||
-        f->udp_ep != NULL) { /* M67/M68/M74 */
+        f->udp_ep != NULL || f->tcp != NULL) { /* M67-M75 */
         info->mode = 0140000u | 0666u; /* S_IFSOCK */
         info->mtime = 0;
         info->atime = 0;

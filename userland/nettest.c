@@ -191,8 +191,105 @@ static int udp_main(void)
     return 0;
 }
 
+/* --- M75: TCP over the real socket calls ----------------- */
+#define SYS_read 0
+#define SYS_write 1
+#define SYS_listen 50
+#define SYS_accept 43
+
+static int tcp_main(void)
+{
+    struct sockaddr_in_k in, from;
+    uint32_t flen;
+    char buf[64];
+    int ok = 1;
+    long r, srv, cli, acc;
+
+    /* loopback conversation, all in one process */
+    srv = sys_call3(SYS_socket, 2, 1, 0);
+    cli = sys_call3(SYS_socket, 2, 1, 0);
+    ok = ok && srv >= 0 && cli >= 0;
+    fill_in(&in, 0x7F000001u, 7779);
+    r = sys_call3(SYS_bind, srv, (long)&in, 16);
+    ok = ok && r == 0;
+    {
+        long srv2 = sys_call3(SYS_socket, 2, 1, 0);
+        r = sys_call3(SYS_bind, srv2, (long)&in, 16);
+        ok = ok && r == -98; /* TCP port space is its own */
+        sys_call3(SYS_close, srv2, 0, 0);
+    }
+    r = sys_call3(SYS_listen, srv, 4, 0);
+    ok = ok && r == 0;
+    fill_in(&in, 0x7F000001u, 7779);
+    r = sys_call3(SYS_connect, cli, (long)&in, 16);
+    ok = ok && r == 0;
+    flen = sizeof(from);
+    acc = sys_call3(SYS_accept, srv, (long)&from, (long)&flen);
+    ok = ok && acc >= 0 && flen == 16;
+    r = sys_call3(SYS_write, cli, (long)"hello-tcp", 9);
+    ok = ok && r == 9;
+    r = sys_call3(SYS_read, acc, (long)buf, 9);
+    ok = ok && r == 9 && buf_eq(buf, "hello-tcp", 9);
+
+    r = sys_call3(SYS_write, acc, (long)"reply-42", 8);
+    ok = ok && r == 8;
+    r = sys_call3(SYS_read, cli, (long)buf, 8);
+    ok = ok && r == 8 && buf_eq(buf, "reply-42", 8);
+    sys_call3(SYS_close, cli, 0, 0);
+    r = sys_call3(SYS_read, acc, (long)buf, 8);
+    ok = ok && r == 0; /* the peer's FIN reads as EOF */
+    sys_call3(SYS_close, acc, 0, 0);
+    sys_call3(SYS_close, srv, 0, 0);
+    out(ok ? "NETTEST tcp-loop PASS\n" : "NETTEST tcp-loop FAIL\n");
+    if (!ok)
+        return 1;
+
+    /* a refused connect (nothing listens on 7997 loopback) */
+    cli = sys_call3(SYS_socket, 2, 1, 0);
+    fill_in(&in, 0x7F000001u, 7997);
+    r = sys_call3(SYS_connect, cli, (long)&in, 16);
+    out(r == -111 ? "NETTEST tcp-refused PASS\n"
+                  : "NETTEST tcp-refused FAIL\n");
+    sys_call3(SYS_close, cli, 0, 0);
+    if (r != -111)
+        return 1;
+
+    /* wire side: connect out to the harness's server
+     * (fill_in takes the plain host-order value: 10.0.2.2) */
+    cli = sys_call3(SYS_socket, 2, 1, 0);
+    fill_in(&in, 0x0A000202u, 8888);
+    out("NETTEST tcp-dialing\n");
+    r = sys_call3(SYS_connect, cli, (long)&in, 16);
+    if (r != 0) {
+        out("NETTEST tcp-conn FAIL\n");
+        return 1;
+    }
+    out("NETTEST tcp-conn\n");
+    r = sys_call3(SYS_read, cli, (long)buf, 5);
+    if (r != 5 || !buf_eq(buf, "srv42", 5)) {
+        out("NETTEST tcp-recv FAIL\n");
+        return 1;
+    }
+    r = sys_call3(SYS_write, cli, (long)"cli42", 5);
+    if (r != 5) {
+        out("NETTEST tcp-send FAIL\n");
+        return 1;
+    }
+    r = sys_call3(SYS_read, cli, (long)buf, 5);
+    if (r != 0) {
+        out("NETTEST tcp-eof FAIL\n");
+        return 1;
+    }
+    sys_call3(SYS_close, cli, 0, 0);
+    print_info("NETTEST after-tcp ");
+    out("NETTEST DONE\n");
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
+    if (argc > 1 && str_eq(argv[1], "tcp"))
+        return tcp_main();
     if (argc > 1 && str_eq(argv[1], "udp"))
         return udp_main();
     if (argc > 1 && str_eq(argv[1], "ping")) {

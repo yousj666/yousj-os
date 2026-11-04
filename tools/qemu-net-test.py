@@ -271,6 +271,69 @@ if ok:
           ic[8 + 20 + 2:8 + 20 + 4] == struct.pack('>H', 7999))
 check('unbound port earns ICMP unreachable', ok)
 
+# 9. (M75) TCP: the harness plays the server for the guest's
+# outbound connect -- handshake, data both ways, FIN close.
+def tcp_seg(sport, dport, seq, ack, flags, data=b''):
+    hdr = struct.pack('>HHII', sport, dport, seq, ack) + \
+        bytes([0x50, flags]) + struct.pack('>HHH', 64240, 0, 0)
+    pseudo = PEER_IP + GUEST_IP + struct.pack('>BBH', 0, 6,
+                                              len(hdr) + len(data))
+    hdr = hdr[:16] + struct.pack('>H', csum(pseudo + hdr + data)) \
+        + hdr[18:]
+    return hdr + data
+
+def wait_tcp(pred, timeout=20):
+    end = time.time() + timeout
+    while time.time() < end:
+        for f in list(frames):
+            if len(f) >= 54 and f[12:14] == b'\x08\x00' and \
+                    f[23] == 6 and pred(f):
+                return f
+        time.sleep(0.1)
+    return None
+
+mark = len(buf)
+frames.clear()  # before dialing: the SYN may beat the prints
+send('nettest tcp')
+check('nettest tcp loopback', until('NETTEST tcp-loop PASS', 30, mark))
+check('nettest tcp refused', until('NETTEST tcp-refused PASS', 30,
+                                    mark))
+check('nettest tcp dialing', until('NETTEST tcp-dialing', 30, mark))
+syn = wait_tcp(lambda f: f[47] & 0x02 and not (f[47] & 0x10))
+ok = syn is not None
+g_sport, g_seq = 0, 0
+if ok:
+    seg = syn[34:]
+    g_sport = struct.unpack('>H', seg[0:2])[0]
+    g_seq = struct.unpack('>I', seg[4:8])[0]
+    ok = struct.unpack('>H', seg[2:4])[0] == 8888 and \
+        syn[14 + 16:14 + 20] == PEER_IP
+check('guest SYN on the wire', ok)
+MY_ISS = 0x10000
+send_frame(eth(GUEST_MAC, PEER_MAC, 0x0800,
+               ip_packet(PEER_IP, GUEST_IP, 6,
+                         tcp_seg(8888, g_sport, MY_ISS, g_seq + 1,
+                                 0x12))))
+ackf = wait_tcp(lambda f: f[47] & 0x10 and
+                struct.unpack('>I', f[42:46])[0] == MY_ISS + 1)
+check('guest completes the handshake', ackf is not None)
+check('nettest tcp connected', until('NETTEST tcp-conn', 30, mark))
+send_frame(eth(GUEST_MAC, PEER_MAC, 0x0800,
+               ip_packet(PEER_IP, GUEST_IP, 6,
+                         tcp_seg(8888, g_sport, MY_ISS + 1,
+                                 g_seq + 1, 0x18, b'srv42'))))
+got = wait_tcp(lambda f: len(f) >= 59 and f[54:] == b'cli42' and
+               struct.unpack('>I', f[38:42])[0] == g_seq + 1)
+check('guest data arrives intact', got is not None)
+if got is not None:
+    send_frame(eth(GUEST_MAC, PEER_MAC, 0x0800,
+                   ip_packet(PEER_IP, GUEST_IP, 6,
+                             tcp_seg(8888, g_sport, MY_ISS + 6,
+                                     g_seq + 6, 0x11))))
+fin = wait_tcp(lambda f: f[47] & 0x01)
+check('guest FINs after close', fin is not None)
+check('nettest done (tcp)', until('NETTEST DONE', 40, mark))
+
 f1 = free_pages(len(buf))
 check('PMM steady state', f0 is not None and f0 == f1)
 
