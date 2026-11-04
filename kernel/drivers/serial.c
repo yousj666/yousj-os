@@ -15,6 +15,7 @@
  */
 #include "serial.h"
 #include <yousj/fb.h> /* M82: fb_console_putc mirror */
+#include <yousj/ps2kbd.h> /* M83: keyboard-fed console input */
 
 #define SERIAL_PORT YOUSJ_SERIAL_COM1_PORT
 
@@ -90,12 +91,20 @@ void serial_put_hex64(uint64_t v)
 
 int serial_rx_ready(void)
 {
-    /* LSR bit 0 without consuming the byte (poll/select). */
-    return (inb(SERIAL_PORT + 5) & 0x01) != 0;
+    /* LSR bit 0 without consuming the byte (poll/select).
+     * M83: the PS/2 keyboard feeds the same console input. */
+    if ((inb(SERIAL_PORT + 5) & 0x01) != 0)
+        return 1;
+    return ps2kbd_ready();
 }
 
 int serial_getc_nonblock(void)
 {
+    /* M83: the local keyboard wins when both sources have input
+     * (the person at the screen outranks the wire). */
+    int kc = ps2kbd_getc();
+    if (kc >= 0)
+        return kc;
     /* LSR (offset 5) bit 0 = data ready in the receive register. */
     if ((inb(SERIAL_PORT + 5) & 0x01) == 0)
         return -1;

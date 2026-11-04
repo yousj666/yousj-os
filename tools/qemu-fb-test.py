@@ -213,6 +213,30 @@ def main():
         check("console advanced with new shell output",
               lower_after > lower_before + 20)
         save_png(os.path.join(ROOT, "build", "fb_con.png"), w, h, body)
+
+        # --- M83: type on the PS/2 keyboard via monitor sendkey ---
+        def sendkey(key):
+            m = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            m.connect(MON)
+            m.settimeout(5)
+            m.recv(4096)
+            m.sendall(("sendkey " + key + "\n").encode())
+            time.sleep(0.22)
+            m.close()
+
+        for key in ("e", "c", "h", "o", "spc", "shift-k", "shift-b",
+                    "shift-d", "8", "3"):
+            sendkey(key)
+        sendkey("ret")
+        check("keyboard-typed command ran (KBD83 on serial)",
+              ser.until("KBD83", 30))
+        time.sleep(0.6)
+        w2, h2, body = dump(os.path.join(ROOT, "build", "fb_kbd.ppm"))
+        lower_kbd = band_bright(560, 1000)
+        print("console bright samples after keyboard:", lower_kbd)
+        check("console advanced with keyboard input",
+              lower_kbd > lower_after + 20)
+        save_png(os.path.join(ROOT, "build", "fb_kbd.png"), w, h, body)
     finally:
         qemu.terminate()
         try:
