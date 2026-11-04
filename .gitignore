@@ -1,3 +1,4 @@
 build/
 *.o
 tools/__pycache__/
+dist/

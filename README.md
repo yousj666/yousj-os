@@ -1436,14 +1436,36 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   项全过。sendfile 对
   socket 输入（-EBADF）
   仍留待办。
-- ⏳ 下一步候选：可启
-  动系统镜像打包（一
-  键产出镜像＋冷启验
-  证），然后网卡中断
-  与 modern virtio；
+- ✅ 可启动系统镜像
+  M78（2026-11-04）：
+  `make image` 一键产
+  出 dist/yousj-os-
+  0.1.0.img（64MB ESP
+  磁盘镜像：BOOTX64.
+  EFI＋自包含内核，
+  initramfs 已内嵌）
+  与 SHA256SUMS。新验
+  收 tools/qemu-image-
+  test.py 只挂这一个
+  文件冷启（无 -kernel
+  /-initrd 拐杖）：固
+  件自寻引导、进
+  shell、busybox 与网
+  络栈实测可用、零异
+  常，共 7 项全过。镜
+  像自此可拷走、在任
+  何 UEFI 机器/虚拟机
+  上直接启动。
+- ⏳ 下一步候选：网卡
+  中断与 modern
+  virtio，然后服务器
+  版日常化（服务管理
+  ＋持久根文件系统安
+  装到镜像第二分区）；
   SCM_RIGHTS 与抽象地
   址留在 socket 面待
-  办。
+  办，sendfile 对
+  socket 输入亦然。
 
 ## 从零构建
 
@@ -1456,6 +1478,7 @@ make test             # 宿主机单元测试（PMM / VMM / 调度逻辑）
 make kernel           # 构建 ELF64 内核 + Multiboot 冒烟桩
 tools/qemu-smoke.sh   # 一键冒烟：构建 + QEMU 启动 + 串口断言
 make -C bootloader esp  # 构建 UEFI 链：BOOTX64.EFI + ESP 镜像
+make image            # 产出可分发系统镜像 dist/yousj-os-<版本>.img + SHA256SUMS
 ```
 
 许可证：待定（开源发布前由用户确认；确认前本仓库不对外发布）。

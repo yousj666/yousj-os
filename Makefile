@@ -333,6 +333,20 @@ STUB_LINK_OBJS := $(BUILD)/stub.o $(BUILD)/stub_main.o $(BUILD)/stub_bootinfo.o
 kernel: $(KERNEL) $(STUB)
 	@echo "kernel OK: $(KERNEL) + $(STUB)"
 
+# M78: the distributable system image -- one bootable disk
+# file (UEFI ESP: BOOTX64.EFI + the self-contained kernel,
+# initramfs embedded) plus its checksum. Boot it with any
+# UEFI firmware; tools/qemu-image-test.py cold-boots this
+# exact file with no -kernel/-initrd crutches.
+VERSION := 0.1.0
+.PHONY: image
+image: kernel
+	$(MAKE) -C bootloader esp OUT=../build/image
+	mkdir -p dist
+	cp build/image/esp.img dist/yousj-os-$(VERSION).img
+	cd dist && sha256sum yousj-os-$(VERSION).img > SHA256SUMS
+	@echo "image ready: dist/yousj-os-$(VERSION).img"
+
 $(KERNEL): $(KERNEL_LINK_OBJS) kernel/arch/x86_64/link.ld
 	ld -T kernel/arch/x86_64/link.ld -o $@ $(KERNEL_LINK_OBJS)
 	@nm $@ | python3 -c "import sys; d={p[2]:int(p[0],16) for p in (l.split() for l in sys.stdin) if len(p)==3}; s=d['__kernel_end']-d['__kernel_start']; print(f'kernel image span: {s} bytes'); sys.exit('span exceeds the 8 MiB early-map window (stub + UEFI handoff, M58)' if s>8388608 else None)"
