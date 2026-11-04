@@ -439,6 +439,68 @@ def main():
 
         save_png(os.path.join(ROOT, "build", "fb_desk.png"), w, h,
                  body)
+
+        # --- M88: a real shell inside a window ----------------
+        # Type `gterm` at the console prompt; a terminal window
+        # opens at (300,300), 880x560, and takes the keyboard.
+        # Commands typed then run INSIDE the window; closing
+        # it with the mouse hands the keyboard back.
+        for key in ("g", "t", "e", "r", "m"):
+            sendkey(key)
+        sendkey("ret")
+        time.sleep(2.5)
+        w2, h2, body = dump(os.path.join(ROOT, "build",
+                                         "fb_t1.ppm"))
+        check("terminal window title bar",
+              close(px(body, w, 500, 310), (0x2E, 0x5E, 0x8C)))
+        check("terminal window body",
+              close(px(body, w, 700, 700), (0x24, 0x46, 0x6B)))
+
+        def win_text_pixels():
+            n = 0
+            for yy in range(336, 856, 2):
+                for xx in range(308, 1172, 2):
+                    r_, g_, b_ = px(body, w, xx, yy)
+                    if r_ > 200 and g_ > 200 and b_ > 200:
+                        n += 1
+            return n
+
+        before = win_text_pixels()
+        check("shell banner rendered in the window",
+              before > 60)
+        for key in ("e", "c", "h", "o", "spc", "shift-g", "u",
+                    "i", "8", "8"):
+            sendkey(key)
+        sendkey("ret")
+        time.sleep(2.0)
+        w2, h2, body = dump(os.path.join(ROOT, "build",
+                                         "fb_t2.ppm"))
+        after = win_text_pixels()
+        print("window text pixels before/after echo:",
+              before, after)
+        check("typed command ran inside the window",
+              after > before + 15)
+        save_png(os.path.join(ROOT, "build", "fb_term.png"),
+                 w, h, body)
+
+        goto(1166, 310, (100, 1984))
+        mon_cmd("mouse_button 1", 0.5)
+        mon_cmd("mouse_button 0", 0.4)
+        time.sleep(1.5)
+        w2, h2, body = dump(os.path.join(ROOT, "build",
+                                         "fb_t3.ppm"))
+        check("terminal window closed by its red box",
+              not close(px(body, w, 1100, 800),
+                        (0x24, 0x46, 0x6B)))
+        for key in ("e", "c", "h", "o", "spc", "shift-b",
+                    "shift-a", "shift-c", "shift-k", "8", "8"):
+            sendkey(key)
+        sendkey("ret")
+        back_ok = ser.until("BACK88", 30)
+        check("console shell took the keyboard back (BACK88)",
+              back_ok)
+        if not back_ok:
+            print("serial tail:", repr(ser.text()[-600:]))
     finally:
         qemu.terminate()
         try:

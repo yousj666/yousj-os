@@ -135,6 +135,14 @@
  * native call is the Yousj shortcut until that ioctl surface
  * is worth building (the pair itself is the real thing). */
 #define YOUSJ_SYS_NATIVE_PTY_SLAVE   (YOUSJ_SYS_NATIVE_BASE + 5)
+/* M88: the window layer as a service. gui_open(title_ptr,
+ * w, h) -> window id; gui_write(id, buf, len); gui_getc(id)
+ * -> byte, -1 empty, -2 mouse-closed; gui_close(id). Only
+ * the owning task may use its windows. */
+#define YOUSJ_SYS_NATIVE_GUI_OPEN    (YOUSJ_SYS_NATIVE_BASE + 6)
+#define YOUSJ_SYS_NATIVE_GUI_WRITE   (YOUSJ_SYS_NATIVE_BASE + 7)
+#define YOUSJ_SYS_NATIVE_GUI_GETC    (YOUSJ_SYS_NATIVE_BASE + 8)
+#define YOUSJ_SYS_NATIVE_GUI_CLOSE   (YOUSJ_SYS_NATIVE_BASE + 9)
 
 #define YOUSJ_SYS_inotify_init     253 /* M48 */
 #define YOUSJ_SYS_inotify_add_watch 254 /* M48 */

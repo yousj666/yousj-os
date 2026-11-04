@@ -1652,17 +1652,35 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   poll、跨 fork 阻塞
   读、关主端 EOF、双
   对独立、无泄漏）。
-- ⏳ 下一步：M88 图
-  形终端——GUI 原生
-  调用（开窗/绘字/
-  事件）＋ gterm 把
-  真 shell 经 PTY 装
-  进窗口。再后：多窗
-  口、modern virtio、
-  服务器版日常化；SCM
-  _RIGHTS/抽象地址/
-  sendfile 对 socket
-  输入仍在 socket 面
+- ✅ 图形终端 M88
+  （2026-11-04）：窗
+  口层泛化为服务——
+  原生调用 gui_open/
+  write/getc/close
+  （0x1006 起），用
+  户窗口是字符格文本
+  面（流式字节、滚
+  动、退格），键盘焦
+  点决定按键去向（窗
+  口或控制台），任务
+  栏指示条跟随焦点窗
+  口，关窗/任务退出
+  都有回收。gterm 经
+  PTY 把真 shell 装
+  进窗口：敲 gterm 开
+  窗打命令，输出回窗
+  口，鼠标关窗后键盘
+  归还控制台。验收：
+  fb 套件 39 项全过。
+- ⏳ 下一步候选：开
+  始菜单加「Terminal」
+  入口、多窗口层叠与
+  焦点模型完善、modern
+  virtio、服务器版日
+  常化；SCM_RIGHTS/
+  抽象地址/sendfile
+  对 socket 输入仍在
+  socket 面
   待办。
 
 ## 从零构建

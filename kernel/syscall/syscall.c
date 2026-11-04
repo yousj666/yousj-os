@@ -29,6 +29,7 @@
 #include <yousj/vmm.h>
 #include <yousj/elf.h>
 #include <yousj/pmm.h>
+#include <yousj/wm.h> /* M88: window ownership ends with the task */
 #include <drivers/serial.h>
 
 static void vma_release_in(struct vmm_space *sp,
@@ -490,6 +491,11 @@ void process_exit(long status, int sig)
             __asm__ volatile("cli; hlt");
     }
     me->sig_killed = sig;
+
+    /* M88: windows die with their owner (before the address
+     * space goes away -- the window layer itself is kernel
+     * state, but tidiness here matches fd teardown below). */
+    wm_task_exit((int)me->tid);
 
     /* M52: the clear_child_tid handshake (set_tid_address /
      * CLONE_CHILD_CLEARTID) -- zero the word and futex-wake
@@ -6116,6 +6122,58 @@ static long sys_pty_slave(long master_fd)
     return rc;
 }
 
+/* --- M88: GUI native calls ----------------------------------
+ * Thin wrappers over the window layer; the caller is the
+ * owner, identified by tid. gui_write stages through a
+ * kernel buffer in chunks. */
+static long sys_gui_open(uint64_t title_ptr, uint64_t w,
+                         uint64_t h)
+{
+    static char title[32];
+    struct task *me = sched_current();
+
+    if (copy_user_string(title_ptr, title, sizeof(title)) != 0)
+        return -YOUSJ_EFAULT;
+    return wm_gui_open((int)me->tid, title, (uint32_t)w,
+                       (uint32_t)h);
+}
+
+static long sys_gui_write(long id, uint64_t buf, uint64_t len)
+{
+    struct task *me = sched_current();
+    uint8_t stage[256];
+    uint64_t done = 0;
+
+    if (!user_range_ok(buf, len))
+        return -YOUSJ_EFAULT;
+    while (done < len) {
+        uint64_t chunk = len - done;
+        uint64_t i;
+        long rc;
+        if (chunk > sizeof(stage))
+            chunk = sizeof(stage);
+        for (i = 0; i < chunk; i++)
+            stage[i] = *(const uint8_t *)(uintptr_t)(buf + done + i);
+        rc = wm_gui_write((int)id, (int)me->tid, stage, chunk);
+        if (rc < 0)
+            return done > 0 ? (long)done : rc;
+        done += chunk;
+    }
+    return (long)done;
+}
+
+static long sys_gui_getc(long id)
+{
+    struct task *me = sched_current();
+    return wm_gui_getc((int)id, (int)me->tid);
+}
+
+static long sys_gui_close(long id)
+{
+    struct task *me = sched_current();
+    return wm_gui_close((int)id, (int)me->tid);
+}
+
 /* --- dispatcher --------------------------------------------------------- */
 
 /* The switch itself. Arguments arrive via the entry shim's
@@ -6461,6 +6519,14 @@ static long dispatch_inner(struct yousj_syscall_ctx *ctx)
         return sys_net_info(a1, a2);
     case YOUSJ_SYS_NATIVE_PTY_SLAVE:
         return sys_pty_slave((long)a1);
+    case YOUSJ_SYS_NATIVE_GUI_OPEN:
+        return sys_gui_open(a1, a2, a3);
+    case YOUSJ_SYS_NATIVE_GUI_WRITE:
+        return sys_gui_write((long)a1, a2, a3);
+    case YOUSJ_SYS_NATIVE_GUI_GETC:
+        return sys_gui_getc((long)a1);
+    case YOUSJ_SYS_NATIVE_GUI_CLOSE:
+        return sys_gui_close((long)a1);
     case YOUSJ_SYS_NATIVE_NET_ARP: {
         /* a1 arrives in network byte order */
         uint32_t b = (uint32_t)a1;

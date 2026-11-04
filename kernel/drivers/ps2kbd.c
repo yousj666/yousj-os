@@ -15,6 +15,7 @@
 #include <yousj/types.h>
 #include <yousj/ps2kbd.h>
 #include <yousj/ps2mouse.h> /* M84: AUX bytes go to the mouse */
+#include <yousj/wm.h> /* M88: a focused window takes the keys */
 
 #define KBD_STATUS 0x64
 #define KBD_DATA   0x60
@@ -56,7 +57,16 @@ static int g_shift, g_caps, g_ctrl, g_e0;
 
 static void ring_push(uint8_t c)
 {
-    uint32_t next = (g_head + 1) & 127;
+    /* M88: while a user window holds keyboard focus, decoded
+     * bytes go to its queue instead of the console ring --
+     * the two never share a keystroke. */
+    int target = wm_key_target();
+    uint32_t next;
+    if (target >= 0) {
+        wm_key_push(target, c);
+        return;
+    }
+    next = (g_head + 1) & 127;
     if (next == g_tail)
         return; /* full: drop */
     g_ring[g_head] = c;

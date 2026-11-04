@@ -212,13 +212,17 @@ static struct {
 /* Is this cell's pixel rectangle covered by the window? */
 static int con_cell_occluded(uint32_t cx, uint32_t cy)
 {
-    uint32_t wx, wy, ww, wh;
     uint32_t px = 8 + cx * 8;
     uint32_t py = g_con.top + cy * 16;
-    if (!wm_window_rect(&wx, &wy, &ww, &wh))
-        return 0;
-    return px + 8 > wx && px < wx + ww &&
-           py + 16 > wy && py < wy + wh;
+    int idx;
+    for (idx = 0;; idx++) {
+        uint32_t wx, wy, ww, wh;
+        if (!wm_window_rect(idx, &wx, &wy, &ww, &wh))
+            return 0;
+        if (px + 8 > wx && px < wx + ww &&
+            py + 16 > wy && py < wy + wh)
+            return 1;
+    }
 }
 
 static uint32_t con_cell_x(uint32_t cx)
