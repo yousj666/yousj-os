@@ -2816,8 +2816,14 @@ static short fd_ready_file(struct yousj_file *f, long fd,
         return rev;
     }
     if (f->pipe == NULL && f->spair == NULL && f->usock == NULL &&
+        f->udp_ep == NULL && f->tcp == NULL &&
         f->backend == 0 && f->node == NULL) {
-        /* the console: fd 0 is the readable side */
+        /* the console: fd 0 is the readable side. Every file
+         * kind must be excluded here by name -- kinds added
+         * later (M74's udp_ep, M75's tcp) once slipped past
+         * and were polled as a console, so an INET socket
+         * never reported POLLIN and busybox nc timed its
+         * reads out (found by M76's real-stack testing). */
         if (fd == 0) {
             if ((events & POLLIN_K) && serial_rx_ready())
                 rev |= POLLIN_K;

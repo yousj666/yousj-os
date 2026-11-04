@@ -1364,15 +1364,57 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   ECONNREFUSED），线级
   由脚本服务器全程应答
   （握手/双向数据/FIN）。
-- ⏳ 下一步候选：真实
-  互通验证（QEMU 用户
-  网 slirp 后与宿主机
-  真实 TCP 栈互打，
-  busybox nc 双向），
-  然后网卡中断与
-  modern virtio；SCM_
-  RIGHTS 与抽象地址留
-  在 socket 面待办。
+- ✅ 真实互通验证
+  M76（2026-11-04）：
+  QEMU 用户网（slirp
+  ＋hostfwd）后与宿主机
+  真实 TCP 栈互打——客
+  户机 busybox nc 出站
+  连宿主 echo 服务器收
+  发、宿主经端口转发连
+  入客户机 nc -l -e 回
+  显，全程 pcap 抓包核
+  对；init 开机自动装
+  busybox applet 链接
+  （bare nc/cat 从此可
+  用，pidtest 的 /bin
+  目录枚举随之改循环
+  读）。互通实测揪出真
+  bug：fd 就绪判定的
+  「控制台」识别只排除
+  了 pipe/spair/usock，
+  M74/M75 新增的 udp/
+  tcp 文件被误认成控制
+  台、poll 对 INET
+  socket 永不报 POLLIN
+  ——已按「每种文件类
+  型逐一具名排除」修
+  正。遗留（M77 头号）：
+  经 slirp 投递的连接
+  关闭时，客户机侧进
+  程偶发退不干净（出
+  口路径 clear_child_
+  tid 的用户页写曾停
+  滞、brk 边缘缺页未
+  命中、极低频 iret
+  #GP），隔离探针（
+  pumptest/fdprobe 已
+  入树）在回环上全过，
+  待压力矩阵稳定复现
+  后再修；入站套件的
+  相关断言待其修复后
+  补回；sendfile 对
+  socket 输入同样待接
+  （现 -EBADF，cat 靠
+  read/write 回退不受
+  影响）。
+- ⏳ 下一步候选：M77
+  进程收尾稳定性攻坚
+  （见上），然后网卡中
+  断与 modern virtio；
+  SCM_RIGHTS 与抽象地
+  址留在 socket 面待
+  办。
 
 ## 从零构建
 

@@ -145,9 +145,9 @@ static void print_banner(void)
  * WNOHANG-sweep) left them as zombies for the whole session,
  * sometimes forever in practice. An orphan that dies during
  * the 1 s respawn throttle below is reaped on the next pass. */
-static int spawn_and_reap(void)
+static int spawn_and_reap_argv(const char *path,
+                               const char *const *argv)
 {
-    static const char *const shell_argv[] = { "/bin/sh", NULL };
     static const char *const empty_env[] = { NULL };
     long pid = sys_call3(SYS_clone, SIGCHLD, 0, 0);
 
@@ -156,10 +156,10 @@ static int spawn_and_reap(void)
         return 127;
     }
     if (pid == 0) {
-        sys_call3(SYS_execve, (long)(uintptr_t)"/bin/sh",
-                  (long)(uintptr_t)shell_argv,
+        sys_call3(SYS_execve, (long)(uintptr_t)path,
+                  (long)(uintptr_t)argv,
                   (long)(uintptr_t)empty_env);
-        out("yousj-init: execve of /bin/sh failed\n");
+        out("yousj-init: execve failed\n");
         sys_call3(SYS_exit_group, 127, 0, 0);
     }
     for (;;) {
@@ -186,9 +186,27 @@ static int spawn_and_reap(void)
     }
 }
 
+static int spawn_and_reap(void)
+{
+    static const char *const shell_argv[] = { "/bin/sh", NULL };
+
+    return spawn_and_reap_argv("/bin/sh", shell_argv);
+}
+
 int main(void)
 {
     print_banner();
+
+    /* M76: install the busybox applet links once at boot, so
+     * a fresh shell starts with the full tool set (echo, cat,
+     * nc, ...) instead of the bare minimum. Failure is not
+     * fatal: busybox itself still answers as /bin/busybox. */
+    {
+        static const char *const bb_argv[] = {
+            "/bin/busybox", "--install", "-s", "/bin", NULL
+        };
+        (void)spawn_and_reap_argv("/bin/busybox", bb_argv);
+    }
 
     for (;;) {
         int rc = spawn_and_reap();

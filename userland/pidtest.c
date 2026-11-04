@@ -546,21 +546,29 @@ int main(int argc, char **argv)
                       (long)(uintptr_t)"/proc/self/exe",
                       (long)(uintptr_t)&sb, 0) == 0 &&
             (sb.mode & 0170000) == 0100000;
-        /* opening cwd opens the directory itself */
+        /* opening cwd opens the directory itself. Since
+         * init installs busybox's ~300 applet links into
+         * /bin, one getdents batch no longer covers the
+         * directory: loop until the entry shows up. */
         {
-            char db[512];
+            char db[2048];
             long fd = sys_call3(SYS_open,
                                 (long)(uintptr_t)"/proc/self/cwd",
                                 0, 0);
-            long got = -1;
+            int found = 0;
             if (fd >= 0) {
-                got = sys_call3(SYS_getdents64, fd,
-                                (long)(uintptr_t)db,
-                                sizeof(db));
+                long got;
+                while ((got = sys_call3(SYS_getdents64, fd,
+                                        (long)(uintptr_t)db,
+                                        sizeof(db))) > 0) {
+                    if (dent_type(db, got, "pidtest") == 8) {
+                        found = 1;
+                        break;
+                    }
+                }
                 sys_call1(SYS_close, fd);
             }
-            ok = ok && got > 0 &&
-                 dent_type(db, got, "pidtest") == 8;
+            ok = ok && found;
         }
         /* a generated file is not a link */
         ok = ok && sys_call3(SYS_readlink,

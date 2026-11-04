@@ -38,6 +38,30 @@ static void out(const char *s)
     sys_call3(SYS_write, 1, (long)s, (long)n);
 }
 
+static void outn(long v)
+{
+    char tmp[24];
+    int n = 0;
+    if (v == 0) {
+        out("0");
+        return;
+    }
+    if (v < 0) {
+        out("-");
+        v = -v;
+    }
+    while (v > 0) {
+        tmp[n++] = (char)('0' + (v % 10));
+        v /= 10;
+    }
+    while (n > 0) {
+        char c[2];
+        c[0] = tmp[--n];
+        c[1] = 0;
+        out(c);
+    }
+}
+
 static int str_eq(const char *a, const char *b)
 {
     while (*a && *a == *b) {
@@ -286,8 +310,115 @@ static int tcp_main(void)
     return 0;
 }
 
+/* M76 probe: outbound connect + write + read against the
+ * slirp-visible host at 10.0.2.2:19152, printing every step. */
+static int egress_main(void)
+{
+    struct sockaddr_in_k in;
+    char buf[64];
+    long r, c, i;
+
+    c = sys_call3(SYS_socket, 2, 1, 0);
+    fill_in(&in, 0x0A000202u, 19152);
+    r = sys_call3(SYS_connect, c, (long)&in, 16);
+    if (r != 0) {
+        out("EGRESS connect-fail\n");
+        return 1;
+    }
+    out("EGRESS connected\n");
+    r = sys_call3(SYS_write, c, (long)"ping-from-guest\n", 16);
+    if (r != 16) {
+        out("EGRESS write-fail\n");
+        return 1;
+    }
+    out("EGRESS wrote\n");
+    r = sys_call3(SYS_read, c, (long)buf, 21);
+    if (r > 0) {
+        for (i = 0; i < r; i++)
+            ;
+        buf[r] = 0;
+        out("EGRESS got: ");
+        out(buf);
+        out("\n");
+    } else
+        out("EGRESS read-fail\n");
+    sys_call3(SYS_close, c, 0, 0);
+    out("EGRESS DONE\n");
+    return 0;
+}
+
+/* M76 probe: mimic nc's poll loop -- a plain file fd plus a
+ * connected socket in one poll set, printing every round. */
+#define SYS_open 2
+#define SYS_poll 7
+struct pollfd_k { int fd; short events; short revents; };
+static int ppoll_main(void)
+{
+    struct sockaddr_in_k in;
+    struct pollfd_k pf[2];
+    char buf[64];
+    long c, f, r, i;
+
+    f = sys_call3(SYS_open, (long)"/xf", 0, 0);
+    if (f < 0) {
+        out("PPOLL no-file (creating via /motd instead)\n");
+        f = sys_call3(SYS_open, (long)"/etc/motd", 0, 0);
+    }
+    c = sys_call3(SYS_socket, 2, 1, 0);
+    fill_in(&in, 0x0A000202u, 19152);
+    r = sys_call3(SYS_connect, c, (long)&in, 16);
+    if (r != 0) {
+        out("PPOLL connect-fail\n");
+        return 1;
+    }
+    r = sys_call3(SYS_write, c, (long)"ping-from-guest\n", 16);
+    out("PPOLL wrote\n");
+    pf[0].fd = (int)f; pf[0].events = 1; pf[0].revents = 0;
+    pf[1].fd = (int)c; pf[1].events = 1; pf[1].revents = 0;
+    for (i = 0; i < 6; i++) {
+        r = sys_call3(SYS_poll, (long)pf, 2, 5000);
+        out("PPOLL round ret=");
+        outn(r);
+        out(" rev0=");
+        outn(pf[0].revents);
+        out(" rev1=");
+        outn(pf[1].revents);
+        out("\n");
+        if (r < 0)
+            break;
+        if (pf[1].revents & 1) {
+            r = sys_call3(SYS_read, c, (long)buf, 40);
+            out("PPOLL sock-read=");
+            outn(r);
+            out("\n");
+            if (r > 0) {
+                buf[r] = 0;
+                out("PPOLL data: ");
+                out(buf);
+            }
+            if (r <= 0)
+                break;
+        }
+        if (pf[0].revents & 1) {
+            r = sys_call3(SYS_read, f, (long)buf, 40);
+            out("PPOLL file-read=");
+            outn(r);
+            out("\n");
+            if (r == 0)
+                pf[0].fd = -1; /* EOF: stop polling it, as nc
+                                * does once the input is done */
+        }
+    }
+    out("PPOLL DONE\n");
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
+    if (argc > 1 && str_eq(argv[1], "ppoll"))
+        return ppoll_main();
+    if (argc > 1 && str_eq(argv[1], "egress"))
+        return egress_main();
     if (argc > 1 && str_eq(argv[1], "tcp"))
         return tcp_main();
     if (argc > 1 && str_eq(argv[1], "udp"))
