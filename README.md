@@ -1408,10 +1408,39 @@ Windows EXE 通过 Wine 式用户态兼容层运行，目标是「常见 EXE 能
   （现 -EBADF，cat 靠
   read/write 回退不受
   影响）。
-- ⏳ 下一步候选：M77
-  进程收尾稳定性攻坚
-  （见上），然后网卡中
-  断与 modern virtio；
+- ✅ 进程收尾稳定性
+  M77（2026-11-04）：
+  上条遗留已结清。冷
+  启压力矩阵稳定复现
+  后定位到真根源——
+  execve 没清退出握手
+  登记：clear_child_
+  tid 与 robust_head
+  是旧镜像 libc 的登
+  记（Linux 随 mm 一
+  并丢弃），我们存在
+  task 里跨 exec 残
+  留；musl 程序（nc）
+  exec 出无 libc 程序
+  （fdprobe）时，新进
+  程退出会照旧登记往
+  新镜像根本没映射的
+  地址写字，出口路径
+  就此卡死、连接 FIN
+  永不发出。已在 exec
+  提交点与 brk/fs_base
+  等一并清零。验证：
+  冷启入站 8 轮矩阵全
+  清、slirp 套件补回
+  全部退出断言共 12
+  项全过。sendfile 对
+  socket 输入（-EBADF）
+  仍留待办。
+- ⏳ 下一步候选：可启
+  动系统镜像打包（一
+  键产出镜像＋冷启验
+  证），然后网卡中断
+  与 modern virtio；
   SCM_RIGHTS 与抽象地
   址留在 socket 面待
   办。

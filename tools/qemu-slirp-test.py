@@ -133,8 +133,12 @@ estab0 = estab1
 
 # 2. Inbound: busybox nc listens in the guest, the host
 # connects through the hostfwd and gets cat echo back.
+mark_pre = len(buf)
 send('busybox nc -l -p 8151 -e /bin/cat')
-mark_in = len(buf)
+# pull the serial buffer up to date (it only advances when
+# until() runs) and prove the listener command actually
+# executed before the host tries to connect
+until('nc -l -p 8151', 20, mark_pre)
 time.sleep(1.0)
 hs = None
 for _ in range(30):
@@ -160,6 +164,25 @@ if hs is not None:
     hs.close()
 check('host got cat echo from the guest', got == b'host says hi\n')
 
+# The child on the accepted connection must unwind fully:
+# the shell prompt that returns has to be a NEW one, after
+# the nc command's own echo (the echo line itself starts
+# with 'sh> ', which is what made the first version of
+# this check pass vacuously).
+echo_pos = buf.find(b'nc -l -p 8151', mark_pre)
+check('guest shell back (inbound)',
+      echo_pos >= 0 and until('sh> ', 40, echo_pos + 4))
+
+# 3. The netinfo counters saw both connections, and the
+# page allocator is back where it started once the
+# detached connections have said their goodbyes.
+estab2 = tcp_estab(len(buf))
+check('netinfo counts real connections',
+      estab1 is not None and estab2 == estab1 + 1)
+time.sleep(3.0)
+f1 = free_pages(len(buf))
+check('PMM steady state',
+      f0 is not None and f1 is not None and abs(f1 - f0) <= 16)
 
 with open('build/slirp_serial_tail.log', 'w') as fh:
     fh.write(buf[-6000:].decode(errors='replace'))

@@ -1263,6 +1263,16 @@ static long sys_execve(uint64_t path_ptr, uint64_t argv_ptr,
     }
     fpu_init_area(me->fx_area); /* FPU state resets on exec (M8) */
     fpu_restore(me->fx_area);   /* the new image starts pristine */
+    /* M77: the exit-handshake registrations belong to the
+     * OLD image's libc: clear_child_tid names a word in its
+     * thread struct, robust_head a list in its data. Linux
+     * drops both with the mm exec discards; we carried them
+     * in the task, so they must be reset here -- otherwise a
+     * no-libc image exec'd from a musl one (nc -e fdprobe)
+     * exits through a write to an address the new image
+     * never mapped, and the exit path wedges for good. */
+    me->clear_child_tid = 0;
+    me->robust_head = 0;
     me->brk_start = heap_base;
     me->brk_end = heap_base;
     me->mmap_next = YOUSJ_MMAP_BASE;
