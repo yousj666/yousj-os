@@ -13,10 +13,21 @@
 #include <yousj/sched.h>
 #include <drivers/serial.h>
 
-/* The QEMU user-net (slirp) defaults; a configuration
- * surface comes later. */
-#define OUR_IP 0x0A00020Fu   /* 10.0.2.15 */
-#define OUR_GATEWAY 0x0A000202u /* 10.0.2.2 */
+/* M92: the live IPv4 configuration. It starts at the QEMU
+ * user-net (slirp) static defaults; the DHCP client run by
+ * net_init replaces the values when a lease is granted, and
+ * the static defaults stay as the fallback when no server
+ * answers. Every use point reads the OUR_IP / OUR_GATEWAY
+ * macros, so the whole stack sees the current configuration
+ * (address, mask, gateway) with no further plumbing. */
+static uint32_t g_net_ip = 0x0A00020Fu;   /* 10.0.2.15 */
+static uint32_t g_net_mask = 0xFFFFFF00u; /* 255.255.255.0 */
+static uint32_t g_net_gw = 0x0A000202u;   /* 10.0.2.2 */
+static bool g_dhcp_leased;
+#define OUR_IP (g_net_ip)
+#define OUR_GATEWAY (g_net_gw)
+
+static void dhcp_run(void); /* M92, below: net_init calls it */
 
 #define ETHERTYPE_ARP 0x0806
 #define ETHERTYPE_IP 0x0800
@@ -189,7 +200,7 @@ static void ip_send_to_mac(uint8_t *f, const uint8_t *dst_mac,
 static bool ip_send(uint8_t *f, uint32_t dst_ip, uint8_t proto,
                     const uint8_t *payload, uint32_t plen)
 {
-    uint32_t onward = (dst_ip & 0xFFFFFF00u) == (OUR_IP & 0xFFFFFF00u)
+    uint32_t onward = (dst_ip & g_net_mask) == (OUR_IP & g_net_mask)
                           ? dst_ip
                           : OUR_GATEWAY;
     const uint8_t *mac = neigh_lookup(onward);
@@ -250,7 +261,7 @@ static void ip_input(const uint8_t *frame, uint32_t len)
     tot = rd16(ip + 2);
     dst = rd32(ip + 16);
     if (tot < 20 || 14u + tot > len ||
-        (dst != OUR_IP && dst != 0x0A0002FFu &&
+        (dst != OUR_IP && dst != (OUR_IP | ~g_net_mask) &&
          dst != 0xFFFFFFFFu)) {
         g_dropped++;
         return;
@@ -327,7 +338,8 @@ void net_init(void)
             serial_putc(hexd[m[i] & 15]);
         }
     }
-    serial_puts(" ip=10.0.2.15\n");
+    serial_puts("\n");
+    dhcp_run(); /* M92: lease replaces the static defaults */
 }
 
 bool net_present(void)
@@ -372,11 +384,11 @@ long net_ping(uint32_t who)
     /* Resolve first: ARP, then wait on ticks for the reply
      * to land in the neighbour cache (the reply arrives in
      * interrupt context through net_poll). */
-    if (neigh_lookup((who & 0xFFFFFF00u) == (OUR_IP & 0xFFFFFF00u)
+    if (neigh_lookup((who & g_net_mask) == (OUR_IP & g_net_mask)
                          ? who
                          : OUR_GATEWAY) == NULL) {
-        uint32_t onward = (who & 0xFFFFFF00u) ==
-                                  (OUR_IP & 0xFFFFFF00u)
+        uint32_t onward = (who & g_net_mask) ==
+                                  (OUR_IP & g_net_mask)
                               ? who
                               : OUR_GATEWAY;
         for (tries = 0; tries < 20; tries++) {
@@ -569,11 +581,242 @@ static struct yousj_udp_ep *udp_find(uint32_t dst_ip,
         if (!ep->in_use || ep->local_port != dst_port)
             continue;
         if (ep->local_ip == 0 || ep->local_ip == dst_ip ||
-            dst_ip == 0x0A0002FFu || dst_ip == 0xFFFFFFFFu ||
+            dst_ip == (OUR_IP | ~g_net_mask) || dst_ip == 0xFFFFFFFFu ||
             dst_ip == 0x7F000001u)
             return ep;
     }
     return NULL;
+}
+
+/* M92: the DHCP client (RFC 2131, the minimal DISCOVER ->
+ * REQUEST -> ACK flow). It runs once, from net_init, before
+ * any task exists: it drives net_poll() itself while waiting,
+ * so neither the scheduler nor interrupts need to be live.
+ * We set the BROADCAST flag (there is no address to unicast
+ * to yet), replies are tapped out of udp_input() into the
+ * state below -- the tap only fills fields in receive
+ * context; all sending happens here in init context. When
+ * no server answers after a few tries, the static defaults
+ * stay and boot proceeds: a server in a rack with a dead
+ * DHCP service still comes up on a known address. */
+#define DHCP_DISCOVERING 1
+#define DHCP_OFFERED 2
+#define DHCP_DONE 3
+#define DHCP_NAK 4
+static volatile int g_dhcp_stage;
+static uint32_t g_dhcp_xid;
+static uint32_t g_dhcp_yiaddr, g_dhcp_mask, g_dhcp_gw,
+    g_dhcp_server;
+
+static void dhcp_input(const uint8_t *b, uint32_t len)
+{
+    const uint8_t *o;
+    uint32_t left;
+    uint8_t mtype = 0;
+    uint32_t mask = 0, gw = 0, server = 0;
+    int i;
+
+    if (g_dhcp_stage != DHCP_DISCOVERING &&
+        g_dhcp_stage != DHCP_OFFERED)
+        return;
+    if (len < 240 || b[0] != 2 || rd32(b + 4) != g_dhcp_xid ||
+        rd32(b + 236) != 0x63825363u)
+        return;
+    for (i = 0; i < 6; i++)
+        if (b[28 + i] != virtio_net_mac()[i])
+            return; /* not addressed to this client */
+    o = b + 240;
+    left = len - 240;
+    while (left >= 2) {
+        uint8_t code = o[0], olen;
+
+        if (code == 0) {
+            o++;
+            left--;
+            continue;
+        }
+        if (code == 255)
+            break;
+        olen = o[1];
+        if (2u + olen > left)
+            break;
+        if (code == 53 && olen >= 1)
+            mtype = o[2];
+        else if (code == 1 && olen >= 4)
+            mask = rd32(o + 2);
+        else if (code == 3 && olen >= 4)
+            gw = rd32(o + 2);
+        else if (code == 54 && olen >= 4)
+            server = rd32(o + 2);
+        o += 2 + olen;
+        left -= 2 + olen;
+    }
+    if (server == 0)
+        server = rd32(b + 20); /* siaddr */
+    if (mtype == 2 && g_dhcp_stage == DHCP_DISCOVERING) {
+        g_dhcp_yiaddr = rd32(b + 16);
+        g_dhcp_mask = mask;
+        g_dhcp_gw = gw;
+        g_dhcp_server = server;
+        g_dhcp_stage = DHCP_OFFERED;
+    } else if (mtype == 5 && g_dhcp_stage == DHCP_OFFERED) {
+        g_dhcp_yiaddr = rd32(b + 16);
+        if (mask)
+            g_dhcp_mask = mask;
+        if (gw)
+            g_dhcp_gw = gw;
+        g_dhcp_server = server;
+        g_dhcp_stage = DHCP_DONE;
+    } else if (mtype == 6) {
+        g_dhcp_stage = DHCP_NAK;
+    }
+}
+
+static void dhcp_send(uint8_t mtype)
+{
+    uint8_t *f = g_frame_out2;
+    uint8_t *ip = f + 14, *u = f + 34, *b = f + 42;
+    const uint8_t *mac = virtio_net_mac();
+    const uint32_t blen = 300; /* bootp body, padded */
+    uint16_t ulen = (uint16_t)(8 + blen);
+    uint8_t *o;
+
+    mem_set(f, 0, 42 + blen);
+    mem_set(f, 0xFF, 6); /* ethernet broadcast */
+    mem_copy(f + 6, mac, 6);
+    wr16(f + 12, ETHERTYPE_IP);
+    ip[0] = 0x45;
+    wr16(ip + 2, (uint16_t)(20 + ulen));
+    wr16(ip + 4, g_ip_id++);
+    ip[8] = 64;
+    ip[9] = PROTO_UDP;
+    wr32(ip + 12, 0);          /* no address yet */
+    wr32(ip + 16, 0xFFFFFFFFu); /* limited broadcast */
+    wr16(ip + 10, csum16(ip, 20));
+    wr16(u, 68);
+    wr16(u + 2, 67);
+    wr16(u + 4, ulen);
+    b[0] = 1; /* BOOTREQUEST */
+    b[1] = 1; /* ethernet */
+    b[2] = 6; /* hlen */
+    wr32(b + 4, g_dhcp_xid);
+    wr16(b + 10, 0x8000); /* flags: broadcast replies */
+    mem_copy(b + 28, mac, 6);
+    wr32(b + 236, 0x63825363u);
+    o = b + 240;
+    *o++ = 53;
+    *o++ = 1;
+    *o++ = mtype;
+    if (mtype == 3) { /* REQUEST: say which offer we take */
+        *o++ = 50;
+        *o++ = 4;
+        wr32(o, g_dhcp_yiaddr);
+        o += 4;
+        *o++ = 54;
+        *o++ = 4;
+        wr32(o, g_dhcp_server);
+        o += 4;
+    }
+    *o++ = 55; /* parameter request list: mask, router, DNS */
+    *o++ = 3;
+    *o++ = 1;
+    *o++ = 3;
+    *o++ = 6;
+    *o++ = 255;
+    {
+        uint8_t *v = g_udp_verify;
+
+        wr32(v, 0);
+        wr32(v + 4, 0xFFFFFFFFu);
+        v[8] = 0;
+        v[9] = PROTO_UDP;
+        wr16(v + 10, ulen);
+        mem_copy(v + 12, u, ulen);
+        wr16(u + 6, csum16(v, 12 + ulen));
+    }
+    virtio_net_send(f, 42 + blen);
+    g_ip_tx++;
+}
+
+/* Spin on net_poll until the stage moves (or the wait runs
+ * out): ticks may not advance this early in boot, so a raw
+ * iteration bound backs up the tick deadline. */
+static bool dhcp_wait(int from, uint32_t ticks)
+{
+    uint64_t deadline = sched_uptime_ticks() + ticks;
+    uint32_t i;
+
+    for (i = 0; i < 2500000u; i++) {
+        if (g_dhcp_stage != from)
+            return true;
+        if (sched_uptime_ticks() >= deadline)
+            break;
+        net_poll();
+    }
+    return g_dhcp_stage != from;
+}
+
+static void serial_ip(uint32_t v)
+{
+    int i;
+
+    for (i = 3; i >= 0; i--) {
+        uint32_t oct = (v >> (8 * i)) & 0xFF;
+        char tmp[3];
+        int n = 0;
+
+        if (i < 3)
+            serial_putc('.');
+        if (oct >= 100)
+            tmp[n++] = (char)('0' + oct / 100);
+        if (oct >= 10)
+            tmp[n++] = (char)('0' + (oct / 10) % 10);
+        tmp[n++] = (char)('0' + oct % 10);
+        tmp[n] = 0;
+        serial_puts(tmp);
+    }
+}
+
+static void dhcp_run(void)
+{
+    const uint8_t *mac = virtio_net_mac();
+    int attempt;
+
+    g_dhcp_xid = 0x59730000u | ((uint32_t)mac[3] << 16) |
+                 ((uint32_t)mac[4] << 8) | (uint32_t)mac[5];
+    for (attempt = 0; attempt < 3; attempt++) {
+        g_dhcp_stage = DHCP_DISCOVERING;
+        dhcp_send(1);
+        if (!dhcp_wait(DHCP_DISCOVERING, 150))
+            continue; /* nobody offered */
+        if (g_dhcp_stage != DHCP_OFFERED)
+            continue; /* NAK or noise: start over */
+        dhcp_send(3);
+        if (!dhcp_wait(DHCP_OFFERED, 150))
+            continue;
+        if (g_dhcp_stage == DHCP_DONE)
+            break;
+    }
+    if (g_dhcp_stage == DHCP_DONE) {
+        g_net_ip = g_dhcp_yiaddr;
+        if (g_dhcp_mask)
+            g_net_mask = g_dhcp_mask;
+        if (g_dhcp_gw)
+            g_net_gw = g_dhcp_gw;
+        g_dhcp_leased = true;
+        serial_puts("Yousj OS: net: dhcp lease ip=");
+        serial_ip(g_net_ip);
+        serial_puts(" mask=");
+        serial_ip(g_net_mask);
+        serial_puts(" gw=");
+        serial_ip(g_net_gw);
+        serial_puts("\n");
+    } else {
+        serial_puts("Yousj OS: net: dhcp no lease, static ip=");
+        serial_ip(g_net_ip);
+        serial_puts("\n");
+    }
+    g_dhcp_stage = 0;
 }
 
 /* ICMP type 3 code 3 for a packet with no home. The reply
@@ -627,6 +870,10 @@ static void udp_input(const uint8_t *frame, const uint8_t *ip,
     }
     sport = rd16(u);
     dport = rd16(u + 2);
+    if (dport == 68 && sport == 67) {
+        dhcp_input(u + 8, (uint32_t)(ulen - 8)); /* M92 tap */
+        return;
+    }
     ep = udp_find(dst, dport);
     if (ep == NULL) {
         if (dst == OUR_IP) /* no ICMP for broadcasts */
@@ -683,8 +930,8 @@ long net_udp_send(struct yousj_udp_ep *ep, uint32_t dst_ip,
         return (long)len;
     }
     {
-        uint32_t onward = (dst_ip & 0xFFFFFF00u) ==
-                                  (OUR_IP & 0xFFFFFF00u)
+        uint32_t onward = (dst_ip & g_net_mask) ==
+                                  (OUR_IP & g_net_mask)
                               ? dst_ip
                               : OUR_GATEWAY;
         if (!resolve_wait(onward))
@@ -1352,8 +1599,8 @@ long net_tcp_connect_start(struct yousj_tcp *t, uint32_t ip,
     t->rcv_nxt = 0;
     t->state = TS_SYN_SENT;
     if (ip != OUR_IP && ip != 0x7F000001u) {
-        uint32_t onward = (ip & 0xFFFFFF00u) ==
-                                  (OUR_IP & 0xFFFFFF00u)
+        uint32_t onward = (ip & g_net_mask) ==
+                                  (OUR_IP & g_net_mask)
                               ? ip
                               : OUR_GATEWAY;
         if (!resolve_wait(onward)) {
@@ -1582,6 +1829,19 @@ static uint64_t snap_put_mac(char *buf, uint64_t len, uint64_t at,
     return at;
 }
 
+static uint64_t snap_put_ip(char *buf, uint64_t len, uint64_t at,
+                            uint32_t v)
+{
+    int i;
+
+    for (i = 3; i >= 0; i--) {
+        if (i < 3)
+            at = snap_puts(buf, len, at, ".");
+        at = snap_put_u64(buf, len, at, (v >> (8 * i)) & 0xFF);
+    }
+    return at;
+}
+
 uint64_t net_snapshot(char *buf, uint64_t len)
 {
     uint64_t at = 0;
@@ -1590,7 +1850,14 @@ uint64_t net_snapshot(char *buf, uint64_t len)
         return 0;
     at = snap_puts(buf, len, at, g_up ? "up mac=" : "down mac=");
     at = snap_put_mac(buf, len, at, virtio_net_mac());
-    at = snap_puts(buf, len, at, " ip=10.0.2.15 rx=");
+    at = snap_puts(buf, len, at, " ip=");
+    at = snap_put_ip(buf, len, at, g_net_ip);
+    at = snap_puts(buf, len, at, " mask=");
+    at = snap_put_ip(buf, len, at, g_net_mask);
+    at = snap_puts(buf, len, at, " gw=");
+    at = snap_put_ip(buf, len, at, g_net_gw);
+    at = snap_puts(buf, len, at,
+                   g_dhcp_leased ? " dhcp=lease rx=" : " dhcp=static rx=");
     at = snap_put_u64(buf, len, at, virtio_net_rx_count());
     at = snap_puts(buf, len, at, " tx=");
     at = snap_put_u64(buf, len, at, virtio_net_tx_count());

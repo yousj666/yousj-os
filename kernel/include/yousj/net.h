@@ -1,11 +1,12 @@
 /*
  * net.h -- the link/network layer surface (M72).
  *
- * M72 scope: an ethernet layer over the virtio-net driver, a
- * fixed IPv4 configuration (the QEMU user-net defaults:
- * 10.0.2.15/24, gateway 10.0.2.2) and ARP -- answering
- * requests for our address and resolving on demand. IP
- * itself arrives in M73.
+ * M72 scope: an ethernet layer over the virtio-net driver, an
+ * IPv4 configuration and ARP -- answering requests for our
+ * address and resolving on demand. IP itself arrives in M73.
+ * M92: the configuration is leased by a DHCP client at boot;
+ * the QEMU user-net defaults (10.0.2.15/24, gateway 10.0.2.2)
+ * remain as the static fallback when no server answers.
  */
 #ifndef YOUSJ_NET_H
 #define YOUSJ_NET_H

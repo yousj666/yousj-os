@@ -424,10 +424,32 @@ int main(int argc, char **argv)
     if (argc > 1 && str_eq(argv[1], "udp"))
         return udp_main();
     if (argc > 1 && str_eq(argv[1], "ping")) {
-        /* ping the gateway 10.0.2.2, give the reply a second
-         * to come back, then show the counters */
+        /* ping the gateway 10.0.2.2 -- or the dotted target
+         * in argv[2] when given (M92: the gateway is whatever
+         * DHCP said, not always 10.0.2.2) -- give the reply a
+         * second to come back, then show the counters */
         uint32_t be = (uint32_t)10 | (0u << 8) | (2u << 16) |
                       (2u << 24);
+        if (argc > 2) {
+            const char *p = argv[2];
+            uint32_t v = 0;
+            int part = 0, shift = 0;
+
+            while (*p && shift < 32) {
+                if (*p == '.') {
+                    v |= (uint32_t)part << shift;
+                    shift += 8;
+                    part = 0;
+                    p++;
+                } else if (*p >= '0' && *p <= '9') {
+                    part = part * 10 + (*p - '0');
+                    p++;
+                } else
+                    break;
+            }
+            v |= (uint32_t)part << shift;
+            be = v;
+        }
         struct {
             int64_t sec;
             int64_t nsec;
