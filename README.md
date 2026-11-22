@@ -17,6 +17,8 @@ only.
 
 ![Graphical terminal](docs/images/terminal.png)
 
+![Demo: booting to the desktop and running commands in the graphical terminal](docs/images/demo.gif)
+
 ## What it can do today
 
 - **Boot**: a from-scratch UEFI bootloader that sets up a GOP
@@ -31,7 +33,8 @@ only.
   character devices; PTY pairs; inotify; epoll
 - **Networking**: a virtio-net driver (PCI + INTx interrupts),
   ARP, IPv4, ICMP, UDP and a complete TCP state machine; a BSD
-  sockets interface including AF_UNIX
+  sockets interface including AF_UNIX; a DHCP client brings
+  the interface up on a real network automatically
 - **Real Linux programs**: dynamically and statically linked
   musl programs run, and the full Alpine busybox applet family
   (about 300 applets) works in the system day to day

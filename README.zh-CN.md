@@ -13,6 +13,8 @@
 
 ![图形终端](docs/images/terminal.png)
 
+![演示：开机进桌面，在图形终端里敲命令](docs/images/demo.gif)
+
 ## 它现在能做什么
 
 - **启动**：自研 UEFI 引导器，设置 GOP 图形模式后把内核拉起来
@@ -22,7 +24,8 @@
 - **文件系统**：自研 yfs 持久文件系统（预写日志）、ramfs、
   生成式 /proc、/dev 字符设备、伪终端 PTY、inotify、epoll
 - **网络**：virtio-net 网卡驱动（PCI + INTx 中断）、ARP、IPv4、
-  ICMP、UDP、完整 TCP 状态机；BSD 套接字接口，含 AF_UNIX
+  ICMP、UDP、完整 TCP 状态机；BSD 套接字接口，含 AF_UNIX；
+  带 DHCP 客户端，能在真实网络里自动获取地址联网
 - **跑真 Linux 程序**：动态与静态链接的 musl 程序都能跑，
   Alpine busybox 全家桶（约 300 个 applet）在系统里日常工作
 - **桌面**：渐变壁纸、桌面图标（单击选中、双击启动）、可拖动
